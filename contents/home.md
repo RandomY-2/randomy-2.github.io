@@ -1,6 +1,7 @@
 
 
-[![randomy-2](https://img.shields.io/badge/RandomY2-github-blue?logo=github)](https://github.com/RandomY-2)
+[![GitHub](https://img.shields.io/badge/RandomY2-github-blue?logo=github)](https://github.com/RandomY-2)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-%230A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/jiahe-yan/)
 
 Hi, I am Jiahe Yan. I I graduated with a B.S. in Computer Science from UCLA and am currently working as a
 Software Development Engineer at Amazon Web Services.
