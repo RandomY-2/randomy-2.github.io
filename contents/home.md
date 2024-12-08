@@ -1,16 +1,14 @@
 
 
-[![senli1073](https://img.shields.io/badge/senli1073-github-blue?logo=github)](https://github.com/senli1073)
+[![randomy-2](https://img.shields.io/badge/RandomY2-github-blue?logo=github)](https://github.com/RandomY-2)
 
-He is currently pursuing a Master's Degree in Computer Science, at School of Computer Science and Technology, China University of Mining and Technology, China.
+Hi, I am Jiahe Yan. I I graduated with a B.S. in Computer Science from UCLA and am currently working as a
+Software Development Engineer at Amazon Web Services.
 
 #### Email
-sli[at]cumt.edu.cn
+yjh20711[at]g.ucla.edu
 
 #### Education
-M.E., Computer Science and Technology, China University of Mining and Technology, 2022—2025 (expected).\
-B.E., Data Science and Big Data Technology, China University of Mining and Technology, 2018—2022.
-
-#### Research Interests
-Deep Learning, Artificial Intelligence Seismology, Mine Microseismic.
-
+Bachelor of Science, Computer Science, University of California, Los Angeles (UCLA) (2020—2024)
+  - GPA: 3.879/4.0 | Cum Laude
+  - $7,500 2024 UCLA Internet Research Initiative Award
