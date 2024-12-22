@@ -1,16 +1,11 @@
+[![GitHub](https://img.shields.io/badge/RandomY2-github-blue?logo=github)](https://github.com/RandomY-2)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-%230A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/jiahe-yan/)
 
+### Hi, I am **Jiahe Yan**!
+I recently graduated from the **University of California, Los Angeles (UCLA)** with a B.S. in Computer Science, where I was honored to receive a **$7,500 award** from the UCLA Internet Research Initiative for my work on distributed stochastic gradient descent (SGD) under the mentorship of [**Prof. Leonard Kleinrock**](https://www.lk.cs.ucla.edu/index.html) and [**Prof. Pratik Chaudhari**](https://pratikac.github.io/). I also collaborated with [**Prof. Remy Wang**](https://remy.wang/), exploring how to optimize data systems using techniques from programming languages and databases.
 
-[![senli1073](https://img.shields.io/badge/senli1073-github-blue?logo=github)](https://github.com/senli1073)
+I am interested in **building robust, high-performance data computing systems** that can automatically adapt to dynamic workloads across domains like relational queries, graph analytics, and high-dimensional tensor computations. I want to explore building **unified abstractions** that bridge ideas from programming languages, databases, and tensor algebra. Ultimately, I aim to design **scalable system architectures** that leverage these optimizations to safely and efficiently handle evolving data challenges—treating every workload as if the system had been purpose-built for it.
 
-He is currently pursuing a Master's Degree in Computer Science, at School of Computer Science and Technology, China University of Mining and Technology, China.
+I am currently a **Software Development Engineer** at **Amazon Web Services (AWS)**, designing large-scale, fault-tolerant systems that power AWS’s global account management services. My daily work involves building auto-scalable microservices, optimizing event-driven workflows, and ensuring our distributed pipelines can handle massive volumes of data without compromising on performance or reliability.
 
-#### Email
-sli[at]cumt.edu.cn
-
-#### Education
-M.E., Computer Science and Technology, China University of Mining and Technology, 2022—2025 (expected).\
-B.E., Data Science and Big Data Technology, China University of Mining and Technology, 2018—2022.
-
-#### Research Interests
-Deep Learning, Artificial Intelligence Seismology, Mine Microseismic.
-
+In the broader open source community, I’ve contributed to open-source projects [**Xorbits**](https://github.com/xorbitsai) and [**Mars**](https://github.com/mars-project), both of which aim to provide frameworks for large-scale distributed data processing. At **Xorbits**, I developed a JIT-based runtime computation graph node fusion optimizer, integrated NCCL-based GPU communication primitives, and implemented distributed synchronous SGD. At **Mars**, I built out REST APIs to retrieve DAG task graphs over a distributed actor framework, designed graph visualizations using React and D3.js, and integrated over a dozen SciPy functions for large-scale tensor computations.
