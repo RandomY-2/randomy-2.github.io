@@ -1,1 +1,0 @@
-- $7500 2024 UCLA Internet Research Initiative Award

@@ -1,0 +1,46 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]          # run on every push to main
+  workflow_dispatch:          # …and allow manual runs
+
+permissions:
+  contents: read              # the workflow only needs read access
+  pages: write                # to publish the site
+  id-token: write             # to authenticate the deploy step
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true    # only keep the newest build if you push quickly
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4     # Node 20 is the current LTS
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - run: npm ci                     # install deps (or pnpm install)
+
+      - run: npm run build              # emits static site into ./out
+
+      # Package the ./out folder as a deployable artifact
+      - uses: actions/upload-pages-artifact@v2
+        with:
+          path: ./out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages               # ← built-in Pages env
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Deploy the artifact that was uploaded in the previous job
+      - id: deployment
+        uses: actions/deploy-pages@v2

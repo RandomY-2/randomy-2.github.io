@@ -1,1 +1,0 @@
-- <strong>J. Yan</strong>, P. Chaudhari, & L. Kleinrock (2024). dSTAR: Straggler Tolerant and Byzantine Resilient Distributed SGD. 3rd Workshop on New Frontiers in Adversarial Machine Learning, NeurIPS. [Paper](https://arxiv.org/abs/2412.07151)

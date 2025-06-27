@@ -1,56 +1,36 @@
-## Introduction
+This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
-This is an academic personal website template based on [bootstrap](https://github.com/StartBootstrap/startbootstrap-new-age).
+## Getting Started
 
-The template is designed to integrate Markdown files as content input.  There's no need to compile the webpage before deployment.  Upon loading, the Markdown files are automatically parsed and embedded into the page.
+First, run the development server:
 
-This template supports LaTeX formula input. You can use `$...$` and `\(...\)` as delimiters for inline-math, or use `$$...$$` and `\[...\]` as delimiters for display-math. Macros such as `\ref{...}`, `\eqref{...}`, and `\begin{equation}...\end{equation}` are also supported. See [MathJax](https://docs.mathjax.org/en/latest/index.html) for more details.
-
-:milky_way: Demo: https://senli1073.github.io/
-
-
-## Getting Start
-### 1. Fork this repository
-The repository name should be `<username>.github.io`, which will also be your website's URL.
-
-
-### 2. Edit page content
-
-(1) Go to the folder where you want to store your project, and clone the new repository:
-```
-git clone https://github.com/<username>/<username>.github.io.git
-```
-The directory structure is as follows:
-
-```.
-.
-├── contents
-└── static
-    ├── assets
-    │   └── img
-    ├── css
-    └── js
+```bash
+npm run dev
+# or
+yarn dev
+# or
+pnpm dev
+# or
+bun dev
 ```
 
-(2) Modify the content of each section, which corresponds to `contents/*.md`.
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-(3) Adjust the title, copyright information, and other text of the website in `contents/config.yml`
+You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
-(4) Replace background image and photo with new ones for your web pages in `static/assets/img/`
+This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
-(5) Push it:
-```
-git commit -am 'init'
-git push
-```
+## Learn More
 
+To learn more about Next.js, take a look at the following resources:
 
-### 3. Enjoy
+- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
+- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
 
-Fire up a browser and go to `https://<username>.github.io`
+You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
 
+## Deploy on Vercel
 
+The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
-## License
-
-Copyright Sen Li, 2023. Licensed under an MIT license. You can copy and mess with this template.
+Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.

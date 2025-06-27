@@ -1,0 +1,40 @@
+{
+  "name": "my-blog",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "lint": "next lint",
+    "build": "next build",
+    "preview": "npx serve -s out",
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d out"
+  },
+  "homepage": "https://randomy-2.github.io/",
+  "dependencies": {
+    "@mdx-js/loader": "^3.1.0",
+    "@next/mdx": "^15.3.4",
+    "gray-matter": "^4.0.3",
+    "next": "15.3.4",
+    "next-mdx-remote": "^5.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@cloudflare/next-on-pages": "^1.13.12",
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/postcss": "^4",
+    "@tailwindcss/typography": "^0.5.16",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "autoprefixer": "^10.4.21",
+    "eslint": "^9",
+    "eslint-config-next": "15.3.4",
+    "gh-pages": "^6.3.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.4",
+    "typescript": "^5"
+  }
+}

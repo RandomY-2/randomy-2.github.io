@@ -1,0 +1,6 @@
+name = "my-next-app"                 # anything globally unique
+compatibility_date = "2025-06-26"
+compatibility_flags = ["nodejs_compat"]  # unlock Node APIs if you need them
+
+# tell Pages where the adapter will place static assets
+pages_build_output_dir = ".vercel/output/static"
