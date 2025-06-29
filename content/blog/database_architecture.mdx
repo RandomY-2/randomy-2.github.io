@@ -1,0 +1,364 @@
+---
+slug: duckdb-architecture
+title: "Dissecting DuckDB: A Code-Level Tour of Modern Database Architecture"
+date: "2025-06-28"
+description: "A deep dive into what components a modern database system has, using DuckDB as an example."
+tags: [databases, duckdb, architecture, system design, sql]
+---
+
+## Overview of a Modern Database Pipeline
+
+Modern databases share a familiar, *compiler-like* pipeline: SQL text enters on
+one end, typed tuples shoot out the other. The CMU 15-445 diagram
+([source]((https://15445.courses.cs.cmu.edu/fall2023/notes/14-optimization1.pdf))) below captures
+those stages at a glance.
+
+> **TL;DR**
+> SQL Query → Parsing → Binding → Logical Planning → Optimization → Physical Planning → Execution.
+
+![Figure 1: DuckDB architecture, annotated.](/figures/database_architecture.png)
+
+- **SQL Query** – the raw text sent by an application
+- **Parsing** – tokenizes the SQL and builds an abstract syntax tree
+- **Binding** – resolves table, column, and function names against the catalog and assigns types
+- **Logical Planning** – converts the bound AST into relational-algebra operators
+- **Optimization** – rewrites and reorders the logical plan to minimize cost
+- **Physical Planning** – picks concrete algorithms (hash join, vectorized scan, etc.) and a processing order
+- **Execution** – runs the physical operators, streaming result tuples back to the client
+
+In this article we use **DuckDB**—an embedded, in-process analytical engine—as our running example.
+As DuckDB original demo [paper](https://mytherin.github.io/papers/2019-duckdbdemo.pdf) described it,
+DuckDB
+
+>follow the “textbook” separation of components: Parser, logical planner, optimizer,
+physical planner, execution engine
+
+We will super-impose the CMU diagram with real entry points in DuckDB codebase as well as snippets
+from DuckDB paper so you can follow every phase directly in your editor.
+
+---
+
+## High‑Level Code Overview
+
+
+The quickest way to grasp DuckDB’s execution flow is to start with the `ClientContext::Query` entry point
+([source](https://github.com/duckdb/duckdb/blob/3524fe07f7c8248ec6932c40873ecb148dfc50bc/src/main/client_context.cpp#L955)).
+This method wires together parsing, binding, planning, optimization, and execution; the key sections are
+annotated in-line and referenced throughout the walkthrough.
+
+(Relevant lines are commented below.)
+
+```cpp
+unique_ptr<QueryResult> ClientContext::Query(const string &query, bool allow_stream_result) {
+	auto lock = LockContext();
+
+	ErrorData error;
+
+	/*
+	 * ///////////////////////////////////////////////////////
+	 * ///////////////// Parsing Logic ///////////////////////
+	 * ///////////////////////////////////////////////////////
+	 */
+	vector<unique_ptr<SQLStatement>> statements;
+	if (!ParseStatements(*lock, query, statements, error)) {
+		return ErrorResult<MaterializedQueryResult>(std::move(error), query);
+	}
+	if (statements.empty()) {
+		// no statements, return empty successful result
+		StatementProperties properties;
+		vector<string> names;
+		auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
+		return make_uniq<MaterializedQueryResult>(StatementType::INVALID_STATEMENT, properties, std::move(names),
+		                                          std::move(collection), GetClientProperties());
+	}
+
+	unique_ptr<QueryResult> result;
+	optional_ptr<QueryResult> last_result;
+	bool last_had_result = false;
+
+	for (idx_t i = 0; i < statements.size(); i++) {
+		auto &statement = statements[i];
+		bool is_last_statement = i + 1 == statements.size();
+
+		/*
+		 * ///////////////////////////////////////////////////////
+		 * PendingQueryInternal will create query plan and optimize
+		 * (Binding / Logic Planning / Optimization / Physical Planning)
+		 * ///////////////////////////////////////////////////////
+		 */
+		PendingQueryParameters parameters;
+		parameters.allow_stream_result = allow_stream_result && is_last_statement;
+		auto pending_query = PendingQueryInternal(*lock, std::move(statement), parameters);
+		auto has_result = pending_query->properties.return_type == StatementReturnType::QUERY_RESULT;
+		unique_ptr<QueryResult> current_result;
+		if (pending_query->HasError()) {
+			current_result = ErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
+		} else {
+			/*
+			 * /////////////////////////////////////////////////////////
+			 * ///////////////// Execution Logic ///////////////////////
+			 * /////////////////////////////////////////////////////////
+			 */
+			current_result = ExecutePendingQueryInternal(*lock, *pending_query);
+		}
+		// now append the result to the list of results
+		if (!last_result || !last_had_result) {
+			// first result of the query
+			result = std::move(current_result);
+			last_result = result.get();
+			last_had_result = has_result;
+		} else {
+			// later results; attach to the result chain
+			// but only if there is a result
+			if (!has_result) {
+				continue;
+			}
+			last_result->next = std::move(current_result);
+			last_result = last_result->next.get();
+		}
+		D_ASSERT(last_result);
+		if (last_result->HasError()) {
+			// Reset the interrupted flag, this was set by the task that found the error
+			// Next statements should not be bothered by that interruption
+			interrupted = false;
+			break;
+		}
+	}
+	return result;
+}
+```
+
+---
+
+## Parsing
+
+As shown above, thee entry point for DuckDB parsing logic is `ClientContext::ParseStatements`
+([code](https://github.com/duckdb/duckdb/blob/0069af20abea2660d67849257bc568570388d50c/src/main/client_context.cpp#L630))
+
+```cpp
+vector<unique_ptr<SQLStatement>> ClientContext::ParseStatements(const string &query) {
+	auto lock = LockContext();
+	return ParseStatementsInternal(*lock, query);
+}
+
+vector<unique_ptr<SQLStatement>> ClientContext::ParseStatementsInternal(ClientContextLock &lock, const string &query) {
+	Parser parser(GetParserOptions());
+	parser.ParseQuery(query);
+
+	PragmaHandler handler(*this);
+	handler.HandlePragmaStatements(lock, parser.statements);
+
+	return std::move(parser.statements);
+}
+```
+
+DuckDB parser code lives in [`src/parser/`](https://github.com/duckdb/duckdb/tree/main/src/parser) module, and
+the entry point is [`Parser::ParseQuery`](https://github.com/duckdb/duckdb/blob/main/src/parser/parser.cpp#L191).
+DuckDB uses Postgres parser to parse the SQL text and, if successfully parsed, transforms the Postgres parse tree into
+DuckDB's own AST (`SQLStatements`).
+
+As DuckDB [paper](https://mytherin.github.io/papers/2019-duckdbdemo.pdf) described it:
+
+>The SQL parser is derived from Postgres’ SQL parser that
+has been stripped down as much as possible [2]. This has
+the advantage of providing DuckDB with a full-featured and
+stable parser to handle one of the most volatile form of its
+input, SQL queries. The parser takes a SQL query string as
+input and returns a parse tree of C structures. This parse tree
+is then immediately transformed into our own parse tree of
+C++ classes to limit the reach of Postgres’ data structures.
+This parse tree consists of statements (e.g. SELECT, INSERT
+etc.) and expressions (e.g. SUM(a)+1).
+
+```cpp
+void Parser::ParseQuery(const string &query) {
+	.....
+
+	/*
+	 * //////////////////// Main Logic ////////////////////
+	 */
+	{
+		PostgresParser::SetPreserveIdentifierCase(options.preserve_identifier_case);
+		bool parsing_succeed = false;
+		// Creating a new scope to prevent multiple PostgresParser destructors being called
+		// which led to some memory issues
+		{
+			PostgresParser parser;
+			parser.Parse(query);
+			if (parser.success) {
+				if (!parser.parse_tree) {
+					// empty statement
+					return;
+				}
+
+				// if it succeeded, we transform the Postgres parse tree into a list of
+				// SQLStatements
+				transformer.TransformParseTree(parser.parse_tree, statements);
+				parsing_succeed = true;
+			} else {
+				parser_error = parser.error_message;
+				if (parser.error_location > 0) {
+					parser_error_location = NumericCast<idx_t>(parser.error_location - 1);
+				}
+			}
+		}
+		// If DuckDB fails to parse the entire sql string, break the string down into individual statements
+		// using ';' as the delimiter so that parser extensions can parse the statement
+		if (parsing_succeed) {
+			// no-op
+			// return here would require refactoring into another function. o.w. will just no-op in order to run wrap up
+			// code at the end of this function
+		} else if (!options.extensions || options.extensions->empty()) {
+			throw ParserException::SyntaxError(query, parser_error, parser_error_location);
+		} else {
+			// split sql string into statements and re-parse using extension
+			...
+		}
+	}
+	...
+}
+```
+
+After parsing SQL text using Postgres parser, DuckDB builds the DuckDB AST using
+[`Transformer::TransformParseTree`](https://github.com/duckdb/duckdb/blob/main/src/parser/transformer.cpp#L28).
+Internally, DuckDB uses a dynamic dispatch approach to transform each SQL node.
+
+```cpp
+bool Transformer::TransformParseTree(duckdb_libpgquery::PGList *tree, vector<unique_ptr<SQLStatement>> &statements) {
+	InitializeStackCheck();
+	for (auto entry = tree->head; entry != nullptr; entry = entry->next) {
+		Clear();
+		auto n = PGPointerCast<duckdb_libpgquery::PGNode>(entry->data.ptr_value);
+		auto stmt = TransformStatement(*n);
+		D_ASSERT(stmt);
+		if (HasPivotEntries()) {
+			stmt = CreatePivotStatement(std::move(stmt));
+		}
+		statements.push_back(std::move(stmt));
+	}
+	return true;
+}
+
+unique_ptr<SQLStatement> Transformer::TransformStatement(duckdb_libpgquery::PGNode &stmt) {
+	auto result = TransformStatementInternal(stmt);
+	result->n_param = ParamCount();
+	if (!named_param_map.empty()) {
+		// Avoid overriding a previous move with nothing
+		result->named_param_map = std::move(named_param_map);
+	}
+	return result;
+}
+
+unique_ptr<SQLStatement> Transformer::TransformStatementInternal(duckdb_libpgquery::PGNode &stmt) {
+	switch (stmt.type) {
+	case duckdb_libpgquery::T_PGRawStmt: {
+		auto &raw_stmt = PGCast<duckdb_libpgquery::PGRawStmt>(stmt);
+		auto result = TransformStatement(*raw_stmt.stmt);
+		if (result) {
+			result->stmt_location = raw_stmt.stmt_location;
+			result->stmt_length = raw_stmt.stmt_len;
+		}
+		return result;
+	}
+	case duckdb_libpgquery::T_PGSelectStmt:
+		return TransformSelect(PGCast<duckdb_libpgquery::PGSelectStmt>(stmt));
+	case duckdb_libpgquery::T_PGCreateStmt:
+		return TransformCreateTable(PGCast<duckdb_libpgquery::PGCreateStmt>(stmt));
+	case duckdb_libpgquery::T_PGCreateSchemaStmt:
+		return TransformCreateSchema(PGCast<duckdb_libpgquery::PGCreateSchemaStmt>(stmt));
+	...
+	default:
+		throw NotImplementedException(NodetypeToString(stmt.type));
+	}
+}
+```
+
+## Binding / Logical Planning
+
+
+In DuckDB, the *binder* and the *logical plan generator* operate almost back-to-back. Once binding
+finishes, a logical plan is already created. The DuckDB demo paper describes it as:
+
+>The logical planner consists of two parts, the binder and
+the plan generator. The binder resolves all expressions referring to schema objects such as tables or views with their
+column names and types. The logical plan generator then
+transforms the parse tree into a tree of basic logical query
+operators such as scan, filter, project, etc. After the planning phase, we have a fully type-resolved logical query plan.
+DuckDB keeps statistics on the stored data, and these are
+propagated through the different expression trees as part of
+the planning process. These statistics are used in the optimizer itself, and are also used for integer overflow prevention
+by upgrading types when required.
+
+>To Be Continued...
+
+## Optimizing
+
+>DuckDB’s optimizer performs join order optimization using dynamic programming [7] with a greedy fallback for
+complex join graphs [11]. It performs flattening of arbitrary
+subqueries as described in Neumann et al. [9]. In addition,
+there are a set of rewrite rules that simplify the expression
+tree, by performing e.g. common subexpression elimination
+and constant folding. Cardinality estimation is done using a
+combination of samples and HyperLogLog. The result of this
+process is the optimized logical plan for the query.
+
+>To Be Continued...
+
+## Physical Planning
+
+> The physical planner transforms the logical plan into the physical plan,
+selecting suitable implementations where applicable. For example, a scan may
+decide to use an existing index instead of
+scanning the base tables based on selectivity estimates, or
+switch between a hash join or merge join depending on the
+join predicates.
+
+>To Be Continued...
+
+## Execution
+
+>DuckDB uses a vectorized interpreted execution engine [1].
+This approach was chosen over Just-in-Time compilation
+(JIT) of SQL queries [8] for portability reasons. JIT engines
+depend on massive compiler libraries (e.g. LLVM) with additional transitive dependencies. DuckDB uses vectors of a
+fixed maximum amount of values (1024 per default). Fixedlength types such as integers are stored as native arrays.
+Variable-length values such as strings are represented as a
+native array of pointers into a separate string heap. NULL
+values are represented using a separate bit vector, which
+is only present if NULL values appear in the vector. This
+allows fast intersection of NULL vectors for binary vector
+operations and avoids redundant computation. To avoid excessive shifting of data within the vectors when e.g. the data
+is filtered, the vectors may have a selection vector, which is
+a list of offsets into the vector stating which indices of the
+vector are relevant [1]. DuckDB contains an extensive library
+of vector operations that support the relational operators,
+this library expands code for all supported data types using
+C++ code templates.
+The execution engine executes the query in a so-called
+“Vector Volcano” model. Query execution commences by pulling
+the first “chunk” of data from the root node of the physical
+plan. A chunk is a horizontal subset of a result set, query
+intermediate or base table. This node will recursively pull
+chunks from child nodes, eventually arriving at a scan operator which produces chunks by reading from the persistent
+tables. This continues until the chunk arriving at the root is
+empty, at which point the query is completed
+
+>To Be Continued...
+
+
+## 5  Further Reading
+
+* [DuckDB: An Embeddable Analytical Database](https://mytherin.github.io/papers/2019-duckdbdemo.pdf)
+* The [DuckDB source](https://github.com/duckdb/duckdb) (start with `src/main/client_context.cpp`)
+
+---
+
+Next time you run:
+
+```sql
+SELECT foo FROM bar;
+```
+
+remember the tiny journey your query takes inside the Duck!
+
+---
