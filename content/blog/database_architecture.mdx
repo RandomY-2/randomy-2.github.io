@@ -34,7 +34,9 @@ DuckDB
 physical planner, execution engine
 
 We will super-impose the CMU diagram with real entry points in DuckDB codebase as well as snippets
-from DuckDB paper so you can follow every phase directly in your editor.
+from DuckDB paper so you can follow every phase directly in your editor. However, DuckDB’s code base is big.
+Covering every detail of DuckDB would take a book. Instead, this post acts as a map: for each stage,
+the key entry functions are provided. From there you can wander as deep as your curiosity takes you.
 
 ---
 
@@ -132,6 +134,9 @@ unique_ptr<QueryResult> ClientContext::Query(const string &query, bool allow_str
 
 ## Parsing
 
+Before the engine can reason about a query it needs syntax.  DuckDB piggy‑backs on the proven Postgres parser,
+then immediately converts the Postgres nodes into its own C++ AST to avoid leaking PG structs all over the code base.
+
 As shown above, the entry point for DuckDB parsing logic is `ClientContext::ParseStatements`
 ([code](https://github.com/duckdb/duckdb/blob/0069af20abea2660d67849257bc568570388d50c/src/main/client_context.cpp#L630))
 
@@ -219,6 +224,14 @@ void Parser::ParseQuery(const string &query) {
 }
 ```
 
+A few neat details:
+
+- Extensions can hook the parser.  If the vanilla pass fails, DuckDB will re‑split the SQL string on
+`;` and let extensions take another shot.
+
+- Error handling carries the original character offset, so client libraries can point exactly at the
+offending token.
+
 After parsing SQL text using Postgres parser, DuckDB builds the DuckDB AST using
 [`Transformer::TransformParseTree`](https://github.com/duckdb/duckdb/blob/main/src/parser/transformer.cpp#L28).
 Internally, DuckDB uses a dynamic dispatch approach to transform each SQL node.
@@ -273,11 +286,15 @@ unique_ptr<SQLStatement> Transformer::TransformStatementInternal(duckdb_libpgque
 }
 ```
 
-## Binding / Logical Planning
+---
 
+## Binding
 
-In DuckDB, the *binder* and the *logical plan generator* operate almost back-to-back. Once binding
-finishes, a logical plan is already created. The DuckDB demo paper describes it as:
+Binding walks the AST, consulting the catalog to resolve every table, column, and function.
+In DuckDB the binder also builds the first relational plan, so when `Planner::CreatePlan` returns
+you already have a fully‑typed logical tree.
+
+The DuckDB demo paper describes it as:
 
 >The logical planner consists of two parts, the binder and
 the plan generator. The binder resolves all expressions referring to schema objects such as tables or views with their
@@ -289,9 +306,327 @@ propagated through the different expression trees as part of
 the planning process. These statistics are used in the optimizer itself, and are also used for integer overflow prevention
 by upgrading types when required.
 
->To Be Continued...
+As mentioned above, DuckDB will bind, create query plan, and optimize inside
+[`ClientContext::PendingQueryInternal`](https://github.com/jensenojs/duckdb/blob/main/src/main/client_context.cpp#L1083).
+There are several call stacks:
+
+```
+ClientContext::PendingQueryInternal
+-> ClientContext::PendingStatementOrPreparedStatementInternal
+-> ClientContext::CreatePreparedStatement
+-> ClientContext::CreatePreparedStatementInternal (important one)
+```
+
+[`ClientContext::CreatePreparedStatementInternal`](https://github.com/jensenojs/duckdb/blob/main/src/main/client_context.cpp#L354)
+performs binding/logical planning/optimizing/physical planning.
+
+(Relevant lines are commented below.)
+
+```cpp
+shared_ptr<PreparedStatementData>
+ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock, const string &query,
+                                               unique_ptr<SQLStatement> statement,
+                                               optional_ptr<case_insensitive_map_t<BoundParameterData>> values) {
+	StatementType statement_type = statement->type;
+	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
+
+	auto &profiler = QueryProfiler::Get(*this);
+	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
+	profiler.StartPhase(MetricsType::PLANNER);
+	Planner logical_planner(*this);
+	if (values) {
+		auto &parameter_values = *values;
+		for (auto &value : parameter_values) {
+			logical_planner.parameter_data.emplace(value.first, BoundParameterData(value.second));
+		}
+	}
+
+	/*
+	 * ///////////////////////////////////////////////////////
+	 *  CreatePlan performs both binding and logical planning
+	 * ///////////////////////////////////////////////////////
+	 */
+	logical_planner.CreatePlan(std::move(statement));
+	D_ASSERT(logical_planner.plan || !logical_planner.properties.bound_all_parameters);
+	profiler.EndPhase();
+
+	auto logical_plan = std::move(logical_planner.plan);
+	// extract the result column names from the plan
+	result->properties = logical_planner.properties;
+	result->names = logical_planner.names;
+	result->types = logical_planner.types;
+	result->value_map = std::move(logical_planner.value_map);
+	if (!logical_planner.properties.bound_all_parameters) {
+		return result;
+	}
+#ifdef DEBUG
+	logical_plan->Verify(*this);
+#endif
+
+    /*
+	 * ///////////////////////////////////////////////////////
+	 * //////////////////// Optimization /////////////////////
+	 * ///////////////////////////////////////////////////////
+	 */
+	if (config.enable_optimizer && logical_plan->RequireOptimizer()) {
+		profiler.StartPhase(MetricsType::ALL_OPTIMIZERS);
+		Optimizer optimizer(*logical_planner.binder, *this);
+		logical_plan = optimizer.Optimize(std::move(logical_plan));
+		D_ASSERT(logical_plan);
+		profiler.EndPhase();
+
+#ifdef DEBUG
+		logical_plan->Verify(*this);
+#endif
+	}
+
+	/*
+	 * ///////////////////////////////////////////////////////
+	 * ////////////////// Physical Planning //////////////////
+	 * ///////////////////////////////////////////////////////
+	 */
+	// Convert the logical query plan into a physical query plan.
+	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER);
+	PhysicalPlanGenerator physical_planner(*this);
+	result->physical_plan = physical_planner.Plan(std::move(logical_plan));
+	profiler.EndPhase();
+	D_ASSERT(result->physical_plan);
+	return result;
+}
+```
+
+Specifically, both Binding and Logical Planning happen inside
+[`Planner::CreatePlan`](https://github.com/duckdb/duckdb/blob/main/src/planner/planner.cpp#L34).
+
+```cpp
+void Planner::CreatePlan(SQLStatement &statement) {
+	...
+
+	profiler.StartPhase(MetricsType::PLANNER_BINDING);
+	binder->parameters = &bound_parameters;
+
+	/*
+	 * //////////////////////////////////////
+	 * ///// Binding + Logical Planning /////
+	 * //////////////////////////////////////
+	 */
+	auto bound_statement = binder->Bind(statement);
+	profiler.EndPhase();
+
+	...
+}
+```
+
+`Planner::CreatePlan` invokes
+[`Binder::Bind`](https://github.com/duckdb/duckdb/blob/3524fe07f7c8248ec6932c40873ecb148dfc50bc/src/planner/binder.cpp#L145)
+method, which uses a dynamic dispatch approach to further invoke the `Binder::Bind` method for each type of SQL node.
+
+For example, for a SELECT node, the [`Binder::Bind`](https://github.com/duckdb/duckdb/blob/3524fe07f7c8248ec6932c40873ecb148dfc50bc/src/planner/binder/statement/bind_select.cpp#L7)
+method is:
+
+```cpp
+BoundStatement Binder::Bind(SelectStatement &stmt) {
+	auto &properties = GetStatementProperties();
+	properties.allow_stream_result = true;
+	properties.return_type = StatementReturnType::QUERY_RESULT;
+	return Bind(*stmt.node);
+}
+```
+
+After SELECT statement-specific binding logic, the method invokes another
+[`Binder::Bind`](https://github.com/duckdb/duckdb/blob/3524fe07f7c8248ec6932c40873ecb148dfc50bc/src/planner/binder.cpp#L233)
+on QueryNode object, which creates the logical plan:
+
+```cpp
+BoundStatement Binder::Bind(QueryNode &node) {
+	BoundStatement result;
+	auto bound_node = BindNode(node);
+
+	result.names = bound_node->names;
+	result.types = bound_node->types;
+
+	// and plan it
+	result.plan = CreatePlan(*bound_node);
+	return result;
+}
+```
+
+---
+
+## Logical Planning
+
+Once bindings are resolved the planner expands each clause (FROM, WHERE, GROUP BY, …)
+into a concrete LogicalOperator.  By the time you reach the root, the tree already looks very
+familiar if you have ever read Volcano papers.
+
+[`Binder::CreatePlan`](https://github.com/duckdb/duckdb/blob/b44b8f91db1523dc3fdaebbcd3213298c796115b/src/planner/binder.cpp#L378)
+generates different LogicalOperators based on the query node's type.
+
+```cpp
+unique_ptr<LogicalOperator> Binder::CreatePlan(BoundQueryNode &node) {
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE:
+		return CreatePlan(node.Cast<BoundSelectNode>());
+	case QueryNodeType::SET_OPERATION_NODE:
+		return CreatePlan(node.Cast<BoundSetOperationNode>());
+	case QueryNodeType::RECURSIVE_CTE_NODE:
+		return CreatePlan(node.Cast<BoundRecursiveCTENode>());
+	case QueryNodeType::CTE_NODE:
+		return CreatePlan(node.Cast<BoundCTENode>());
+	default:
+		throw InternalException("Unsupported bound query node type");
+	}
+}
+```
+
+For example, for a SELECT node,
+[`Binder::CreatePlan(BoundSelectNode &statement)`](https://github.com/duckdb/duckdb/blob/a35d8b6d5ba121f2601b917e1a7732207c944ae5/src/planner/binder/query_node/plan_select_node.cpp#L18)
+is called. The function further adds LogicalOperator for clauses in a SELECT statement, such as FROM, SAMPLE, WHERE, etc.
+
+```cpp
+unique_ptr<LogicalOperator> Binder::CreatePlan(BoundSelectNode &statement) {
+	unique_ptr<LogicalOperator> root;
+
+	D_ASSERT(statement.from_table);
+
+	// plan the from clause
+	root = CreatePlan(*statement.from_table);
+
+	D_ASSERT(root);
+
+	// plan the sample clause
+	if (statement.sample_options) {
+		root = make_uniq<LogicalSample>(std::move(statement.sample_options), std::move(root));
+	}
+
+  // plan the where clause
+	if (statement.where_clause) {
+		root = PlanFilter(std::move(statement.where_clause), std::move(root));
+	}
+
+  // plan groupby and aggregation
+	if (!statement.aggregates.empty() || !statement.groups.group_expressions.empty()) {
+
+		// groupby
+		if (!statement.groups.group_expressions.empty()) {
+			// visit the groups
+			for (auto &group : statement.groups.group_expressions) {
+				PlanSubqueries(group, root);
+			}
+		}
+
+		// now visit all aggregate expressions
+		for (auto &expr : statement.aggregates) {
+			PlanSubqueries(expr, root);
+		}
+
+		// finally create the aggregate node with the group_index and aggregate_index as obtained from the binder
+		auto aggregate = make_uniq<LogicalAggregate>(statement.group_index, statement.aggregate_index,
+		                                             std::move(statement.aggregates));
+		aggregate->groups = std::move(statement.groups.group_expressions);
+		aggregate->groupings_index = statement.groupings_index;
+		aggregate->grouping_sets = std::move(statement.groups.grouping_sets);
+		aggregate->grouping_functions = std::move(statement.grouping_functions);
+
+		aggregate->AddChild(std::move(root));
+		root = std::move(aggregate);
+	} else if (!statement.groups.grouping_sets.empty()) {
+		// edge case: we have grouping sets but no groups or aggregates
+		// this can only happen if we have e.g. select 1 from tbl group by ();
+		// just output a dummy scan
+		root = make_uniq_base<LogicalOperator, LogicalDummyScan>(statement.group_index);
+	}
+
+  // HAVING
+	if (statement.having) {
+		PlanSubqueries(statement.having, root);
+		auto having = make_uniq<LogicalFilter>(std::move(statement.having));
+
+		having->AddChild(std::move(root));
+		root = std::move(having);
+	}
+
+  // plan window expression
+	if (!statement.windows.empty()) {
+		auto win = make_uniq<LogicalWindow>(statement.window_index);
+		win->expressions = std::move(statement.windows);
+		// visit the window expressions
+		for (auto &expr : win->expressions) {
+			PlanSubqueries(expr, root);
+		}
+		D_ASSERT(!win->expressions.empty());
+		win->AddChild(std::move(root));
+		root = std::move(win);
+	}
+
+  // plan qualify
+	if (statement.qualify) {
+		PlanSubqueries(statement.qualify, root);
+		auto qualify = make_uniq<LogicalFilter>(std::move(statement.qualify));
+
+		qualify->AddChild(std::move(root));
+		root = std::move(qualify);
+	}
+
+  // plan unnest operations (flatten nested list-like or array-like columns
+  // e.g., LIST, ARRAY, JSON into a row-wise representation)
+	for (idx_t i = statement.unnests.size(); i > 0; i--) {
+		auto unnest_level = i - 1;
+		auto entry = statement.unnests.find(unnest_level);
+		if (entry == statement.unnests.end()) {
+			throw InternalException("unnests specified at level %d but none were found", unnest_level);
+		}
+		auto &unnest_node = entry->second;
+		auto unnest = make_uniq<LogicalUnnest>(unnest_node.index);
+		unnest->expressions = std::move(unnest_node.expressions);
+		// visit the unnest expressions
+		for (auto &expr : unnest->expressions) {
+			PlanSubqueries(expr, root);
+		}
+		D_ASSERT(!unnest->expressions.empty());
+		unnest->AddChild(std::move(root));
+		root = std::move(unnest);
+	}
+
+  // SELECT subquery (i.e., SELECT a, (SELECT b FROM ...), c FROM ...)
+	for (auto &expr : statement.select_list) {
+		PlanSubqueries(expr, root);
+	}
+
+	auto proj = make_uniq<LogicalProjection>(statement.projection_index, std::move(statement.select_list));
+	auto &projection = *proj;
+	proj->AddChild(std::move(root));
+	root = std::move(proj);
+
+	// finish the plan by handling the elements of the QueryNode
+	root = VisitQueryNode(statement, std::move(root));
+
+	// add a prune node if necessary
+	if (statement.need_prune) {
+		D_ASSERT(root);
+		vector<unique_ptr<Expression>> prune_expressions;
+		for (idx_t i = 0; i < statement.column_count; i++) {
+			prune_expressions.push_back(make_uniq<BoundColumnRefExpression>(
+			    projection.expressions[i]->return_type, ColumnBinding(statement.projection_index, i)));
+		}
+		auto prune = make_uniq<LogicalProjection>(statement.prune_index, std::move(prune_expressions));
+		prune->AddChild(std::move(root));
+		root = std::move(prune);
+	}
+	return root;
+}
+```
+
+---
 
 ## Optimizing
+
+Now, we return to
+[`ClientContext::CreatePreparedStatementInternal`](https://github.com/jensenojs/duckdb/blob/main/src/main/client_context.cpp#L354),
+which is the entry point for DuckDB's optimization logic.
+Here DuckDB diverges from heavyweight optimizers like Cascades or Calcite.
+Rather than iterate rules to a fix‑point, DuckDB runs a deterministic conveyor
+belt of passes—each fires once in a fixed order.
 
 >DuckDB’s optimizer performs join order optimization using dynamic programming [7] with a greedy fallback for
 complex join graphs [11]. It performs flattening of arbitrary
@@ -302,9 +637,122 @@ and constant folding. Cardinality estimation is done using a
 combination of samples and HyperLogLog. The result of this
 process is the optimized logical plan for the query.
 
->To Be Continued...
+```cpp
+shared_ptr<PreparedStatementData>
+ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock, const string &query,
+                                               unique_ptr<SQLStatement> statement,
+                                               optional_ptr<case_insensitive_map_t<BoundParameterData>> values) {
+
+	...
+
+	if (config.enable_optimizer && logical_plan->RequireOptimizer()) {
+		profiler.StartPhase(MetricsType::ALL_OPTIMIZERS);
+		Optimizer optimizer(*logical_planner.binder, *this);
+		logical_plan = optimizer.Optimize(std::move(logical_plan));
+		D_ASSERT(logical_plan);
+		profiler.EndPhase();
+
+	...
+}
+```
+
+`ClientContext::CreatePreparedStatementInternal` invokes
+[`Optimizer::Optimize`](https://github.com/duckdb/duckdb/blob/a35d8b6d5ba121f2601b917e1a7732207c944ae5/src/optimizer/optimizer.cpp#L270).
+
+```cpp
+unique_ptr<LogicalOperator> Optimizer::Optimize(unique_ptr<LogicalOperator> plan_p) {
+	Verify(*plan_p);
+
+	this->plan = std::move(plan_p);
+
+	for (auto &pre_optimizer_extension : DBConfig::GetConfig(context).optimizer_extensions) {
+		RunOptimizer(OptimizerType::EXTENSION, [&]() {
+			OptimizerExtensionInput input {GetContext(), *this, pre_optimizer_extension.optimizer_info.get()};
+			if (pre_optimizer_extension.pre_optimize_function) {
+				pre_optimizer_extension.pre_optimize_function(input, plan);
+			}
+		});
+	}
+
+	RunBuiltInOptimizers();
+
+	for (auto &optimizer_extension : DBConfig::GetConfig(context).optimizer_extensions) {
+		RunOptimizer(OptimizerType::EXTENSION, [&]() {
+			OptimizerExtensionInput input {GetContext(), *this, optimizer_extension.optimizer_info.get()};
+			if (optimizer_extension.optimize_function) {
+				optimizer_extension.optimize_function(input, plan);
+			}
+		});
+	}
+
+	Planner::VerifyPlan(context, plan);
+
+	return std::move(plan);
+}
+```
+
+which invokes [`Optimizer::RunBuiltInOptimizers`](https://github.com/duckdb/duckdb/blob/a35d8b6d5ba121f2601b917e1a7732207c944ae5/src/optimizer/optimizer.cpp#L101).
+
+```cpp
+void Optimizer::RunBuiltInOptimizers() {
+	switch (plan->type) {
+	case LogicalOperatorType::LOGICAL_TRANSACTION:
+	case LogicalOperatorType::LOGICAL_PRAGMA:
+	case LogicalOperatorType::LOGICAL_SET:
+	case LogicalOperatorType::LOGICAL_UPDATE_EXTENSIONS:
+	case LogicalOperatorType::LOGICAL_CREATE_SECRET:
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
+		// skip optimizing simple & often-occurring plans unaffected by rewrites
+		if (plan->children.empty()) {
+			return;
+		}
+		break;
+	default:
+		break;
+	}
+	// first we perform expression rewrites using the ExpressionRewriter
+	// this does not change the logical plan structure, but only simplifies the expression trees
+	RunOptimizer(OptimizerType::EXPRESSION_REWRITER, [&]() { rewriter.VisitOperator(*plan); });
+
+	// Rewrites SUM(x + C) into SUM(x) + C * COUNT(x)
+	RunOptimizer(OptimizerType::SUM_REWRITER, [&]() {
+		SumRewriterOptimizer optimizer(*this);
+		optimizer.Optimize(plan);
+	});
+
+	// perform filter pullup
+	RunOptimizer(OptimizerType::FILTER_PULLUP, [&]() {
+		FilterPullup filter_pullup;
+		plan = filter_pullup.Rewrite(std::move(plan));
+	});
+
+	...
+
+	// perform join filter pushdown after the dust has settled
+	RunOptimizer(OptimizerType::JOIN_FILTER_PUSHDOWN, [&]() {
+		JoinFilterPushdownOptimizer join_filter_pushdown(*this);
+		join_filter_pushdown.VisitOperator(*plan);
+	});
+}
+```
+
+DuckDB optimizer includes Rule-based Optimizations, such as
+[`EXPRESSION_REWRITER`](https://github.com/duckdb/duckdb/blob/a35d8b6d5ba121f2601b917e1a7732207c944ae5/src/include/duckdb/optimizer/expression_rewriter.hpp#L19),
+as well as Cost-based Optimizations, such as
+[`JOIN_ORDER`](https://github.com/duckdb/duckdb/blob/a35d8b6d5ba121f2601b917e1a7732207c944ae5/src/include/duckdb/optimizer/join_order/join_order_optimizer.hpp#L26).
+
+---
 
 ## Physical Planning
+
+Again, we return to
+[`ClientContext::CreatePreparedStatementInternal`](https://github.com/jensenojs/duckdb/blob/main/src/main/client_context.cpp#L354),
+which is the entry point for DuckDB's physical planing logic.
+
+With the logical plan polished, the PhysicalPlanGenerator swaps algebraic operators for concrete algorithms:
+- Scans may become sequential, index, or parquet scans.
+- Joins choose between hash, merge, nested‑loop, or even piecewise merge.
+- Aggregates decide on hash vs. sort based on GROUP BY keys & memory budget.
 
 > The physical planner transforms the logical plan into the physical plan,
 selecting suitable implementations where applicable. For example, a scan may
@@ -313,9 +761,55 @@ scanning the base tables based on selectivity estimates, or
 switch between a hash join or merge join depending on the
 join predicates.
 
->To Be Continued...
+```cpp
+shared_ptr<PreparedStatementData>
+ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock, const string &query,
+                                               unique_ptr<SQLStatement> statement,
+                                               optional_ptr<case_insensitive_map_t<BoundParameterData>> values) {
+
+	...
+
+	// Convert the logical query plan into a physical query plan.
+	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER);
+	PhysicalPlanGenerator physical_planner(*this);
+	result->physical_plan = physical_planner.Plan(std::move(logical_plan));
+	profiler.EndPhase();
+	D_ASSERT(result->physical_plan);
+	return result;
+}
+```
+
+The heart of DuckDB physical planning is [`PhysicalPlanGenerator::CreatePlan`](https://github.com/duckdb/duckdb/blob/32459c958ae5e1c112a02257dcc5b9f4bd59a7cc/src/execution/physical_plan_generator.cpp#L69),
+which converts each LogicalOperatorType to a corresponding physical plan operator.
+
+```cpp
+PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET:
+		return CreatePlan(op.Cast<LogicalGet>());
+	...
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
+		auto &extension_op = op.Cast<LogicalExtensionOperator>();
+		return extension_op.CreatePlan(context, *this);
+	}
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+	case LogicalOperatorType::LOGICAL_INVALID: {
+		throw NotImplementedException("Unimplemented logical operator type!");
+	}
+	}
+	throw InternalException("Physical plan generator - no plan generated");
+}
+```
+
+---
 
 ## Execution
+
+Finally, [`PendingQueryResult::ExecuteInternal`](https://github.com/duckdb/duckdb/blob/32459c958ae5e1c112a02257dcc5b9f4bd59a7cc/src/main/pending_query_result.cpp#L71).
+pulls vector chunks (1 k rows by default) through the physical tree.
+DuckDB calls the design Vector Volcano: same pull‑based iterator model as
+classic Volcano, but each call returns a SIMD‑friendly block instead of a single tuple.
 
 >DuckDB uses a vectorized interpreted execution engine [1].
 This approach was chosen over Just-in-Time compilation
@@ -343,8 +837,31 @@ chunks from child nodes, eventually arriving at a scan operator which produces c
 tables. This continues until the chunk arriving at the root is
 empty, at which point the query is completed
 
->To Be Continued...
+```cpp
+unique_ptr<QueryResult> PendingQueryResult::ExecuteInternal(ClientContextLock &lock) {
+	CheckExecutableInternal(lock);
 
+	PendingExecutionResult execution_result;
+	while (!IsResultReady(execution_result = ExecuteTaskInternal(lock))) {
+		if (execution_result == PendingExecutionResult::BLOCKED) {
+			CheckExecutableInternal(lock);
+			context->WaitForTask(lock, *this);
+		}
+	}
+	if (HasError()) {
+		if (allow_stream_result) {
+			return make_uniq<StreamQueryResult>(error);
+		} else {
+			return make_uniq<MaterializedQueryResult>(error);
+		}
+	}
+	auto result = context->FetchResultInternal(lock, *this);
+	Close();
+	return result;
+}
+```
+
+---
 
 ## 5  Further Reading
 
