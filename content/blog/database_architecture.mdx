@@ -137,6 +137,19 @@ unique_ptr<QueryResult> ClientContext::Query(const string &query, bool allow_str
 Before the engine can reason about a query it needs syntax.  DuckDB piggy‑backs on the proven Postgres parser,
 then immediately converts the Postgres nodes into its own C++ AST to avoid leaking PG structs all over the code base.
 
+As DuckDB [paper](https://mytherin.github.io/papers/2019-duckdbdemo.pdf) described it:
+
+>The SQL parser is derived from Postgres’ SQL parser that
+has been stripped down as much as possible [2]. This has
+the advantage of providing DuckDB with a full-featured and
+stable parser to handle one of the most volatile form of its
+input, SQL queries. The parser takes a SQL query string as
+input and returns a parse tree of C structures. This parse tree
+is then immediately transformed into our own parse tree of
+C++ classes to limit the reach of Postgres’ data structures.
+This parse tree consists of statements (e.g. SELECT, INSERT
+etc.) and expressions (e.g. SUM(a)+1).
+
 As shown above, the entry point for DuckDB parsing logic is `ClientContext::ParseStatements`
 ([code](https://github.com/duckdb/duckdb/blob/0069af20abea2660d67849257bc568570388d50c/src/main/client_context.cpp#L630))
 
@@ -161,19 +174,6 @@ DuckDB parser code lives in [`src/parser/`](https://github.com/duckdb/duckdb/tre
 the entry point is [`Parser::ParseQuery`](https://github.com/duckdb/duckdb/blob/main/src/parser/parser.cpp#L191).
 DuckDB uses Postgres parser to parse the SQL text and, if successfully parsed, transforms the Postgres parse tree into
 DuckDB's own AST (`SQLStatements`).
-
-As DuckDB [paper](https://mytherin.github.io/papers/2019-duckdbdemo.pdf) described it:
-
->The SQL parser is derived from Postgres’ SQL parser that
-has been stripped down as much as possible [2]. This has
-the advantage of providing DuckDB with a full-featured and
-stable parser to handle one of the most volatile form of its
-input, SQL queries. The parser takes a SQL query string as
-input and returns a parse tree of C structures. This parse tree
-is then immediately transformed into our own parse tree of
-C++ classes to limit the reach of Postgres’ data structures.
-This parse tree consists of statements (e.g. SELECT, INSERT
-etc.) and expressions (e.g. SUM(a)+1).
 
 ```cpp
 void Parser::ParseQuery(const string &query) {
