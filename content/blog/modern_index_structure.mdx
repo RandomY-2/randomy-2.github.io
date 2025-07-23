@@ -1,0 +1,193 @@
+---
+slug: modern-index-structure
+title: "Beyond the Classic B-Tree: The Evolution Towards Modern Variants for Cache-Efficient, Concurrent Indexing"
+date: "2025-07-13"
+description: "A survey of B+-Tree evolution to tackle cache hierarchy, block-oriented reads, append-friendly writes, and high-concurrency workloads."
+tags: [databases, b-tree, b+-tree, data-structures, concurrency, cache]
+---
+
+## Hardware Characteristics
+
+### CPU / Cache Perspective — Exploit Concurrency, Dodge Invalidations
+
+Beginning in the mid‑2000s, transistor counts kept climbing but
+single‑thread performance flat‑lined. Voltage and frequency scaling
+hit thermal and physical walls, so CPU vendors pivoted from *faster*
+cores to *more* cores. Laptops now arrive with 8‑16 cores; top‑end
+server parts expose 32/64+ general‑purpose cores plus assorted accelerators.
+This shift means modern software, especially performance-critical components like index structures,
+must fully leverage multi-core parallelism to scale.
+
+To utilize this hardware effectively, modern index designs must satisfy two critical requirements:
+
+1. **Fine-grained parallelism** — Coarse-grained locks (e.g., A latch per node, or worse, per tree) create contention
+   and quickly become bottlenecks under high concurrency. Even node-level locks can limit throughput
+   as they serialize access to frequently accessed paths. Lock-free or latch-free techniques, such as
+   optimistic concurrency control or CAS, help eliminate this bottleneck and allow more cores to operate independently.
+
+2. **Cache-friendly behavior** — Shared mutable state can lead to expensive cache invalidations across cores.
+   In-place modifications to nodes (e.g., updates during insertions or deletions) can force cache line ownership
+   transfers and stall pipelines. Modern variants therefore favor immutable or append-only designs where updates
+   generate new versions or deltas, keeping hot read paths in clean, read-only cache lines.
+
+In fact, being latch-free can help to avoid both problems, as shown in
+**Figure 1 (adapted from [OLIFT](https://15721.courses.cs.cmu.edu/spring2016/papers/cha-vldb2001.pdf))**,
+which traces the cache‑line “ping‑pong” that unfolds when multiple threads walk overlapping
+root‑to‑leaf paths **n1 → n2/n3 → n4–n7**:
+
+![Figure 1: Coherence Storm Triggered by Node‑Resident Latches](/figures/latch-cache-miss.png)
+
+1. **p1** starts from a cold cache, traverses **n1 → n2 → n4**, and pulls these nodes into its private cache
+**c1** while toggling their latches.
+2. **p2** soon follows the path **n1 → n2 → n5**.  Every latch acquire/release *writes* that same cache line,
+so the clean copies of **n1** and **n2** in **c1** are invalidated—even though **c1** has plenty of free space.
+3. **p3** walks **n1 → n3 → n6** and, by latching **n1**, invalidates its copy in **c2**.
+4. **p4** finishes with **n1 → n3 → n7**, knocking **n1** and **n3** out of **c3**.
+
+### Storage Perspective — From HDD to SSD, and Why Sequential Still Wins
+
+Disk latency is still bottleneck. HDDs employ a
+mechanical actuator arm that must seek to the right cylinder and then wait for the platter to rotate
+beneath the head.  Each random update therefore incurs two mechanical delays—seek time and rotational
+latency.  Sequential I/O, by contrast, streams data past the head in order and keeps the arm largely
+stationary, saturating the platter’s transfer bandwidth.
+
+SSDs eliminated moving parts and slashed random‑read latencies, but because flash cells must be erased
+before they can be reprogrammed, random‑write heavy workloads scatter
+live pages across many blocks, forcing the Flash Translation Layer (FTL) to migrate data during garbage
+collection and amplifying writes. Large sequential writes remain king on SSDs since they fill entire
+erase blocks in one go, allowing the FTL to retire them en masse with minimal overhead.
+
+Modern index structures therefore needs to favor:
+
+1. **Sequential and append-only write patterns**
+   Buffer writes in memory and flush them in large, contiguous segments to minimize erase‑cycle overhead
+   and write amplification. Avoid random in‑place updates (which trigger erase cycles); instead, versioned or shadow‑copy
+   approaches let you treat flash more like a circular log.
+
+2. **Write coalescing and batching**
+   Group small updates together so that many logical writes map to a single physical block write, further reducing FTL churn.
+
+---
+
+## B-Link Tree and Support for Latch-Free Reads
+
+To meet the demands of modern hardware outlined above, researchers and system architects have revisited the classic
+B+-Tree and proposed variants that retain its search efficiency while improving concurrency and write behavior.
+One of the earliest and most influential variants is the [**B-Link Tree**](https://dl.acm.org/doi/10.1145/319628.319663).
+
+The B-Link Tree extends the B+-Tree with two simple but powerful ideas:
+
+```plaintext
+      [10 | →]          (root)
+       /    \
+  [5 | →]  [15 | →]     (leaf nodes with right-sibling pointers)
+````
+
+1. **Sibling Pointers** — Each node includes a right-sibling pointer that allows searches and insertions to "jump right"
+if keys fall beyond a node’s range. This provides a form of horizontal traversal and simplifies concurrent modifications,
+especially during splits.
+
+2. **High-Key Invariants** — Each internal node stores a *high key*, which marks the upper bound of the key range contained
+in its child. This lets concurrent readers safely determine whether to descend or jump to a sibling, even as concurrent
+writers are splitting nodes.
+
+Noticeably, B-Link Tree assumes read and write operations on each node are **indivisible** (e.g, atomic), which may
+or may not be true in modern lens
+
+> “get” and “put” operations are assumed to be indivisible
+
+and insertions will happen from top-to-bottom and left-to-right. That is, if a node needs to split, the new node
+will always be placed as the original node's right sibling.
+
+### Latch-Free Reads
+
+As mentioned above, acquiring and releasing latches not only hinders concurrency (especially if the lock is not shared),
+but also induces costly cache line invalidations in multi-core systems. One of the key strengths of the B-Link Tree
+is that it enables **Latch-Free Reads** through a careful design of its traversal logic and node layout.
+
+> To search for a value, u, in the tree, the search process begins at the root and
+proceeds by comparing u with the values in each node in a path down the tree. In
+each node, the comparisons produce a pointer to follow from that node, whether
+to the next level, or to a leaf (record) node. If the search process examines a node
+and finds that the maximum value given by that node is less than u, then it infers
+some change has taken place in the current node that had not been indicated in
+the father at the time the father was examined by the search. The current node
+must have been split into two (or more) new nodes. The search must then rectify
+the error in its position in the tree by following the link pointer of the newly split
+node instead of by following a son pointer as it would ordinarily do
+
+This ability to **"jump right"** ensures forward progress even in the presence of concurrent
+structural modifications,
+without requiring any coordination with the writers (remember, reads are assumed to never see
+partially updated tree, and splits will always happen left-to-right ). Readers never block, and
+writers do not have to delay
+or invalidate ongoing traversals — an essential property for high-throughput systems on modern hardware.
+
+---
+
+## Bw-Tree: A Latch-Free, SSD-Friendly Index
+
+While B-Link Trees make it possible to avoid latches during read operations, [**Bw-Trees**](https://15721.courses.cs.cmu.edu/spring2016/papers/bwtree-icde2013.pdf)
+push this concept further
+by eliminating latches entirely, even during writes and structure modifications. Proposed by Microsoft Research in
+2013, the Bw-Tree is a high-performance index structure designed specifically for modern multi-core, SSD-based systems.
+
+Unlike traditional B-Trees, the Bw-Tree introduces three core innovations:
+
+1. **Delta Records** — Instead of modifying pages in-place, updates are encoded as delta records and prepended to
+existing page state. This preserves cache locality and enables lock-free updates via atomic CAS (Compare-And-Swap).
+
+2. **Mapping Table** — Logical page IDs (PIDs) map to physical memory or disk addresses. All links between nodes
+(e.g., parent to child) use PIDs, not physical pointers, enabling structure modifications without rewriting parent nodes.
+
+3. **Log-Structured Storage** — Bw-Trees employ their own write-optimized storage layer instead of relying on the
+Flash Translation Layer (FTL). This improves SSD write performance by controlling flushing and avoiding write amplification.
+
+![Figure 2: Bw-Tree Layers](/figures/bw-tree-archi-1.png)
+
+![Figure 3: Bw-Tree Architecture](/figures/bw-tree-archi-2.png)
+
+These techniques directly address the hardware constraints discussed earlier. The Bw-Tree eliminates blocking synchronization
+by relying solely on
+atomic instructions. By avoiding in-place updates, it minimizes inter-core cache invalidations, increasing cache residency
+and CPU throughput.
+Its log-structured I/O layer aligns with the sequential write preference of SSDs, enabling high-throughput, low-latency
+persistence.
+
+> In our Bw-tree design, threads almost never block. Eliminating latches is our main technique. Instead of latches,
+we install state changes using the atomic compare and swap (CAS) instruction.
+
+> Further, the Bw-tree performs node updates via ”delta updates” (attaching the update to an existing page), not via
+update-in-place (updating the existing page memory). Avoiding update-in-place reduces CPU cache invalidation,
+resulting in higher cache hit ratios. Reducing cache misses increases the instructions executed per cycle.
+
+> I/O access rates can limit performance. Our log structure storage layer enables writing large buffers, effectively
+eliminating any write bottle neck. Flash storage’s high random read access rates coupled with a large main memory
+cache minimizes blocking on reads. Writing large multi-page buffers permits us to write variable size pages that
+do no contain “filler” to align to a uniform size boundary.
+
+### Delta Chains and Mapping Table
+
+Every logical page is represented as a chain of delta records sitting atop a base page.
+Periodically, long delta chains are merged ("consolidated")
+into a fresh base page to maintain fast read performance.
+
+Delta records are installed by atomically swapping the page's pointer in the mapping table, ensuring no thread sees
+partial state. If a CAS fails (another thread updated first), the operation retries.
+
+Together, the delta chain and mapping table enable Bw-Tree’s **lock-free semantics**. The delta chain avoids in-place
+writes, preserving cache locality and supporting concurrent access. The mapping table coordinates version transitions
+via atomic CAS, ensuring readers and writers operate on consistent views.
+
+### Structural Modifications: Split and Merge
+
+Bw-Trees decompose structural changes into atomic, CAS-installable actions.
+
+**Split** is performed in two
+steps — first, a split delta is installed on the child page; then, the parent is updated
+with a new index term. B-Link style sibling pointers allow searches to traverse split pages before the parent is updated.
+
+
+**Merge** is more complex, multi-step process involving a remove-node delta, a merge delta, and an index-term delete.
+All steps are atomic and latch-free. Epoch-based garbage collection ensures no memory is reclaimed prematurely.
