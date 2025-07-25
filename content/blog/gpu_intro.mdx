@@ -1,0 +1,160 @@
+---
+slug: gpu-architecture-intro
+title: "An Introduction to GPU Architecture: A Systems Perspective"
+date: "2025-07-23"
+description: "An overview of how GPU architecture differs from CPUs, and why it's essential for
+parallel computing and modern workloads like ML and graphics."
+tags: [gpu, architecture, parallel-computing, hardware, machine-learning]
+---
+
+## Why Learn GPU Architecture?
+
+Modern applications—from graphics rendering and video processing to machine learning and scientific
+simulation—rely heavily on GPUs. Unlike CPUs, which are optimized for latency-sensitive, sequential
+tasks, GPUs are engineered for **throughput** and **massive parallelism**.
+
+---
+
+## Architectural Divergence Between CPU and GPU
+
+![Figure 1: CPU vs. GPU](/figures/cpu-vs-gpu.png)
+
+The above diagram provides an abstract visualization of the architectural distinctions between CPUs
+and GPUs. It represents the relative transistor allocation for different functional components using
+colored regions. In this schematic, green indicates computational units, gold denotes instruction
+control and scheduling logic, purple corresponds to L1 cache, blue represents higher-level caches
+(e.g., L2 or L3), and orange signifies DRAM (in reality size should be much larger relatively).
+
+The relative area of each block reflects the design emphasis of each architecture:
+
+- CPUs allocate more transistors
+to **control logic and large caches** and is good for multitasking and fast **serial processing**
+
+- GPUs prioritize **computational throughput** by dedicating more area to arithmetic units.
+
+In simple words from a [Cornell Workshop](https://cvw.cac.cornell.edu/gpu-architecture/gpu-characteristics/design):
+
+>1. CPUs can handle more complex workflows compared to GPUs.
+>2. CPUs don't have as many arithmetic logic units or floating point units as GPUs
+(the small green boxes above, roughly speaking), but the ALUs and FPUs in a CPU core are individually more capable.
+>3. CPUs have more cache memory than GPUs.
+
+---
+
+## Compute Units: Large-and-Smart vs. Small-and-Many
+
+A key distinction lies in the nature and number of compute units (or **cores**). CPUs typically have a
+small number of complex, high-performance cores capable of executing out-of-order instructions,
+speculative branches, and sophisticated prediction mechanisms. These features allow CPUs to minimize
+latency for single-threaded workloads and to dynamically optimize control flow during execution.
+
+In contrast, GPUs consist of hundreds or even thousands of simpler cores that operate under the **Single
+Instruction, Multiple Threads (SIMT)** paradigm. These cores are not designed to handle complex control
+logic or branch prediction. Instead, they excel at performing simple, arithmetic-heavy operations—such
+as fused multiply-add (FMA)—across large volumes of data.
+
+Although SIMT is conceptually related to SIMD, it introduces a crucial relaxation: thread-level predication.
+In SIMD, all data lanes execute the same instruction unconditionally, which limits expressiveness in
+control flow. SIMT, by contrast, allows threads within a **warp** (typically 32 threads) to diverge and
+execute different paths conditionally, using **per-thread masking**. For example, in a warp encountering
+an `if-else` branch, threads for which the condition evaluates to `true` will be active during the execution
+of the `if` block, while the others are deactivated. Afterward, the inactive threads are reactivated for
+the `else` block, and the roles reverse.
+
+![Figure 3: GPU If-Else](/figures/gpu-if-else.png)
+
+It is worth emphasizing that although we speak of "cores" in both CPU and GPU contexts, they are not equivalent
+in capability or granularity. A single GPU core—a **CUDA core**--is more accurately
+comparable to a single vector lane within the vector processing unit of a CPU. CUDA cores operate in groups,
+such as of 32, executing the same instruction simultaneously on different data elements. This SIMD-style execution
+is central to GPU performance. While CPUs also support SIMD via vector units, these typically operate on much
+smaller widths (e.g., 128-bit or 256-bit registers processing 4, 8, or 16 elements). Consequently, GPU cores are
+optimized for bulk throughput over large data arrays, whereas CPU vector units provide modest parallelism tightly
+coupled with control-rich logic. The following are more terms explained from the Cornell Workshop.
+
+![Figure 2: GPU Compute Terms](/figures/gpu-compute-terms.png)
+
+---
+
+## Memory Hierarchy: Cache-Coherent vs. Software-Managed
+
+![Figure 2: GPU Memory Architecture](/figures/gpu-memory-archi.png)
+
+Memory subsystems further illustrate the architectural divergence between CPUs and GPUs.
+CPU memory hierarchies are built around deep, hardware-managed cache systems—including L1,
+L2, and a shared L3 cache—which aim to minimize DRAM latency while remaining fully transparent
+to the programmer. These caches are coherent and dynamically updated by hardware, allowing CPUs
+to support workloads with complex branching, irregular data access, and pointer-heavy memory
+patterns efficiently.
+
+GPU memory hierarchies, in contrast, are more explicitly tiered and programmer-visible. At the top
+sits **global memory**—typically implemented as high-bandwidth GDDR or HBM—which provides substantial
+throughput but incurs relatively high access latency. Each **Streaming Multiprocessor (SM)** includes
+a **shared memory** segment, a low-latency, explicitly managed scratchpad that facilitates intra-block
+communication and data reuse. Specialized memory types, such as **constant** and **texture memory**,
+offer additional access optimizations for read-only and spatially-local workloads.
+
+GPUs do have cache structures (e.g., L1 per SM and a unified L2 cache shared across SMs), but these are
+generally shallower and less sophisticated than their CPU counterparts. Each CPU core includes dedicated
+L1 and L2 caches and a partitioned share of a larger L3 cache, yielding significantly more total cache
+space per core than is available on a typical GPU.
+
+---
+
+## CUDA Programming Model
+
+The CUDA programming model exposes the GPU’s parallel execution capabilities to the developer. A CUDA program
+consists of both
+**host code**, which runs on the CPU, and **device code**, which runs on the GPU. The CPU (host) initiates
+GPU computation by launching **kernel functions**—CUDA device-side functions marked with the `__global__`
+qualifier—that are executed by many parallel threads on the GPU.
+
+### Host–Device Interaction
+
+1. **Initialization** The host allocates buffers in host and device memory and, if necessary, pins host pages to enable
+direct-memory-access (DMA) transfers.
+2. **Data Movement** Input data are transferred to global memory over PCIe or NVLink.  Asynchronous copies (`cudaMemcpyAsync`)
+let the host queue transfers and immediately proceed.
+3. **Kernel Launch** With the execution configuration set, the host enqueues the kernel.  The GPU driver partitions the
+grid across available SMs; individual blocks are dispatched as soon as hardware resources (registers, shared memory, warp
+slots) are free.
+4. **Execution & Concurrency** Within each SM, a warp scheduler issues instructions from resident warps every cycle,
+hiding global-memory latency by readily switching to another ready warp.
+5. **Completion & Copy-Back** When all blocks finish, control returns to the host.  Output data are copied back to host
+memory, after which the host proceeds with post-processing or launches subsequent kernels.
+
+The drawback of heterogeneous CPU–GPU computing is the **communication overhead across the host–device boundary**.
+Even with high-bandwidth interconnects (e.g., NVLink), the latency and bandwidth of CPU–GPU transfers and kernel
+launch latencies are orders of magnitude worse than on-chip memory accesses.
+
+### Hierarchical Parallelism
+
+CUDA expresses parallel work in a three-level hierarchy, closely mirroring the underlying hardware:
+
+1. **Thread**
+   The smallest execution context. Each thread owns its own program counter, predicate registers,
+    and a slice of the SM’s large register file.  A thread can access *registers* (fast, private),
+	*local memory* (off-chip spill space), *shared memory* (if declared `__shared__`), and *global memory* (per grid).
+
+2. **Block**
+   A cooperative group of threads that execute concurrently on a single Streaming Multiprocessor.
+   Threads in the same block can synchronize with the barrier primitive `__syncthreads()` and exchange data
+   through low-latency *shared memory*.  Modern GPUs allow up to 1024 resident threads per block; several
+   blocks may occupy the same SM simultaneously if resources remain.
+
+3. **Grid**
+   The collection of all blocks launched by a single kernel invocation.  Blocks in a grid are independent:
+   they share global memory but have no implicit ordering or direct synchronization mechanism.  Global coordination
+   therefore requires either multiple kernel launches or newer features such as *Cooperative Groups*.
+
+
+<img
+  src="/figures/thread-block-grid.png"
+  alt="Figure 3: Thread Block Grid"
+  className="mx-auto my-4"
+/>
+
+Beneath this programmer-visible structure lies the hardware scheduling unit known as a *warp*—a set of 32 threads
+within a block that execute in lock-step under the SIMT paradigm discussed
+earlier.  Warp divergence, caused by per-thread control-flow variation, is handled through per-thread predication
+and serial execution of divergent paths, reducing arithmetic throughput while preserving correctness.
