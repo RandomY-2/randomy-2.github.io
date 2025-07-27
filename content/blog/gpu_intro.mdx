@@ -103,29 +103,17 @@ space per core than is available on a typical GPU.
 
 ## CUDA Programming Model
 
-The CUDA programming model exposes the GPU’s parallel execution capabilities to the developer. A CUDA program
-consists of both
-**host code**, which runs on the CPU, and **device code**, which runs on the GPU. The CPU (host) initiates
-GPU computation by launching **kernel functions**—CUDA device-side functions marked with the `__global__`
-qualifier—that are executed by many parallel threads on the GPU.
-
-### Host–Device Interaction
-
-1. **Initialization** The host allocates buffers in host and device memory and, if necessary, pins host pages to enable
-direct-memory-access (DMA) transfers.
-2. **Data Movement** Input data are transferred to global memory over PCIe or NVLink.  Asynchronous copies (`cudaMemcpyAsync`)
-let the host queue transfers and immediately proceed.
-3. **Kernel Launch** With the execution configuration set, the host enqueues the kernel.  The GPU driver partitions the
-grid across available SMs; individual blocks are dispatched as soon as hardware resources (registers, shared memory, warp
-slots) are free.
-4. **Execution & Concurrency** Within each SM, a warp scheduler issues instructions from resident warps every cycle,
-hiding global-memory latency by readily switching to another ready warp.
-5. **Completion & Copy-Back** When all blocks finish, control returns to the host.  Output data are copied back to host
-memory, after which the host proceeds with post-processing or launches subsequent kernels.
+The CUDA programming model exposes the GPU’s parallel execution capabilities to the developer.
+A CUDA program consists of **host code** (CPU) and **device code** (GPU). The host initiates
+GPU work by launching **kernel functions**—device routines marked `__global__`. Conceptually,
+a kernel is written as if it will execute on a **single thread**; at launch, the runtime instantiates
+that same function across a user-specified grid of threads (often thousands or millions). Thus,
+one source-level kernel maps to many concurrent thread instances, each operating on different data.
 
 The drawback of heterogeneous CPU–GPU computing is the **communication overhead across the host–device boundary**.
 Even with high-bandwidth interconnects (e.g., NVLink), the latency and bandwidth of CPU–GPU transfers and kernel
 launch latencies are orders of magnitude worse than on-chip memory accesses.
+
 
 ### Hierarchical Parallelism
 
@@ -136,7 +124,7 @@ CUDA expresses parallel work in a three-level hierarchy, closely mirroring the u
     and a slice of the SM’s large register file.  A thread can access *registers* (fast, private),
 	*local memory* (off-chip spill space), *shared memory* (if declared `__shared__`), and *global memory* (per grid).
 
-2. **Block**
+2. **Thread Block**
    A cooperative group of threads that execute concurrently on a single Streaming Multiprocessor.
    Threads in the same block can synchronize with the barrier primitive `__syncthreads()` and exchange data
    through low-latency *shared memory*.  Modern GPUs allow up to 1024 resident threads per block; several
@@ -156,5 +144,10 @@ CUDA expresses parallel work in a three-level hierarchy, closely mirroring the u
 
 Beneath this programmer-visible structure lies the hardware scheduling unit known as a *warp*—a set of 32 threads
 within a block that execute in lock-step under the SIMT paradigm discussed
-earlier.  Warp divergence, caused by per-thread control-flow variation, is handled through per-thread predication
+earlier (for AMD, typically a warp includes 64 threads).  Warp divergence, caused by per-thread control-flow variation,
+is handled through per-thread predication
 and serial execution of divergent paths, reducing arithmetic throughput while preserving correctness.
+
+An example CUDA and host code are as follows:
+
+![Figure 4: CUDA Code](/figures/cuda-code-example.png)
