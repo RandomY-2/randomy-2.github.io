@@ -1,6 +1,6 @@
 ---
 slug: gpu-architecture-intro
-title: "An Introduction to GPU Architecture: A Systems Perspective"
+title: "GPU Architecture and Optimization: Execution Model, Memory Hierarchy, and Tuning Techniques"
 date: "2025-07-23"
 description: "An overview of how GPU architecture differs from CPUs, and why it's essential for
 parallel computing and modern workloads like ML and graphics."
@@ -110,10 +110,13 @@ a kernel is written as if it will execute on a **single thread**; at launch, the
 that same function across a user-specified grid of threads (often thousands or millions). Thus,
 one source-level kernel maps to many concurrent thread instances, each operating on different data.
 
+An example CUDA and host code are as follows:
+
+![Figure 4: CUDA Code](/figures/cuda-code-example.png)
+
 The drawback of heterogeneous CPU–GPU computing is the **communication overhead across the host–device boundary**.
 Even with high-bandwidth interconnects (e.g., NVLink), the latency and bandwidth of CPU–GPU transfers and kernel
 launch latencies are orders of magnitude worse than on-chip memory accesses.
-
 
 ### Hierarchical Parallelism
 
@@ -142,12 +145,247 @@ CUDA expresses parallel work in a three-level hierarchy, closely mirroring the u
   className="mx-auto my-4"
 />
 
-Beneath this programmer-visible structure lies the hardware scheduling unit known as a *warp*—a set of 32 threads
-within a block that execute in lock-step under the SIMT paradigm discussed
-earlier (for AMD, typically a warp includes 64 threads).  Warp divergence, caused by per-thread control-flow variation,
-is handled through per-thread predication
-and serial execution of divergent paths, reducing arithmetic throughput while preserving correctness.
+A block is mapped to execute on a single SM and is the scope for fast barrier sync
+(`__syncthreads()`) and programmer-managed **shared memory**. Multiple blocks can co-reside
+on one SM, subject to resource limits (registers, shared memory, warp slots).
 
-An example CUDA and host code are as follows:
+Warps (32 threads on NVIDIA, 64 on many AMD GPUs) are the entities actually issued by the
+SM’s schedulers. All threads in a warp execute the same decoded instruction each cycle,
+with per-thread predication masking off inactive lanes during divergent branches. Warp–shuffle intrinsics
+enable lane-to-lane data exchange without using shared memory.
 
-![Figure 4: CUDA Code](/figures/cuda-code-example.png)
+Each thread owns its own program counter and register slice, but at the hardware level it is one lane
+within a warp. The compiler determines how many registers on each SM is allocated to each thread; excess
+demand spills to device memory (“local” memory), which is slower though often cached.
+
+GPUs are throughput-oriented. When a warp stalls on a long-latency operation (e.g., a global memory load),
+the SM continues by executing another ready warp—**Thread-Level Parallelism (TLP)**. Compilers
+and hardware also exploit **Instruction-Level Parallelism (ILP)** within a warp’s instruction stream (issuing
+independent arithmetic ops while others wait).
+
+How many blocks (and thus warps) can be active on an SM—often termed **occupancy**—is bounded by three primary factors:
+
+1. **Threads per block** (block size, up to 1,024 on most NVIDIA GPUs).
+2. **Registers per thread**, multiplied by threads per block, must fit in the SM’s register file.
+3. **Shared memory per block**, which is carved out of the SM’s on-chip scratchpad.
+
+Large blocks with heavy register or shared-memory footprints can throttle concurrency to one or two blocks per SM; smaller
+or lighter-weight blocks allow the scheduler to resident more blocks and thus more warps.
+
+---
+
+## Optimizations for GPU Programming
+
+This section outlines some optimization techniques for GPU programming, as described in
+[this paper](https://dl.acm.org/doi/pdf/10.1145/3570638), into four themes:
+
+1. **Memory Access** – Because memory latency are often much slower than computation latency,
+	optimizing data movement is important.
+
+2. **Irregularity** – Mapping irregular algorithms onto the highly regular GPU.
+
+3. **Balancing** – Ensuring the hardware stays busy and no resource becomes the bottleneck.
+
+4. **Host Interaction** – Overlapping PCIe/NVLink transfers with kernels, batching launches, keeping data resident
+	on device, and coordinating multi-kernel pipelines.
+
+### Memory Access
+
+Optimizing for memory access is an important theme in GPU programming because GPUs are computationally very strong due
+to the high degree of parallelism whereas memory access is typically much slower than computation.
+
+#### On-Chip Optimizations
+
+On-chip resources—registers, shared memory, warp-wide intrinsics, and the small L1/L2 caches—are the first line of defense
+against the high latency of off-chip DRAM. Effective kernels aggressively exploit these structures to maximize data reuse,
+ reduce traffic to global memory, and avoid serialization hazards.
+
+**Use Specialized On-Chip Memories.**
+GPUs expose several dedicated, fast paths besides generic caches. **Constant memory** provides broadcast-friendly, read-only
+storage: when all threads in a warp read the same location, the access collapses to a single memory transaction.
+**Texture memory** is a read-only, hardware-cached space with a dedicated cache tuned for 2D spatial locality. It provides
+built-in filtering and address-mode handling (e.g., clamp/repeat) and is frequently leveraged in GPGPU kernels to speed
+irregular or strided accesses and lightweight format conversions.
+**Shared memory** is a software-managed memory allocated per thread block and physically resident in the SM. It enables
+low-latency sharing of data between threads in the same thread block, but demands careful layout to prevent
+bank conflicts. Padding, index remapping, or data reordering are common tactics to ensure threads in a warp hit
+different banks.
+
+**Exploit Warp-Level Primitives.** Since Kepler-generation GPUs, NVIDIA has exposed warp-level intrinsics that enable
+intra-warp communication without shared memory or block-wide barriers. **Warp-vote** operations
+evaluate predicates at warp-level and broadcast result to all threads in the warp, while
+**warp-shuffle** operations share data intra-warp without going through shared
+memory. These instructions cut latency and shared-memory pressure and
+are routinely used to implement warp-scope reductions, scans, compaction, and small-tile transpositions.
+
+**Exploit Warp-Level Primitives.**
+Since Kepler-era GPUs, **warp-vote** and **warp-shuffle** instructions allow threads in a warp to reach consensus
+without explicitly synchronizing at block scope. These intrinsics cut latency and
+pressure on shared memory, and are particularly effective for collectives like reductions, scans, ballot-based compaction,
+or small-tile transpositions.
+
+**Register Blocking (Temporal Blocking).**
+Registers are the fastest storage available and are private to each thread. Keeping temporally reused scalars in registers
+eliminates repeated loads from shared or global memory. This is especially useful in stencil codes and accumulation-heavy
+kernels. Because registers cannot be indexed dynamically, compilers or templates often unroll loops and scalarize arrays
+to keep values in registers.
+
+**Reduce Register Usage**
+Excessive register use throttles occupancy and may trigger **spilling** to off-chip “local” memory. Techniques include:
+minimizing temporary variables, packing small types, recomputing cheap expressions instead of storing them, moving rarely
+reused data to shared memory, or explicitly capping registers per thread (with care). Loop unrolling can both help (fewer
+induction variables) and hurt (more live values); measure and tune.
+
+**Recompute When Cheaper Than Reload.**
+On modern GPUs, flops are abundant and memory is scarce. Recomputing values—especially simple arithmetic or address
+calculations—can be faster than fetching them from memory. Combined with kernel fusion, recomputation avoids writing
+intermediates to global memory and subsequent reloading, reducing synchronization and bandwidth costs.
+
+#### Off-Chip Optimizations
+
+**Coalesced Access.** Global-memory bandwidth is maximized when the 32 threads of a warp access contiguous, properly
+aligned addresses so the hardware can serve them with a few wide transactions instead of many narrow ones. Achieving
+coalescing may require reorganizing data (e.g., struct-of-arrays, transpositions, padding), remapping threads to data,
+tiling through shared memory (load coalesced, then access arbitrarily), or even adopting alternative parallelization
+strategies and index schemes (e.g., space-filling curves). For highly irregular workloads (sparse matrices, graphs),
+custom data formats and caching strategies are often necessary to approximate coalesced behavior.
+
+**Spatial Blocking (Loop Tiling).** Partition computations and data into tiles that fit on-chip, processing one tile at
+a time. Spatial blocking increases locality in L1/L2 caches, texture caches, registers, and shared memory, and can also
+reduce warp divergence. Tile dimensions can be auto-tuned and need not match thread-block dimensions, enabling flexible
+work-per-thread choices.
+
+**Kernel Fusion.** Merging kernels that consume/produce the same data avoids intermediate global-memory writes/reads,
+reduces kernel-launch overhead, and can improve cache reuse. The trade-off is higher register and shared-memory usage
+in the fused kernel, which can depress occupancy. Balance fusion benefits against resource pressure.
+
+**Software Prefetching.** Although GPUs hide latency using warp switching, explicit prefetching (often double-buffered)
+in application code can pipeline memory and computation within a kernel iteration. Prefetch the next tile’s data into
+registers/shared memory  while computing on the current tile to smooth stalls. Warp specialization—dedicating a warp to
+prefetch—can also be effective.
+
+**Data Compression.** Compressing inputs on the host and transferring compressed representations can cut PCIe/NVLink
+traffic and device memory footprint; decompression on the GPU trades a few ALU cycles for bandwidth savings. Sparse formats
+are classic examples, but compression helps in other domains as well.
+
+**Precompute.** Shift work upstream by computing reusable values on the host (or once on the device) and storing them
+for later reuse. This saves runtime arithmetic at the cost of extra memory traffic and storage, making it the conceptual
+opposite of recomputation. Use it when memory pressure is manageable and the saved computation is significant.
+
+### Irregularity
+
+GPU is a highly regular architecture, but many  algorithms feature irregular control flow, uneven memory access patterns,
+or input‑dependent work distribution. Performance hinges on reshaping such workloads to match the GPU’s SIMT execution
+model while minimizing divergence and imbalance.
+
+**Loop Unrolling.**  Unrolling replicates the body of a loop multiple times—manually or via compiler directives—to cut
+branch and address‑calculation overhead, expose more independent instructions for ILP, and unlock further optimizations
+such as keeping temporaries in registers.  Excessive unrolling, however, inflates register pressure and can reduce occupancy;
+the unroll factor must be tuned per kernel and architecture.
+
+**Reduce Branch Divergence.**  When threads in a warp take different branch paths, execution serializes and inactive lanes
+idle.  Remedies include refactoring branches into predicated arithmetic, flattening conditional logic, using lookup tables,
+or rearranging data and thread mappings so that adjacent threads follow the same path.  In some cases, accepting limited
+redundant computation is faster than divergent branching.
+
+**Sparse Data Formats.**  For sparse linear algebra or graph processing, the memory format dictates SIMD
+efficiency.  GPU‑oriented formats—such as ELL/ELLR, SELL‑C‑σ, or hybrid combinations (e.g., HYB)—pad or reorder non‑zeros
+to equalize work per row and enable coalesced loads.  Dynamic or compressed formats further trade computation for bandwidth
+when the sparsity pattern changes at runtime.
+
+**Kernel Fission.**  Splitting a monolithic, irregular kernel into multiple simpler kernels can tighten resource usage,
+reduce divergence, and improve auto‑tuner search space.  Each fissioned kernel focuses on a more regular sub‑task, at the
+expense of extra launches and global synchronizations—trade‑offs that must be weighed against resource savings.
+
+**Avoid Redundant Work.**  This optimization consists
+of avoiding to perform work that is considered redundant. Its implementation is usually algorithm-specific and it is the
+opposite of recomputing values
+
+### Balancing
+Although GPUs are relatively simple architectures, many architectural details are highly interconnected and require careful
+balancing to achieve performance.
+
+#### Instruction‑Stream Balancing
+
+**Vectorization.** Load and operate on `int4`, `float4`, or `double2` vectors so each instruction touches multiple data
+elements. This reduces branch and pointer arithmetic overhead, improves coalesced memory access, and can align transfers
+to 16‑ or 32‑byte boundaries. Padding or data‑layout changes may be required to maintain alignment.
+
+**Fast Math Functions.** CUDA’s `-use_fast_math` flag and intrinsics such as `__expf`, `__sinf`, or SFU‑backed `__fdividef`
+deliver lower‑precision but significantly faster results. On Ampere+ devices, tensor cores accelerate half‑, TF32‑, and
+bfloat16‑precision matrix–tensor products, accessible through WMMA or library calls, shifting the bottleneck from math
+to memory.
+
+**Warp‑Centric Programming.** Organize work so a warp (rather than a thread) is the fundamental scheduling unit. Warps can
+cooperatively load tiles into shared memory, perform collective reductions via `__shfl_sync`, or specialize into
+producer/consumer roles. This reduces block‑level barriers and exploits warp‑wide broadcast latency of 1–2 cycles.
+
+#### Parallelism‑Balancing
+
+**Vary Work per Thread.** Assign multiple iterations or data tiles to each thread (thread/warp coarsening). This boosts
+register‑level reuse and amortizes index calculations, but raises register and shared‑memory pressure.
+
+**Resize Thread Blocks.** Choosing 64, 128, 256, 512, or 1 024 threads per block affects occupancy, barrier efficiency,
+and shared‑memory allocation granularity. Larger blocks expose more on‑chip parallelism but may limit concurrent blocks
+per SM; smaller blocks ease register pressure and allow finer‑grain scheduling.
+
+**Auto‑Tuning.** Frameworks such as Kernel Tuner, CLTune, and OpenTuner explore multidimensional spaces—block size, tile
+shape, unroll factor, memory layout—using search heuristics or ML models. Auto‑tuning yields device‑ and input‑specific
+configurations, improving both raw throughput and performance portability.
+
+**Load Balancing.** Irregular workloads (graphs, sparse matrices) suffer when some warps idle. Solutions include work‑lists
+with task stealing, CSR/ELL hybrid formats, frontier compaction, and persistent threads that dynamically fetch new work.
+At the multi‑device level, static or adaptive CPU/GPU partitions balance heterogeneous resources.
+
+#### Synchronization‑Balancing
+
+**Reduce Synchronization.** Eliminate unnecessary barriers by fusing stages, privatizing intermediate data, or
+double‑buffering tiles so computations proceed while data is loaded. When unavoidable, keep enough independent warps
+resident to cover barrier latency.
+
+**Reduce Atomics.** Atomic operations allow programmers to perform parallel memory updates without conflicts, but atomics
+introduce synchronization overhead. Aggregate updates in shared memory, perform warp‑level reductions (`__shfl_xor_sync`),
+or restructure data to minimize contended locations. In some algorithms, approximate or relaxed‑consistency methods can
+replace exact atomics without affecting end results.
+
+**Inter‑Block Synchronization.** CUDA ≥ 9 provides `cooperative_groups::grid_group` and `grid.sync()` for whole‑grid
+barriers on Pascal‑class GPUs and newer, avoiding costly kernel relaunches. Pre‑Pascal devices can emulate barriers with
+lock‑free or atomic‑based algorithms that poll global flags and spin only within a few hundred cycles.
+
+### Host Interaction
+
+Efficient host–device coordination is critical to end‑to‑end performance once kernels are tuned.  Optimizations fall into
+two groups: minimizing the cost of communication over PCIe/NVLink and judiciously partitioning computation between
+CPU and GPU.
+
+#### Host Communication
+
+**Eliminate Transfers.** Execute entire pipelines on the GPU or keep persistent data resident across multiple kernels,
+avoiding PCIe/NVLink traffic altogether.
+
+**Compression.** Compress payloads on the CPU, transfer the smaller representation, and decompress on‑device—a net win when
+bandwidth, not compute, is the bottleneck.
+
+**Pinned & Mapped Memory.** Allocate page‑locked buffers (`cudaHostAlloc` or `cudaMallocHost`) to enable direct DMA and
+higher transfer throughput; map them into the GPU address space (`cudaHostGetDevicePointer`) when zero‑copy access is profitable.
+
+**Overlap Communication and Computation.** Use CUDA streams (or OpenCL command queues) to pipeline asynchronous
+`cudaMemcpyAsync` calls with kernel launches.  Double‑ or triple‑buffering hides latency by ensuring one buffer is in transit
+while another is being processed.
+
+**Dynamic Parallelism & Unified Memory.** Move control loops on‑device by allowing kernels to launch child kernels, or employ
+unified memory to present a single address space; both approaches reduce round‑trip latency for fine‑grained tasks.
+
+#### CPU/GPU Computation
+
+**Task Decomposition.** Partition the application into coarse tasks that run independently on CPU and GPU, communicating only
+at well‑defined boundaries; this is effective for heterogeneous workloads such as vision pipelines or irregular graph analytics.
+
+**Static vs. Dynamic Load Balancing.** Static schemes assign a fixed work fraction (e.g., 70 % GPU, 30 % CPU) based on
+profiling, while dynamic schemes monitor progress and migrate work adaptively using shared work queues or runtime schedulers.
+
+**Data‑Transfer‑Aware Scheduling.** When tasks have dependencies, schedule them to minimize the number and size of host–device
+transfers, possibly batching multiple small tasks into a single transfer window.
+
+**Overlap and Pipeline.** For producer–consumer workflows, run CPU pre‑processing, GPU compute, and CPU post‑processing as
+concurrent pipeline stages, each operating on different data batches buffered in pinned memory.
