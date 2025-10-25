@@ -1,0 +1,119 @@
+---
+slug: lakehouse-architecture-cidr2021
+title: "Lakehouse Demystified"
+date: "2025-08-13"
+description: "Revisit Lakehouse paper after 4 years."
+tags: [lakehouse, data-lake, data-warehouse, delta-lake, iceberg, hudi, cidr, parquet, orc, metadata]
+---
+
+## Where We Have Been
+
+![Figure 1: Data Platform Generations](/figures/data_generation.png)
+
+### First generation: classic data warehouses
+
+Classic warehouses tightly coupled compute and storage—often as on-prem appliances—using schema-on-write
+to achieve strong governance and fast SQL. This design delivered predictable BI performance but scaled
+poorly in cost and flexibility. At the same time, data volumes shifted toward **unstructured** formats
+(video, audio, documents) that these systems could neither store nor query effectively, further limiting
+applicability beyond curated, relational workloads.
+
+Pain points:
+
+* Coupled compute/storage in on-prem appliances → organizations had to provision for
+	peak load and peak data under management
+* Rapid data growth + rising unstructured data (video/audio/text) that classic warehouses
+	could not store/query well.
+
+### Second generation: data lake + warehouse (two-tier)
+
+To regain flexibility and reduce storage costs, architectures split into a two-tier model: an open-format
+data lake on low-cost object storage for raw, diverse data, and a downstream warehouse for curated,
+high-performance SQL and BI.
+
+While separating storage and compute (e.g., S3 with Redshift) appears
+economical, it introduces complexity and fragility. Data is first ETLed into lakes and then ELTed again
+into warehouses, adding steps, delays, and new failure modes. Keeping lake and warehouse consistent demands
+continuous engineering; each pipeline hop risks semantic drift and quality bugs. Warehouse data often lags
+the lake by hours or days, a regression from first-gen setups where operational data was closer to analysis.
+Meanwhile, modern ML and advanced analytics require large scans and iterative, non-SQL computation—ill-served
+by ODBC/JDBC access paths and proprietary warehouse formats—so teams either export tables to files (adding
+yet another step and staleness) or bypass warehouses and read the lake directly, forfeiting DBMS features
+like ACID transactions, versioning, and indexing. The net effect is higher total cost of ownership: duplicated
+storage across lake and warehouse, persistent ETL overhead, and vendor lock-in that inflates migration costs.
+
+Pain points:
+
+* **Reliability**: Keeping lake and warehouse consistent is difficult/costly; more ETL → more chances for bugs
+	and semantic mismatches.
+
+* **Data staleness**: Warehouse data lags lake data by hours/days since data needs to be loaded by asynchronous
+	ETL jobs. This is worse than first-gen where data is always fresh as there is only one system.
+
+* **Limited support for advanced analytics**: ML needs large scans and non-SQL code; ODBC/JDBC is inefficient;
+	proprietary warehouse formats block direct access, leading to either export data from warehouse
+	(a third ETL step) or directly reading from data lake which loses DBMS features (no ACID/versioning/indexes).
+
+* **Total cost of ownership**: Customer pays for doubled storage in lake and warehouses; plus vendor lock-in from
+	proprietary data warehouse formats raises migration costs.
+
+---
+
+## What the Paper Proposes: The Lakehouse
+
+> Lakehouse, which will (i) be based on **open
+direct-access data formats**, such as Apache Parquet, (ii) have **first-class support for machine learning and data
+science**, and (iii) offer **state-of-the-art performance**.
+
+![Figure 2: Lakehouse Architecture](/figures/lakehouse_architecture.png)
+
+The core idea is to keep data in open, directly accessible formats (Parquet/ORC) on low-cost object storage and add a
+**transactional metadata layer** that abstracts files into managed tables. This layer enables ACID semantics across
+many files via atomic add/remove operations recorded in a log, supports time travel to query historical versions,
+enforces schema and constraints with options to quarantine bad records, and centralizes governance through access
+control and auditing.
+
+Representative implementations include Delta Lake (a transaction log stored in Parquet), Apache Iceberg (a manifest-based
+approach), and Apache Hudi (a timeline/instant log). All three provide a higher-level table contract over raw files,
+allowing engines to combine open storage with DBMS-grade management and performance features.
+
+---
+
+## Performance Without Proprietary Storage
+
+Warehouses traditionally achieve fast SQL by tightly controlling storage formats, but the paper shows lakehouse can reach
+competitive performance while leaving the base Parquet/ORC files untouched through format-agnostic
+optimizations:
+
+* **caching** hot files on SSD/RAM and validating them against the table version in the transaction
+log (optionally storing a transcoded cache layout that’s friendlier to the query engine)
+
+* maintaining **auxiliary data** such as per-file column statistics/zone maps for data skipping and Bloom
+filters (or similar indexes) to short-circuit scans
+
+*  optimizing **data layout** by clustering records (e.g., Z-order/Hilbert) and periodically rewriting
+files via OPTIMIZE/compaction to bound small-file counts and improve scan efficiency.
+
+---
+
+## Advanced Analytics, Natively
+
+![Figure 3: Lakehouse AI](/figures/lakehouse_ai.png)
+
+ML/DS frameworks already read Parquet/ORC; in a Lakehouse they simply consult the transactional metadata log to
+determine **which files comprise the current table version**, avoiding exports and proprietary barriers.
+Paired with **declarative DataFrame APIs** (e.g., Spark SQL/DataFrames), pipelines build logical plans
+lazily so the Lakehouse optimizer can **push down** filters and projections and automatically leverage
+**auxiliary data** and **caches**. The result is a single source of truth where **BI** and **AI** operate
+on the same tables, and ML pipelines consume **fresh** data with full DBMS guarantees.
+
+---
+
+## Looking Back: From Concept to Industry Standard (2021–2025)
+
+Over the past four years, Lakehouse ideas have solidified into the default enterprise pattern: open **table formats**
+(especially **Apache Iceberg**) are now first-class across engines and clouds, enabling one copy of data with
+multi-engine interoperability. Google’s **BigQuery BigLake** natively supports Iceberg tables for open lakehouses;
+**Trino** ships a mature Iceberg connector; and AWS EMR documents Iceberg with Trino as a standard path.
+Meanwhile, governance has centralized at the catalog layer: **Databricks Unity Catalog** and **Snowflake Polaris Catalog**
+provide cross-cloud access control, lineage, and sharing.

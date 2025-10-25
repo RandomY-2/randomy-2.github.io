@@ -1,0 +1,168 @@
+---
+slug: dynamo-amazon-kv-store
+title: "Dynamo, Amazon's Highly Available Key-value Store"
+date: "2025-10-21"
+description: "Dynamo, Amazon's Highly Available Key-value Store"
+tags: [dynamo, kv, database, Amazon, AWS]
+---
+
+## Why Dynamo?
+
+Dynamo was built to keep Amazon retail “always on.” Amazon retail workloads are
+mainly **primary-key lookups/updates on small blobs (≲1 MB), with hard 99.9th-percentile
+latency SLOs**.
+
+Traditional ACID/relational databases were deemed unsuitable to this because
+* Most of these services only store and retrieve data by primary key and do not require
+the complex querying and management functionality offered by an RDBMS.
+* The available replication technologies are limited and typically choose consistency over availability
+
+Dynamo’s design center:
+
+* **Availability over consistency**: Never reject customer writes (e.g., shopping cart updates) even
+if there are failures or concurrent writes (e.g., AP in CAP). Eventual consistency with application-visible
+versioning is acceptable.
+
+* **Symmetry & Decentralization**: No coordinator node to avoid single point of failure;
+any node can serve customer request; uniform responsibilities.
+
+* **Incremental scalability**: Be able to add/remove one host at a time with minimal impact on both
+operators of the system and the system itself.
+
+* **Heterogeneity**: Systems can exploit heterogeneity in the infrastructure it runs on. More work should be
+distributed to nodes with higher capacity.
+
+---
+
+## System Design
+
+![Figure 1: Dynamo Design Choices](/figures/dynamo-design-choices.png)
+
+### Partition via Consistent Hashing
+
+In services such as GFS, there is a control plane that provides metadata about which node to request for which data,
+which can lead to single-point-of-failure. Dynamo uses **consistent hashing with virtual nodes**.
+
+![Figure 2: Consistent hashing](/figures/dynamo-consistent-hashing.png)
+
+In traditional consistent hashing, each key is mapped to a point on the ring by hashing the key. Ownership is defined
+by walking clockwise to the first token greater than the key’s hash. In Dynamo, each physical node owns multiple tokens
+(**virtual nodes**) scattered around the ring. Because a single physical machine holds many token, the key space of any
+one box is sliced into many discontinuous ranges. This indirection provides several benefits:
+
+* **Better load balance**: Splitting each physical machine into many noncontiguous key-ranges evens out variance from
+random token placement; hot partitions are diluted across more owners.
+
+* **Heterogeneity-aware capacity**: Better machines can be assigned more tokens (and weaker ones fewer) so work scales
+with hardware capacity without special cases in routing or placement.
+
+* **Low-blast-radius rebalancing**: On node join/leave, only the key-ranges of the affected tokens move; because every
+box has many small ranges, data migration is naturally sharded across many peers.
+
+
+### Durability via Preference List Replication
+
+Starting at the key’s hash position, Dynamo selects the first **N distinct physical nodes** encountered when
+traversing successor tokens on the ring as the **preference list** of the key. Data of the key will be
+replicated on these physical nodes to achieve durability.
+
+
+### Causality Consistency via Vector Clocks
+
+Dynamo stays always-writable by allowing **eventual consistency** where updates can be propagated replicas asynchronously
+after coordinator acks user writes. Concurrent writes can proceed without coordination and by deferring conflict resolution
+to reads. The mechanism that makes this safe and observable to applications is the **vector clock** attached to every object
+version.
+
+**What a vector clock is:** A vector clock is a set of `(node_id, counter)` pairs that encodes causality. Each
+successful `put(key, context, value)` takes the client-supplied `context` (a prior clock), increments the coordinator’s
+own counter, and attaches the new clock to the stored version.
+
+![Figure 3: Vector Clocks](/figures/dynamo-vector-clocks.png)
+
+**Reading the diagram (Figure 3).** A write starts at node `Sx`, yielding `[Sx:1]`, then `[Sx:2]`. Replicas `Sy` and `Sz`
+later handle independent writes that both *include* `[Sx:2]`, producing `[Sx:2, Sy:1]` and `[Sx:2, Sz:1]`. These two
+versions are **concurrent** with each other (neither clock dominates the other) but both **causally follow** `[Sx:2]`
+(because they include it). A subsequent `get(key)` gathers both leaf versions and returns them (plus a merged context) to
+the application, which merges them and writes back a reconciled version.
+
+**Why this preserves availability.** Writers don’t block waiting for a single “latest” replica. Any replica can accept a
+write, bump its counter, and persist the causal summary. Later:
+
+- If `VC(A) ≤ VC(B)` component-wise, **A is an ancestor of B** and can be elided.
+- If neither `VC(A) ≤ VC(B)` nor `VC(B) ≤ VC(A)`, the versions are **concurrent** and should be **merged** by the app
+  (e.g., union shopping-cart items so “adds” aren’t lost).
+
+
+### High Availability via Sloppy Quorum & Hinted Handoff
+
+Dynamo prioritizes write availability by relaxing strict quorum membership under faults. Instead of insisting that
+reads/writes hit quorum nodes, it talks to the **first N healthy nodes** reachable in the preference-list
+order (**sloppy quorum**). If an intended owner is down, the write lands on a temporary holder with a **hint** pointing
+to the true destination (**hinted handoff**). When the failed node recovers, the temporary holder streams the data back
+and may delete its local copy once durability is restored.
+
+
+### Fault Recovery via Anti-Entropy with Merkle Trees
+
+When hinted replicas become also unavailable before they can be returned to the original replica node, Dynamo uses an
+**anti-entropy (replica synchronization) protocol** to keep the replicas synchronized. The core mechanism is the
+**Merkle tree**: a hash tree built over a key-range (typically a vnode’s partition). Leaves are per-key hashes; each
+internal node is the hash of its children. Two nodes can compare just the **root hash** for a shared range: if equal,
+no work is needed; if different, they **descend** only into mismatched subtrees until they isolate the exact keys that
+diverged. This bounds both network traffic and disk I/O, since intact subtrees are skipped entirely.
+
+**Dynamo Implementations:**
+
+- **Per-range trees.** Each node maintains one Merkle tree per key range it owns. This localizes comparisons and lets
+  peers reconcile only the ranges they have in common.
+- **Efficient detection.** Root hash mismatch ⇒ walk down the tree, exchanging only the minimal set of hashes needed to
+  pinpoint out-of-sync leaves; transfer just those keys (or value/version digests) to resynchronize.
+
+### Membership & Failure Detection via Gossip
+
+Dynamo maintains ring membership and token ownership with a **gossip protocol**—a lightweight, peer-to-peer exchange that
+keeps a **loosely synchronized** view across nodes without any central coordinator.
+
+**How membership propagates.** An operator uses CLI to connect to a Dynamo node and issues a membership change to join a
+node to a ring or remove a node from a ring. That node persists the change with a timestamp (form a membership history)
+and gossips it. Each node periodically contacts a random peer (e.g., ~1s intervals) and reconcile histories.
+
+**How partition info propagates.** On join, a node selects its tokens (vnodes) and persists the local token map. Gossip
+then reconciles these maps cluster-wide, so every node eventually learns who owns each range and can route reads/writes
+directly to the correct replicas.
+
+**Seeds prevent logical partitions.** A small set of **seed nodes** (discoverable via config or a registry) serve as
+rendezvous points. Even if disjoint sub-rings temporarily form (e.g., staggered joins), periodic reconciliation with seeds
+stitches views back together, making long-lived logical splits unlikely.
+
+**Local, pragmatic failure detection.** Dynamo avoids a global consensus on liveness. Instead, A treats B as **failed**
+if B doesn’t respond to A’s I/O (even if C can still reach B). Under steady traffic, unresponsiveness is detected quickly;
+A routes around B using alternate replicas and periodically probes for recovery. When no traffic, no heartbeats are
+required—nodes need not agree on B’s status until they actually need to communicate.
+
+---
+
+## Personal Thoughts
+
+Dynamo is a landmark in availability-first storage design, but reading it in 2025 highlights how product expectations
+have evolved:
+
+- **Transactions & stronger guarantees.** Dynamo deliberately avoided ACID to keep the system always-writeable and simple
+at the interface layer. In practice, many applications eventually rediscovered the need for transactional guarantees.
+The industry’s response—conditional writes, idempotency keys, item collections, and eventually full transactions
+(e.g., DynamoDB’s transaction APIs)—shows that even key–value systems benefit from a principled transactional substrate
+for a subset of operations.
+
+- **Operational ergonomics & autoscaling.** Classic Dynamo requires an operator to manually issue join/leave when capacity
+changes. That’s reasonable in an internal, single-tenant setting, but
+modern managed services set the bar at on-demand autoscaling, elastic partitions, and policy-driven rebalance
+with SLO-aware throttling. The control-plane machinery needed for this (predictive splitting, hotspot detection, automated
+token moves) wasn’t in-scope for Dynamo’s paper, but is now table stakes in cloud KV services.
+
+- **Decentralization vs. governance.** Dynamo’s fully decentralized design is unique: no central
+coordinator, no single-point-of-failure. However, today’s platforms often require a metadata layer to enforce
+governance: RBAC, encryption policy, auditing, TTL/retention, schema/contract validation, global
+secondary indexes, backup/restore orchestration, tiering, cost attribution, and multi-tenant isolation.
+Many of these are awkward to graft onto a purely gossip-driven ring. In practice, systems frequently adopt a hybrid
+model: decentralized data path with a modest, highly available control plane for policy and fleet automation.
