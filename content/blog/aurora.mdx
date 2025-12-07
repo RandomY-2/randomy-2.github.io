@@ -1,0 +1,440 @@
+---
+
+slug: aurora-amazon-cloud-native-database
+title: "Aurora, Amazon’s Cloud-Native Relational Database"
+date: "2025-12-06"
+description: "Amazon Aurora rethinks MySQL’s architecture for the cloud by treating the log as the database and pushing durability into a multi-AZ storage service."
+tags: [aurora, mysql, database, aws, cloud, oltp]
+-------------------------------------------------
+
+## Why Aurora?
+
+Aurora is Amazon’s answer to a very specific question:
+
+> *As IT workloads are increasingly moving to cloud, how to model a cloud-native database?*
+
+As workloads move into public clouds, the environment around databases has changed:
+
+* Compute and storage are **decoupled** and independently scalable.
+* Storage is provided by a **large multi-tenant fleet** of SSD-backed servers across multiple Availability Zones (AZs).
+* Databases are expected to survive **host failures, AZ failures, rolling upgrades, and noisy neighbors** with minimal downtime.
+
+In that world, the classic RDBMS architecture designed for a single machine with locally attached disks starts to experience bottlenecks:
+
+1. **The bottleneck shifts from disk to network.**
+   Each write in a traditional database like MySQL fan-outs into:
+
+   * Page writes
+   * Redo log writes
+   * Double-write buffer writes
+   * Metadata writes
+   * Mirrored copies to a remote replica / secondary volume
+
+   For HA, databases are replicated across AZs, **the network packets per second (PPS)** and latency of the slowest replica dominate performance.
+
+2. **Synchronous protocols don’t scale well in a failure-full world.**
+   2PC-style commit protocols and "4/4 must-ack" replication stacks:
+
+   * Add **latency** (each hop is in the critical path).
+   * Are **fragile**: any slow/failing node can stall progress.
+   * Don’t match cloud reality, where there is constant background churn (nodes coming/going, disks failing, upgrades happening).
+
+3. **Crash recovery and maintenance become painful.**
+   ARIES-style recovery (checkpoint + log replay) can take a long time on big, write-heavy databases. Checkpointing more often helps recovery but:
+
+   * Steals IOPS and CPU from foreground queries.
+   * Creates jitter as background I/O competes with OLTP traffic.
+
+This leads to Aurora's design choices:
+
+* Treat the **redo log as the database**.
+* Push redo processing, durability, and backup into a **decoupled scale-out storage service**.
+* Use **quorum replication across AZs** with fast, asynchronous gossip.
+* Aggressively reduce **network write amplification**, not just disk write amplification.
+
+![Aurora Overview](/figures/aurora-overview.png)
+
+---
+
+## High-Level Architecture: Compute Decoupled from a Log-Centric Storage Service
+
+![Aurora Architecture](/figures/aurora-architecture.png)
+
+At a high level, Aurora consists of a database engine and a storage service:
+
+### Database Engine
+
+The database engine is a fork of community MySQL/InnoDB:
+
+* It keeps query processing, transactions, locks, buffer pool, B+-trees, and undo log.
+
+* It diverges in how InnoDB reads and writes data to disk.
+
+#### Community InnoDB
+
+	1. A write first modifies pages in the buffer pool and appends redo log records to the WAL buffer in LSN order.
+	2. On transaction commit, the WAL protocol only requires that the transaction’s redo records be durably flushed to disk
+	3. The actual dirty pages are written out later via the double-write buffer (to avoid torn pages), either in the background, during cache eviction, or as part of checkpointing.
+
+So disk sees two kinds of writes:
+* Redo log (small, sequential, but frequent).
+* Data pages (large, scattered, plus double-writes).
+
+And in a replicated / mirrored setup, both of these often get mirrored out to other disks / AZs, multiplying the write load.
+
+#### Aurora
+
+	1. Gnerates redo log records in the same MTR (mini-transaction) units as normal InnoDB.
+	2. Batches redo records.
+	3. Shards them by Protection Group (PG) - i.e., based on which logical volume segment they belong to.
+	4. Sends those redo batches over the network to the storage service (6 replicas, 3 AZs).
+	5. The storage service then:
+	* Persists the redo.
+	* Applies redo in the background to build materialized pages on its own local SSDs.
+	* Handles replication, repair, backup, and recovery.
+
+The final log record of each MTR is tagged as a **consistency point**, so storage can reason about durable mini-transactions. The writer supports exactly the same isolation levels as community MySQL (ANSI levels plus
+snapshot isolation/consistent reads). Read replicas consume the writer’s log stream and metadata about transaction starts/commits to provide local
+read-only snapshot isolation, but all **concurrency control stays in the database engine**. The storage service simply applies redo and manages pages,
+presenting a logical view of data that matches what you would see if InnoDB were writing to local storage.
+
+
+### Storage Service
+
+* Runs as a large multi-tenant fleet of EC2 instances with SSDs across at least three AZs.
+* Presents a logical segmented redo log to the engine.
+* Handles replication, page materialization, crash recovery, backup/restore, and garbage collection.
+
+This separation brings three benefits:
+
+1. **Resilience and durability as a service.**
+   The database offloads:
+
+   * Multi-AZ replication
+   * Segment repair and re-replication
+   * Backups and restores to/from S3
+
+The storage fleet is built to tolerate AZ failures and constant background noise of disk/node failures.
+
+2. **Reduction in network I/O.**
+   Only **redo log records** cross the network:
+
+   * No background page writes
+   * No checkpoints flushing pages
+   * No double-write buffer pages
+
+Replication multiplies log writes, but avoids replicating large data pages for every update.
+
+3. **Near-instant crash recovery.**
+   Redo application happens **continuously and asynchronously** in storage:
+
+   * On crash, the database just needs to reestablish **metadata and undo state**.
+
+---
+
+## Durability at Scale: 6-Way Replication and Protection Groups
+
+### AZ+1 Durability Goal
+
+Aurora observes that in a cloud region:
+
+* **AZ failures are correlated failures**: if one AZ goes down, *all replicas there* are gone together.
+* Meanwhile, there is constant “background noise” of **independent disk/node failures** elsewhere.
+
+A classic 3-way replicated quorum (3 nodes, 2/3 reads, 2/3 writes) across 3 AZs is therefore not enough:
+
+* If one AZ fails, one replica is lost.
+* If *any* of the remaining two replicas happens to be down or degraded (background noise), quorum is lost and you do not know which copy is up-to-date.
+
+Aurora aims for a stronger durability:
+
+> **Tolerate losing one entire AZ + one additional node (AZ+1) without losing data, and tolerate the loss of a whole AZ without losing write availability.**
+
+To do this, Aurora:
+
+* Replicates each piece of data **6 ways** across 3 AZs (`V = 6`).
+* Places **2 replicas per AZ**.
+* Uses:
+
+  * **Write quorum** `Vw = 4/6`
+  * **Read quorum** `Vr = 3/6`
+
+Properties:
+
+* **Durability**: Can lose any AZ (2 replicas) plus one extra node (total 3 replicas) and still have **3/6** for reads.
+* **Write availability**: Can lose any AZ (2 replicas) and still have **4/6** for writes.
+
+### Segmented Storage and Protection Groups
+
+To manage repair and durability in practice, Aurora:
+
+* Splits each logical volume into **fixed 10 GB segments**.
+* Groups six copies of the same segment into a **Protection Group (PG)**:
+
+  * 6 segments, 2 per AZ.
+  * These are the unit of replication and repair.
+
+A volume is thus a **concatenation of PGs**. Operationally:
+
+* Background noise failure unit = segment.
+* A 10 GB segment can be copied over a 10 Gbps link in about 10 seconds.
+* To lose quorum, need to have in that 10-second repair window:
+
+  * Two independent segment failures **in the same PG**, both in non-failed AZs, plus
+  * An AZ-wide outage on the remaining replicas
+
+Because repairs are fast and localized, the probability of a catastrophic multi-way loss **over the repair window** is tiny, even at large fleet scale.
+
+---
+
+## The Log Is the Database: Offloading Redo to Storage
+
+### The Write Amplification Problem in Traditional MySQL
+
+Consider a highly available MySQL deployment across 2 AZs with EBS and synchronous mirroring:
+
+![Traditional Mirrored MySQL](/figures/aurora-mirrored-mysql.png)
+
+For each OLTP write, MySQL typically produces:
+
+* Redo log writes (WAL)
+* Binary log writes (for replication / PITR)
+* Data page writes (dirty pages)
+* Double-write buffer writes (to avoid torn pages)
+* Metadata file writes (FRM / dictionary, etc.)
+
+These are then:
+
+1. Written to local EBS volume and its in-AZ mirror (Step 1/2).
+2. Synchronously replicated to a standby instance in another AZ (Step 3).
+3. Written to standby instance's EBS volume and mirror (Step 4/5).
+
+Problems:
+
+* **Sequential synchronous steps (1→3→5)** inflate latency; the slowest node dictates completion.
+* Many different types of writes represent largely the **same logical changes**.
+* From a quorum perspective, this is effectively **4/4 quorum writes**, highly vulnerable to any outlier.
+
+### Aurora: Offloading Redo Processing to Storage
+
+Aurora changes the data path:
+
+* When the database modifies a page, it generates a **redo log record** (just as in InnoDB).
+* **Only redo log records are sent to the storage service**.
+* **No data pages** are ever written out by the engine:
+
+![Aurora Network IO](/figures/aurora-network-io.png)
+
+In an Aurora cluster with one primary instance and multiple replicas instances deployed across multiple AZs:
+* The primary only writes log records to the storage service and streams those log records as well as metadata updates to the replica instances
+* The IO flow batches fully ordered log records based on a common destination (a logical segment, i.e., a PG) and delivers each batch to all 6 replicas where
+  the batch is persisted on disk
+* The database engine waits for acknowledgements from 4 out of 6 replicas in order to satisfy the write quorum and consider the log records in question durable or
+  hardened.
+* The replicas use the redo log records to apply changes to their buffer caches.
+
+
+The **log applicator** (redo logic) is pushed down into the storage service, and storage nodes maintain:
+
+  * A persistent log of redo records.
+  * A **materialized cache of pages** produced by applying log chains.
+
+To make this efficient:
+
+* Storage nodes **continuously materialize pages in the background**:
+
+  * They look at the chains of log records per page.
+  * If a page’s chain gets too long, they coalesce it into a new base page and can garbage-collect older log entries.
+
+Aurora therefore reduces network load while still providing strong durability. The storage service can scale out I/Os in an embarrassingly parallel
+fashion without impacting write throughput of the database engine.
+
+---
+
+## Storage Node Pipeline: Foreground vs Background
+
+On each storage node, the pipeline for log records looks roughly like this:
+
+![Aurora Storage Node Pipeline](/figures/aurora-storage-pipeline.png)
+
+1. **Receive log record** and enqueue in memory.
+2. **Persist record to local SSD** and acknowledge back to the engine.
+3. Organize records, detect **gaps** in the log sequence.
+4. **Gossip** with peer replicas to fill in missing log records.
+5. **Coalesce** log records into new data pages.
+6. Periodically **stage log and pages to S3** for backup.
+7. **Garbage-collect** old versions and log ranges that are no longer needed.
+8. Periodically **validate CRCs** to detect latent corruption.
+
+Only **steps (1) and (2)** are in the critical foreground path. Aurora aggressively moves everything else off the latency-sensitive
+path and lets the storage fleet chew through background work as capacity allows.
+
+Background work is **negatively correlated** with foreground load:
+
+* If foreground write load spikes, storage can back off on GC and page coalescing.
+* When the system is idle, storage can catch up on compaction, backup staging, and verification.
+
+This is the opposite of the traditional design, where checkpoints and background page flushes often scale *with* foreground load and add jitter.
+
+---
+
+## Asynchronous Consensus on a Marching Log
+
+To maintain a consistent view of the log across storage nodes without 2PC or heavyweight consensus on every transaction, Aurora exploit
+the monotonically increasing nature of **Log Sequence Number (LSN)**.
+### Vocabulary
+
+Aurora uses several key LSN-based concepts:
+
+- **LSN (Log Sequence Number)**
+  Monotonically increasing identifier assigned by the database to every log record. It totally orders all changes in the system.
+
+- **VCL (Volume Complete LSN)**
+  From the storage service’s point of view, the **highest LSN such that *all* prior records are guaranteed to be available** across the Protection Group.
+  During a recovery, every log record with an LSN larger than the VCL must be truncated.
+
+- **CPL (Consistency Point LSN)**
+  Special subsets of LSNs that are allowable for truncation, marking the end of a mini-transaction (MTR).
+
+- **VDL (Volume Durable LSN)**
+  The **highest CPL ≤ VCL**. This is the durable point from the database’s point of view: anything past VDL is not guaranteed durable and may be truncated on recovery.
+
+- **SCL (Segment Complete LSN)**
+  For an individual storage segment (one of the 6 replicas in a PG), the **greatest LSN below which all log records of the PG have been received**.
+  SCL is tracked using backlinks in the log (each log record points to the previous one for that PG) and refined by gossip between peers.
+
+- **LAL (LSN Allocation Limit)**
+  A bound on how far ahead the engine is allowed to allocate new LSNs beyond the current VDL (e.g., VDL + 10M). This prevents the engine from racing too far ahead of storage and
+  provides backpressure if the storage or network lags.
+
+Completeness and durability are therefore different in Aurora. In practice, the database and storage interact as follows:
+    1. Each database-level transaction is broken up into multiple MTRs that are ordered and must be performed atomically.
+    2. Each mini-transaction is composed of multiple contiguous log records (as many as needed).
+    3. The final log record in a mini-transaction is a CPL.
+
+### Writes
+
+During normal operation:
+
+1. The database assigns **LSNs** to log records, respecting the LAL ahead-of-VDL limit.
+2. It batches log records **by Protection Group** and sends them to all 6 segment replicas of that PG.
+3. Each storage node persists the batch and responds.
+4. Once the writer receives **4 out of 6 acks**, it:
+
+   * Considers the log records **durable** for that PG.
+   * Advances VDL.
+
+Meanwhile, each storage node:
+
+* Tracks its **SCL** using backlinks in log records (each record points to the previous one for that PG).
+* Periodically **gossips** with the other 5 replicas of the PG to fill in any missing records.
+* As nodes exchange information, they refine their individual SCLs; the minimum across them contributes to VCL.
+
+### Commits
+
+Aurora makes **transaction commits asynchronous** from the perspective of worker threads:
+
+* When a client issues `COMMIT`:
+
+  * The worker just records the transaction’s commit LSN.
+  * The worker doesn’t block; it goes on to handle other requests.
+
+* A dedicated commit thread:
+
+  * Monitors the database’s **VDL**.
+  * Whenever `VDL ≥ commit_lsn(txn)`, the transaction is now safely durable.
+  * It sends a commit acknowledgement to the client.
+
+### Reads
+
+Reads follow familiar patterns with one change:
+
+* Pages are served from the **buffer cache** if present.
+* On a cache miss, the engine issues a read to the storage service with a **read-point LSN** (typically the current VDL).
+
+To maintain correctness, a page can be evicted from cache only if its **page LSN ≥ VDL**.
+
+* That ensures all its changes are already durable in the log.
+* On a future cache miss, requesting the page at the current VDL suffices to get the latest durable version.
+
+Under normal operation, the database doesn’t need a **read quorum**:
+
+* It tracks, per PG, which segments are complete enough (SCL ≥ read-point).
+* It issues reads to a single suitable segment.
+
+### Replicas
+
+* A single writer plus up to **15 read replicas** share the **same physical storage volume**.
+* The writer streams its log records to the replicas, which:
+
+  * Apply redo to any pages they have in cache.
+  * Discard redo for pages they don’t currently hold.
+* Replicas:
+
+  * Only apply log records with `LSN ≤ VDL`.
+  * Apply all log records of a given mini-transaction (MTR) atomically to maintain consistency.
+
+Replica lag is typically small (on the order of tens of milliseconds), and replicas don’t multiply storage usage or disk writes — they share the same 6-way replicated underlying volume.
+
+---
+
+## Recovery: Always Doing Recovery, So Startup is Cheap
+
+Traditional databases uses ARES-style crash recovery:
+
+* **Forward processing**: apply WAL + periodically checkpoint pages to disk.
+* **Crash recovery**: run log replay synchronously while the database is offline.
+
+Aurora uses the same redo logic for crash recovery but keeps log applicator running in storage service background.
+
+On crash:
+
+1. The database engine restarts and runs a **volume recovery protocol** with the storage service:
+
+   * For each PG, it contacts a **read quorum** of segments.
+   * It determines the highest LSN for which all prior log records are guaranteed available across the quorum → **VCL**.
+   * It then determines **VDL** as the highest CPL ≤ VCL.
+   * All log records with `LSN > VDL` must be **truncated** (logically annulled).
+   * It writes **truncation ranges** (with epoch numbers) durably into storage so restarted recoveries don’t “un-truncate” accidentally.
+
+2. The database re-establishes its **runtime structures** (e.g., transaction tables, locks).
+
+3. It performs **undo recovery** for in-flight transactions at the time of crash:
+
+   * This can happen **online**, after the engine comes back to serve traffic.
+
+Because:
+
+* The log is already replicated and continuously applied to pages in storage.
+* There is no need to replay a huge log **from scratch** at startup.
+
+…Aurora can typically recover in under **10 seconds**, even if the system was handling >100K writes per second before the crash.
+
+---
+
+## Personal Thoughts
+
+A few things stand out when reading the Aurora paper in 2025.
+
+* Database bottleneck **has shifted from disk to network** in the cloud era: Once you accept that your “disk” is effectively a fleet of network-attached SSD servers spread across AZs, a lot of traditional database
+design suddenly looks inefficient. Aurora leans into this by reviving the *log-is-database* idea, pushing only redo log down to storage, and letting a multi-tenant storage fleet handle durability, replication, and recovery.
+Compute and storage are cleanly separated, and the storage layer presents a **single logical  volume** with strong durability to the database engine. That single logical view is key: it makes backup, point-in-time restore,
+HA failover, and even maintenance operations much easier than if  each instance had its own private disks.
+
+* **Compute-storage separation** is a trend for cloud computing: In the old days you might run web services and the database on the same EC2 instance with a locally attached volume; if the machine died you manually reattached
+the volume somewhere else. That’s clearly not tenable in cloud where machines “just die” all the time and you want automation-by-default. AWS RDS was one of the early attempts to separate storage from compute by putting storage
+into its own AZ and managing it as a service. But when you directly lift-and-shift a traditional engine like MySQL into that model, you run into MySQL’s fundamental problem: it writes *too many different things* (redo, pages, double-write
+buffer, binlog, metadata, etc.), and every extra replica multiplies those writes across the network. Aurora’s answer is: stop pretending the engine can treat storage as a block device and instead **define the contract as “here is my
+redo log”**. That dramatically cuts network I/O and foreground disk I/O while letting the storage system focus on what it’s good at: replication and repair.
+
+* **Quorum-style NRW protocols applied at cloud scale**: The 6-way, 3-AZ layout with `V = 6`, `Vw = 4`, `Vr = 3` is not mathematically complicated, but the way they operationalize it with **10 GB Protection Groups** is very practical.
+By sharding the volume into small segments and treating each PG as the unit of replication and repair, failure handling becomes localized and fast. A 10 GB segment over a 10 Gbps link is on the order of seconds; that small repair window
+keeps the probability of losing multiple replicas in the same PG vanishingly low, even with constant background failures. Most of the “majority reads” only show up during recovery when the system has to reconstruct the authoritative
+state; normal reads are just one-write, one-read per PG, which keeps the steady-state path simple.
+
+* **Horizontal-scaling of Aurora**: Aurora sits in an interesting place compared to **shared-nothing NewSQL systems**. Aurora has only **a single writer node** (plus many read replicas) sharing a common storage volume. That single writer means data consistency
+is a lot easier than in a fully distributed, multi-writer system. There’s no need for 2PC or distributed transaction protocols across multiple write partitions. Instead, the redo log LSN acts as a **logical clock** that totally orders updates. As long
+as all storage nodes see the same LSN-ordered log and apply mini-transactions in that order, the system stays consistent. But the **foreground engine is still fundamentally a single-node MySQL instance**: one writer, one transaction/lock manager, one query processor.
+There’s no partitioned transaction protocol, no distributed query planner, and no built-in mechanism for automatic sharding and service discovery across multiple writer shards. In theory, you could shard the log stream itself by mapping different log ranges to
+different PGs (e.g., odd LSNs → PG1, even LSNs → PG2) and build a distributed engine on top of that, but when the paper was published, Aurora still suffered from this performance bottleneck. In that sense, Aurora is “a single-node database with a massively scalable
+storage backend,” not a fully horizontally partitioned database like some NewSQL systems.
