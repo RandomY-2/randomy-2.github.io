@@ -1,0 +1,300 @@
+---
+slug: unity-catalog-lakehouse-catalog
+title: "Unity Catalog: An Open and Universal Lakehouse Catalog"
+date: "2025-12-20"
+description: "Unity Catalog addresses the critical yet understudied component of the Lakehouse architecture: the catalog. It provides consistent governance, universality, and high performance for diverse data and AI assets."
+tags: [unity-catalog, lakehouse, catalog, governance, databricks, data-lake, metadata]
+---
+
+## Why Unity Catalog?
+
+Enterprises are increasingly adopting the Lakehouse architecture to manage their data assets due to its flexibility, low cost, and high performance. While the catalog plays a central role in this architecture, it remains under-explored, and current Lakehouse catalogs exhibit key limitations.
+
+**The Problem with Existing Catalogs:**
+
+* **Inconsistent governance.** Access enforcement can differ depending on whether a table is accessed via its catalog name or through its cloud storage path, without a mechanism to enforce consistency. Many catalogs lack support for fine-grained access control features such as view-based access control or row- and column-level security.
+
+* **Narrow interoperability.** While Hive Metastore (HMS) is open and interoperable, many proprietary catalogs, including AWS Glue or those tightly integrated with specific data warehouses, are not open, making it difficult to access data from external workloads.
+
+* **Lack of discovery capabilities.** Existing operational catalogs often lack discovery capabilities (e.g., searching for data tagged as 'PII' or tracking data lineage), which are critical for many users.
+
+* **Limited asset type support.** Enterprises increasingly seek to manage and govern a broad range of assets beyond tables, including multiple versions of AI models, unstructured data (e.g., images and text), and even on-premise data sources, in a unified way. Existing data lake catalogs are primarily designed for tabular data and lack the capability to represent unstructured data or AI assets.
+
+**Unity Catalog's Goals:**
+
+To address these limitations, Unity Catalog (UC) aims to be an ideal Lakehouse catalog that meets these fundamental requirements:
+
+* **Consistent governance.** Ensures uniform enforcement of access policies across all access paths, while offering comprehensive auditing and fine-grained access control capabilities.
+
+* **Universality.** Extensible to support diverse asset types (e.g., tabular, unstructured, AI assets), interoperates with various clients (e.g., SQL engines, User Interfaces (UI), AI tools), provides both operational and discovery catalog features, enables cross organizational sharing, and operates across multiple cloud environments.
+
+* **High Performance.** Supports workloads with varying performance and consistency requirements, including low-latency interactive workloads, transactional workloads requiring strong consistency, and high-throughput batch workloads.
+
+
+---
+
+## Related Work
+
+### Traditional DBMS Catalogs
+
+Traditional database catalogs are tightly coupled with query processing and data organization in a monolithic architecture. While this integration simplifies optimizations and maintains consistency, it binds the catalog to a specific engine and storage format, limiting flexibility.
+
+### Lakehouse Catalogs
+
+The Lakehouse architecture separates storage, compute, and catalog to enable independent scaling and multi-engine interoperability. However, existing Lakehouse catalogs face limitations:
+
+#### Open Source Catalogs
+
+* **Hive Metastore (HMS)**. The most widely used Lakehouse catalog, providing basic namespace organization and metadata storage. **Limitations**: No built-in governance (relies on cloud storage policies), no native transaction support, tables-only.
+
+* **Iceberg REST Catalog API**. Open API for Iceberg tables with transaction support. **Limitations**: Format-specific (Iceberg only), minimal governance APIs, tables-only. **Polaris** adds governance but remains tables-only.
+
+#### Commercial Catalogs
+
+Commercial offerings (Fabric/Purview/OneLake, AWS Glue, BigLake/Dataplex, Horizon) are **not open** and **tables-only**, though some provide HMS/Iceberg interfaces for interoperability.
+
+### Unity Catalog's Differentiation
+
+Unity Catalog addresses these limitations by being:
+* **Open** with universal APIs
+* **Governance-first** with consistent access control, credential vending, and auditing
+* **Universal** supporting tables, volumes, ML models, and other asset types
+* **Discovery-ready** with lineage APIs and change event streams for external discovery platforms
+
+---
+
+## Databricks Lakehouse Platform
+
+Unity Catalog operates within the Databricks Lakehouse platform, which consists of three key components:
+
+![Databricks Lakehouse platform](/figures/dbx-lakehouse-platform.png)
+
+* **Data lake storage.** The Lakehouse platform decouples storage from compute, allowing customers to choose their preferred storage providers (e.g., S3, ADLS, GCS) and bring existing large datasets without costly migrations. These datasets can be stored in open formats such as Delta Lake, Iceberg, or Parquet.
+
+* **Databricks Runtime (DBR).** The Databricks Runtime is the core execution engine that powers data processing across a wide range of workloads, including SQL, machine learning, and both interactive and batch operations. Built on open-source Apache Spark, it incorporates substantial enhancements in performance and reliability.
+
+* **Unity Catalog service.** The Unity Catalog service is a multi-tenant service implementing all UC functionality and APIs. Execution engines interact with it to deliver end-to-end functionality for users.
+
+The data lake storage and DBR are part of the **data plane**, which customers can manage themselves within their cloud accounts or use Databricks-managed resources. The Unity Catalog service operates in the **control plane**, which runs entirely within a Databricks-managed cloud account and is fully operated by Databricks.
+
+---
+
+## Object Model
+
+All data and AI assets in UC are organized within a metastore, which defines a three-level hierarchical namespace. Assets are referenced using fully qualified names of the form `catalog.schema.table`.
+
+![Unity Catalog Object Model](/figures/unity-catalog-object-model.png)
+
+* **Metastore.** A metastore serves as the root of the namespace and provides the highest level of naming isolation. Each metastore is associated with a "home region," where its primary metadata is stored. Every Databricks workspace—and its workloads—is attached to a single metastore, and objects in other metastores are inaccessible by default unless explicitly shared via Delta Sharing.
+
+* **Catalogs.** The first level of the hierarchy, catalogs typically reflect organizational units (e.g., per team) or development scopes (e.g., separate catalogs for development and production). Administrators can define "bindings" to restrict a catalog's access to specific Databricks workspaces. Catalogs also serve as integration points for importing external data via Delta Sharing and federation.
+
+* **Schemas.** Schemas (or databases) reside within catalogs and organize data and AI assets into finer-grained categories. A schema often represents a use case, project, or team sandbox, with access isolation enforced through privileges.
+
+* **Assets.** The last level contains the actual assets such as tables, views, volumes, ML models, and functions. UC also supports:
+  * **Volumes**, which represent a logical storage in a cloud object storage location for organizing files and non-tabular data
+  * **Models**, which represent ML models and their associated artifacts
+
+In addition to catalogs, a metastore also contains non-data configuration assets that abstract cloud resources, including **credentials**, **storage locations**, and **connections**, which abstract cloud principals, cloud storage, and external data sources, respectively. These assets enable UC to operate across clouds and engines.
+
+---
+
+## Privilege Model
+
+UC's privilege model is inspired by SQL-style grants. For example, to run a SELECT query on a table, a user must have the SELECT privilege on the table, the USE SCHEMA privilege on its parent schema and the USE CATALOG privilege on its catalog; the usage privileges allow container administrators to enforce broad access restrictions on assets within the container.
+
+### Ownership
+
+Every securable has an owner who holds all privileges on the object, including administrative rights, and can grant privileges to other principals. By default, regular users have no access to any securables within a metastore. Administrators must bootstrap access by granting privileges, including the right to create new securables. When a securable is created, its creator is automatically assigned as its owner. Owners may delegate privilege management by granting the MANAGE privilege to other principals, which confers the same authority as ownership.
+
+### Privilege Inheritance
+
+Privileges in UC are inherited down the securable hierarchy. Granting a privilege on a catalog or schema automatically propagates that privilege to all existing and future securables within that scope. For example, a principal granted SELECT on a catalog receives SELECT on all current and future tables in that catalog. This inheritance model allows administrators to scale access control efficiently by leveraging hierarchical grants.
+
+### Fine-Grained Access Control (FGAC)
+
+Some use cases require restricting access to specific rows or columns within a table—for example, limiting access to sensitive data such as social security numbers for non-privileged users. UC enables table administrators to define row filters and column masks, allowing data to be selectively hidden based on the accessing principal. Implementing fine-grained access control (FGAC) requires coordination between UC and a "trusted" query engine.
+
+### Attribute-Based Access Control (ABAC)
+
+To support scalable access management in large enterprises, administrators often prefer to define high-level access control policies based on data attributes rather than individual securables. ABAC enables this by dynamically applying privilege grants or FGAC policies based on metadata—such as tags—associated with a securable or table column. For example, an administrator can define an ABAC policy at the catalog level that applies a redacting column mask to all columns tagged with 'PII' for unprivileged users. An ABAC policy applies to all current and future securables within the policy's scope that satisfy the specified conditions. This approach enables flexible, comprehensive, and hierarchical policy enforcement at scale.
+
+---
+
+## Key Design Challenges and Solutions
+
+Designing UC required addressing several key challenges:
+
+### Uniform Access Control
+
+Lakehouse workloads access tables at two levels of abstraction: as higher-level catalog assets or directly through cloud storage paths. Existing catalogs, like HMS, operate solely at the catalog level, and direct access via raw storage paths bypasses the catalog entirely. However, customers require consistent access control regardless of the access method.
+
+**UC's Solution:**
+
+* **One-asset-per-path principle.** UC enforces that each cloud storage object maps to at most one UC asset, guaranteeing an unambiguous mapping from a cloud storage path to the corresponding UC asset.
+
+* **Credential vending API.** Clients do not have direct access to cloud storage; instead, UC provides a credential vending API that issues temporary credentials to clients. When a path-based access request is made, UC resolves the asset from the path and enforces its access policies, before issuing temporary credentials to that asset's storage.
+
+### Support for Diverse Asset Types
+
+Customers need to manage assets beyond tables for modern data and AI workloads, and also wish to manage assets in external catalogs like HMS from UC.
+
+**UC's Solution:**
+
+* **Open, extensible API.** UC provides an open, extensible API to integrate various open formats as asset types. For example, making UC act as a MLflow model registry only involved creating UC implementations of the MLflow base model registry RestStore and the base ArtifactRepository, after adding UC asset type for registered models. UC uses the same one-asset-per-path and credential vending approaches to ensure uniform governance for the model asset type.
+
+* **Catalog federation.** UC implements catalog federation, which allows users to "mount" data managed by an external catalog, such as an on-premise DBMS or HMS, and make it accessible in UC.
+
+### External Access
+
+An important use case is sharing data with external workloads that may not support the format of data stored in UC, without requiring additional data copies. For instance, this includes scenarios like sharing a Delta Lake table with an external workload that does not understand the Delta format or with one that only supports Apache Iceberg.
+
+**UC's Solution:**
+
+UC addresses this challenge by providing multiple open interfaces to access the same underlying data:
+
+* **Delta Sharing protocol** to share Delta tables with external Delta Sharing clients
+* **Delta UniForm (Universal Format)** to allow external Iceberg and Hudi clients to read Delta tables in UC
+* **Iceberg REST Catalog interface** to provide access to the UC catalog functionality to Iceberg clients
+
+### Discovery Support
+
+Many enterprise use cases require identifying assets that meet specific criteria or understanding their lifecycles. For instance, a user may need to verify that an asset has no downstream dependencies—using lineage information—prior to deletion, or may wish to locate all assets tagged with 'PII'. These needs are typically addressed by **discovery catalogs**, which operate by "indexing" metadata from operational catalogs. However, separating operational and discovery catalog functionality introduces several challenges:
+
+* Collecting metadata like lineage requires coordination not only with the operational catalog but also with compute engines
+* Discovery catalogs often rely on polling operational catalogs for updates, which incurs overhead and necessitates tradeoffs between metadata freshness and system performance
+* Efficiently enforcing access control policies defined in the operational catalog during discovery queries adds additional complexity
+
+**UC's Solution:**
+
+UC is designed with discovery catalog functionality in mind:
+
+* **Lineage APIs.** UC provides lineage APIs that allow compute engines to submit lineage information for end-to-end data tracking.
+
+* **Change event stream.** To improve freshness and reduce polling overhead, UC offers a change event stream that allows discovery catalogs to receive timely updates.
+
+* **Authorization APIs.** UC exposes authorization APIs that enable discovery systems to efficiently enforce access control policies at query time.
+
+In Databricks, these capabilities power features such as lineage and search, and the same functionality is exposed via APIs to enterprise discovery platforms like Collibra and Alation.
+
+### Performance
+
+Data warehouse workloads require Lakehouse catalogs to deliver significantly lower latency than traditional data lake solutions. UC operates as an independent service that exposes an open API, enabling integration with a variety of compute engines. This separation is essential for UC to function as a universal catalog, but it introduces additional network hops between engines and the catalog service, which can increase metadata access latency.
+
+**UC's Solution:**
+
+To mitigate this overhead, UC incorporates both batching and caching mechanisms:
+
+* **Batching.** UC consolidates all metadata access for a query into a single batched API call.
+
+* **Specialized caches.** UC employs specialized caches based on the consistency requirements of the metadata:
+  * For immutable metadata or metadata where weak consistency is acceptable (e.g., cloud credentials or user/group information), UC uses simple TTL-based caches to bound staleness.
+  * For metadata requiring stronger consistency—such as table commit information—UC utilizes a write-through cache that respects the transaction isolation guarantees of its underlying metadata store.
+  * These caches can be pushed to clients to further reduce latency for frequently accessed metadata.
+
+---
+
+## System Architecture
+
+![Unity Catalog Layered Architecture](/figures/unity-catalog-layered-architecture.png)
+
+### Catalog-Engine Separation
+
+The Lakehouse architecture follows the principle of catalog-engine separation, even though workloads often require close collaboration between the catalog and a processing engine. UC defines a clear interface between the catalog and the engines.
+
+The separation between the catalog and engines provides two major benefits:
+
+* **Enhanced manageability and security.** The catalog acts as a centralized authority for the Lakehouse asset namespace, all asset metadata, and access control policies. This single source of truth ensures that the core metadata is tightly managed, with well-defined REST APIs. The namespace and governance are unambiguous across different workloads and engines.
+
+* **Improved interoperability across engines.** A unified catalog allows different engines to work with the same set of assets, making it easier to support a wide variety of workloads without duplicating metadata management logic in each engine. Engines can focus on processing logic while relying on the catalog for metadata and access control, which improves modularity, reduces duplication of effort, and allows users to use the best engine for their workload.
+
+### Layered Design for Asset Types
+
+A key objective of UC's design is to maintain a uniform behavior for the common feature set shared by all asset types, while allowing different asset types to have type-specific functionalities.
+
+UC's layered design is essential for the separation of functionality core to all asset types and functionality specific to certain asset types. The following metadata and functionality served by the Unity Catalog service is considered essential for all asset types:
+
+* **Asset namespaces.** UC maintains the names of all assets and enforces the uniqueness of fully qualified names for each asset type.
+
+* **Storage paths and the one-asset-per-path principle.** The catalog enforces that no two assets in a metastore can have overlapping storage paths, guaranteeing an unambiguous mapping from a cloud storage path to the corresponding UC asset.
+
+* **Lifecycle.** The Unity Catalog service keeps track of the creation and deletion of assets in the 3-level namespace. It handles soft deletions and propagates deletions of a parent object to its children.
+
+* **Access control.** The Unity Catalog service maintains object ownership, privilege grants, tag assignment, ABAC rules and fine-grained access control policies. It is also the sole authority to make access control decisions based on these governance metadata.
+
+* **Credentials.** Credentials used to access cloud storage and external data sources are secured and governed by the Unity Catalog service. It is also responsible for generating temporary down-scoped credentials for data assets based on the requested access level.
+
+* **Audit logging.** The Unity Catalog service maintains an audit trail for API requests, object life cycle changes, access control decisions and other important events for all asset types.
+
+UC's layered architecture separates core functionality from type-specific implementations:
+
+**Entity-Relationship Data Model (Bottom Layer)**
+
+The foundation layer provides a generic data model for all asset types with:
+* Common interfaces for asset lookup (by name or ID), parent-child relationships, and privilege retrieval
+* State machines for resource provisioning and cleanup
+* Extension points for type-specific functionality
+
+The data model is persisted in a standard relational database, with caching optimizations handled at the persistence layer while maintaining consistency guarantees.
+
+**Adapter Layer**
+
+Provides integration with asset types and cloud providers:
+* Developers add new asset types via declarative manifests to UC's asset types registry
+* Each manifest specifies: hierarchy location, supported operations and privileges, authorization rules, and lifecycle management
+* Defines a uniform interface for cloud storage access and credential handling
+
+**Core Features Layer (Top)**
+
+Implements shared functionality critical for catalog integrity:
+* Namespace and lifecycle management
+* Access control and storage path management
+* Audit logging
+* Metadata change event publication (for discovery catalog functionality)
+
+This shared implementation ensures uniformity and correctness of core behaviors across all asset types.
+
+### Uniform Access Control Implementation
+
+UC avoids performance bottlenecks by not placing itself in the client's data access path. Instead, it uses a **temporary credential vending mechanism**:
+
+**Credential Vending Flow**
+
+* Administrators grant storage access exclusively to the catalog service (via UC external locations and storage credentials)
+* Clients receive credentials only to invoke UC APIs, not direct cloud storage access
+* When data access is needed:
+  1. Client invokes UC's temporary credentials API with required access level (read/write)
+  2. If accessed via cloud storage path, UC resolves the path to a unique asset (one-asset-per-path principle)
+  3. UC validates client privileges and issues a temporary credential scoped to the asset's storage path and access type
+  4. Credentials use cloud provider systems (e.g., STS tokens for AWS S3) and expire after tens of minutes
+
+**Fine-Grained Access Control (FGAC)**
+
+For row- and column-level security, UC employs a **two-level defense-in-depth mechanism**:
+
+* **Level 1: Securable-level access control.** UC grants the engine temporary credentials to access the table
+* **Level 2: Fine-grained enforcement.** The engine enforces row filtering and column masking based on user privileges
+
+**Trusted Engines Requirement**
+
+* FGAC requires engines to be isolated from user code to prevent privilege escalation
+* **Trusted engines** (authenticated to UC with machine identities) can access tables with FGAC policies
+* Untrusted engines (e.g., ML workloads requiring GPU access) cannot directly access FGAC-protected tables
+
+**Data Filtering Service**
+
+For untrusted engines needing FGAC-protected data, UC provides a **data filtering service**:
+* A trusted engine that untrusted engines delegate queries to
+* Executes queries with FGAC policies applied and returns filtered results
+* In Databricks, untrusted engines use Spark Connect to send queries to the data filtering service
+
+### Discovery Catalog Support
+
+Discovery catalog functionality like search and lineage is provided by second-tier services. However, they depend on the core service, and the interaction between them reflects a clear separation between "foreground" and "background" capabilities.
+
+* **Foreground capabilities**, such as access control and audit logging, are integral to the core service, where ensuring low-latency responses and consistency is essential for the integrity and security of metadata.
+
+* **Background capabilities**, such as search, discovery, and lineage, are built as extensions of the core service. They rely on platform-level features like metadata change events to asynchronously process metadata updates. This separation enables second-tier services to focus on large-scale indexing operations while tolerating slight staleness in metadata updates.
+
+Metadata change events serve as the critical bridge between the core and second-tier services. Whenever metadata is modified, the core service propagates change events, which are consumed by second-tier services to update their indexes, graphs, or lineage models. This event-driven approach ensures background services stay synchronized with the core service while operating independently in terms of processing and storage.
+
