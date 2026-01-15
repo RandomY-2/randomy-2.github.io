@@ -1,0 +1,450 @@
+---
+slug: gfs-google-file-system
+title: "GFS, Google's Distributed File System"
+date: "2026-01-02"
+description: "GFS is a scalable distributed file system for large distributed data-intensive applications, providing fault tolerance while running on inexpensive commodity hardware."
+tags: [gfs, google, distributed-systems, file-system, storage, hdfs, big-data]
+---
+
+## Why GFS?
+
+GFS is Google's scalable distributed file system designed for large distributed data-intensive applications. It provides fault tolerance while running on inexpensive commodity hardware and delivers high aggregate performance to a large number of clients.
+
+**Key Design Assumptions:**
+
+* **Component failures are the norm**: With hundreds or thousands of storage machines, failures are common. The system must constantly monitor, detect, tolerate, and automatically recover from failures.
+* **Files are huge by traditional standards**: Regularly working with multi-TB datasets comprising billions of objects makes managing billions of KB-sized files unwieldy. I/O operation and block sizes need to be revisited.
+* **Most files are mutated by appending**: Given huge files, appending becomes the focus of performance optimization and atomicity guarantees, while client-side data caching loses its appeal.
+* **Co-designing applications and file system API**: Relaxed consistency model simplifies the file system without imposing an onerous burden on applications. Atomic append operations allow multiple clients to append concurrently without extra synchronization.
+
+**Key Insights:**
+
+* **Control plane vs data plane**: Master (control plane) manages and orchestrates; chunk servers (data plane) store chunks replicated across multiple servers
+* **Single leader control plane**: Easier orchestration with global knowledge, fault-tolerant using consensus algorithms
+* **Avoid single bottleneck**: Master stores metadata, clients cache it and talk directly to data plane thereafter
+* **Relaxed consistency**: Replicas don't need to be byte-wise identical, but if a write succeeds, all replicas have data at that chunk index
+
+---
+
+## Design Assumptions
+
+**System built from commodity components**: Many inexpensive components that often fail. Must constantly monitor itself and detect, tolerate, and recover promptly from component failures.
+
+**Modest number of large files**: Expect a few million files, each typically 100 MB or larger. Multi-GB files are common case and should be managed efficiently. Small files supported but not optimized.
+
+**Workloads consist of:**
+* **Large streaming reads**: Individual operations typically read hundreds of KBs, more commonly 1 MB or more. Successive operations often read through contiguous regions.
+* **Small random reads**: Typically reads a few KBs at arbitrary offset. Performance-conscious applications batch and sort small reads to advance steadily through the file.
+
+**Large sequential writes**: Many large sequential writes that append data to files. Typical operation sizes similar to reads. Once written, files are seldom modified again. Small writes at arbitrary positions supported but don't have to be efficient.
+
+**Concurrent appends**: System must efficiently implement well-defined semantics for multiple clients concurrently appending to the same file. Files often used as producer-consumer queues or for many-way merging. Hundreds of producers may concurrently append. Atomicity with minimal synchronization overhead is essential.
+
+**High sustained bandwidth over low latency**: Most target applications place a premium on processing data in bulk at high rate, while few have stringent response time requirements for individual reads or writes.
+
+---
+
+## Architecture
+
+![Figure 1: GFS Architecture](/figures/gfs-architecture.png)
+
+A GFS cluster consists of **a single master and multiple chunk servers** and is accessed by multiple clients.
+
+**Files are divided into fixed-size chunks**:
+* Each chunk is identified by an immutable and globally unique 64-bit **chunk handle** assigned by the master at creation time (key-value pairs)
+* Chunk servers store chunks on local disks as Linux files
+* For reliability, each chunk is replicated on multiple chunk servers
+
+**The master maintains all file system metadata**:
+* Namespace (file and chunk namespaces)
+* Access control information
+* Mapping from files to chunks
+* Current locations of chunks
+* System-wide activities (chunk lease management, garbage collection, chunk migration)
+* Periodically communicates with each chunk server via HeartBeat messages
+
+**Clients interact with the master for metadata operations, but all data-bearing communication goes directly to chunk servers**.
+
+**No client or chunk server caching of file data**:
+* Client caches offer little benefit because most applications stream through huge files or have working sets too large to be cached. Not having them simplifies the client and eliminates cache coherence issues. (Clients do cache metadata.)
+* Chunk servers need not cache file data because chunks are stored as local files, so Linux's buffer cache already keeps frequently accessed data in memory.
+
+---
+
+## Single Master
+
+Having a single master simplifies design and enables sophisticated chunk placement and replication decisions using global knowledge. However, the master must minimize its involvement in reads and writes to avoid becoming a bottleneck.
+
+**Clients never read and write file data through the master**. Instead:
+
+1. Client asks the master which chunk servers it should contact
+2. Client caches this information for a limited time
+3. Client interacts with chunk servers directly for subsequent operations
+
+This is the **control plane vs data plane** separation: the master (control plane) stores metadata about (file path, chunk index) to chunk server mappings, while clients talk to the data plane directly.
+
+**Read flow**:
+1. Using fixed chunk size, client translates file name and byte offset into a chunk index
+2. Client sends master a request with file name and chunk index
+3. Master replies with chunk handle and locations of replicas
+4. Client caches this information using (file name, chunk index) as key
+5. Client sends request to one of the replicas (most likely closest), specifying chunk handle and byte range
+6. Further reads of the same chunk require no more client-master interaction until cache expires or file is reopened
+
+The client typically asks for multiple chunks in the same request, and the master includes information for chunks immediately following those requested, sidestepping future client-master interactions.
+
+---
+
+## Chunk Size
+
+Chunk size is one of the key design parameters. GFS chose **64 MB**, much larger than typical file system block sizes.
+
+**Advantages of large chunk size**:
+* Reduces clients' need to interact with the master (reads/writes on same chunk require only one initial request)
+* Since client is more likely to perform many operations on a given chunk, it can reduce network overhead by keeping a persistent TCP connection
+* Reduces size of metadata stored on master, allowing metadata to be kept in memory
+
+**Disadvantages**:
+* Small files consist of small number of chunks, perhaps just one. Chunk servers storing those chunks may become hot spots if many clients access the same file
+* Fixed by storing executables with higher replication factor and making batch queue system stagger application start times
+* Potential long-term solution: allow clients to read data from other clients
+
+Each chunk replica is stored as a plain Linux file and extended only as needed. Lazy space allocation avoids wasting space due to internal fragmentation.
+
+---
+
+## Metadata
+
+The master stores three major types of metadata:
+* The file and chunk namespaces
+* The mapping from files to chunks
+* The locations of each chunk's replicas
+
+**All metadata is kept in the master's memory**. The first two types (namespaces and file-to-chunk mapping) are also kept persistent by logging mutations to an operation log stored on the master's local disk and replicated on remote machines.
+
+### Chunk Locations
+
+The master **does not store chunk location information persistently**. Instead:
+* It asks each chunk server about its chunks at master startup
+* It asks whenever a chunk server joins the cluster
+* It keeps itself up-to-date by controlling all chunk placement and monitoring chunk server status with regular HeartBeat messages
+
+This eliminates the problem of keeping the master and chunk servers in sync as chunk servers join and leave the cluster, change names, fail, restart, and so on.
+
+### Operation Logs
+
+The operation log contains a historical record of critical metadata changes. It is central to GFS:
+* It is the only persistent record of metadata
+* It serves as a logical timeline that defines the order of concurrent operations
+* Files and chunks are uniquely identified by the logical times at which they were created
+
+The log is replicated on multiple remote machines. The master responds to a client operation only after flushing the corresponding log record to disk both locally and remotely.
+
+**Master recovery**: The master recovers its file system state by replaying the operation log. To minimize startup time:
+* The master checkpoints its state whenever the log grows beyond a certain size
+* It recovers by loading the latest checkpoint and replaying only the limited number of log records after that
+* The checkpoint is in a compact B-tree-like form that can be directly mapped into memory
+
+Because building a checkpoint can take a while, the master's internal state is structured so a new checkpoint can be created without delaying incoming mutations. The master switches to a new log file and creates the checkpoint in a separate thread.
+
+### In-Memory Data Structures
+
+The master periodically scans through its entire state in the background to:
+* Implement chunk garbage collection
+* Re-replicate in the presence of chunk server failures
+* Migrate chunks to balance load and disk space usage
+
+With less than 64 bytes of metadata per 64 MB chunk, and file namespace data typically requiring less than 64 bytes per file (using prefix compression), this approach is not a serious limitation in practice.
+
+---
+
+## Consistency Model
+
+![Figure 2: GFS Consistency Model](/figures/gfs-consistency-model.png)
+
+GFS has a **relaxed consistency model** that supports highly distributed applications while remaining relatively simple and efficient to implement.
+
+### Guarantees
+
+**File namespace mutations** (e.g., file creation) are atomic:
+* Handled exclusively by the master
+* Namespace locking guarantees atomicity and correctness
+* Master's operation log defines a global total order
+
+**Consistency definitions**:
+* A file region is **consistent** if all clients always see the same data, regardless of which replicas they read from
+* A region is **defined** after a file data mutation if it is consistent and clients see what the mutation writes in its entirety
+
+**Mutation outcomes**:
+* **Successful mutation without interference**: Region is defined (and consistent). All clients always see what the mutation has written.
+* **Concurrent successful mutations**: Region is undefined but consistent. All clients see the same data, but it may not reflect what any one mutation has written (may contain fragments from different mutations).
+* **Failed mutation**: Region is inconsistent (hence also undefined). Different clients may see different data at different times.
+
+**Data mutations**:
+* **`write`**: Causes data to be written at an application-specified file offset
+* **`record append`**: Causes data to be appended **atomically at least once** even in the presence of concurrent mutations, but at an offset of GFS's choosing. The offset is returned to the client and marks the beginning of a defined region. GFS may insert padding or record duplicates in between (these occupy regions considered inconsistent).
+
+**After a sequence of successful mutations**, the mutated file region is guaranteed to be defined and contain the data written by the last mutation. GFS achieves this by:
+* Applying mutations to a chunk in the same order on all its replicas (**log replication**)
+* Using chunk version numbers to detect stale replicas that have missed mutations while their chunk server was down (**log sequence number**)
+
+Stale replicas are never involved in a mutation or given to clients asking the master for chunk locations. They are garbage collected at the earliest opportunity.
+
+**Client caching considerations**: Since clients cache chunk locations, they may read from a stale replica before that information is refreshed. This is limited by the cache entry's timeout and the next open of the file, which purges all chunk information for that file from the cache.
+
+**Data corruption**: Long after a successful mutation, component failures can still corrupt or destroy data. GFS identifies failed chunk servers by regular handshakes and detects data corruption by checksumming. Once a problem surfaces, data is restored from valid replicas as soon as possible.
+
+A chunk is lost irreversibly only if all its replicas are lost before GFS can react (typically within minutes). Even in this case, it becomes unavailable, not corrupted: applications receive clear errors rather than corrupt data.
+
+---
+
+## System Interaction
+
+The system is designed to **minimize the master's involvement in all operations**.
+
+### Leases and Mutation Order
+
+A mutation is an operation that changes the contents or metadata of a chunk (e.g., write or append). Each mutation is performed at all the chunk's replicas.
+
+**Lease mechanism**:
+* The master grants a chunk lease to one of the replicas, called the **primary**
+* The primary picks a serial order for all mutations to the chunk
+* All replicas follow this order when applying mutations
+
+The lease mechanism minimizes management overhead:
+* Initial timeout of 60 seconds
+* As long as the chunk is being mutated, the primary can request and typically receive extensions indefinitely
+* Extension requests and grants are piggybacked on HeartBeat messages
+* The master may revoke a lease before it expires (e.g., when renaming a file)
+* Even if the master loses communication with a primary, it can safely grant a new lease to another replica after the old lease expires
+
+**Write flow** (7 steps):
+
+<div align="center">
+![Figure 3: GFS Write Control and Data Flow](/figures/gfs-write-control-data-flow.png)
+</div>
+
+1. Client asks master which chunk server holds the current lease for the chunk and locations of other replicas
+2. Master replies with identity of primary and locations of **secondary** replicas. Client caches this data
+3. Client pushes data to all replicas (can do so in any order). Each chunk server stores data in internal LRU buffer cache
+4. Once all replicas acknowledge receiving data, client sends write request to primary, identifying the data pushed earlier
+5. Primary assigns consecutive serial numbers to mutations and applies them to its local state in serial number order
+6. Primary forwards write request to all secondary replicas. Each secondary applies mutations in the same serial number order
+7. Secondaries reply to primary. Primary replies to client
+
+**Error handling**: If any replica reports an error, the client request is considered failed. The client code handles errors by retrying the failed mutation, making a few attempts at steps (3) through (7) before falling back to a retry from the beginning.
+
+**Large writes**: If a write is large or straddles a chunk boundary, GFS client code breaks it into multiple write operations. They may be interleaved with concurrent operations from other clients, so the shared file region may contain fragments from different clients, although replicas will be identical because operations complete successfully in the same order on all replicas (consistent but not necessarily defined).
+
+### Data Flow
+
+Data flow is **decoupled from control flow** to use the network efficiently.
+
+**Control flow**: Client → primary → all secondaries
+
+**Data flow**: Data is pushed linearly along a carefully picked chain of chunk servers in a pipelined fashion.
+
+**Goals**:
+* Fully utilize each machine's network bandwidth (linear chain rather than tree topology)
+* Avoid network bottlenecks and high-latency links (each machine forwards to the "closest" machine in network topology that has not received it)
+* Minimize latency by pipelining data transfer over TCP connections (chunk server starts forwarding immediately upon receiving data)
+
+Pipelining is especially helpful with switched networks with full-duplex links.
+
+### Atomic Record Appends
+
+In a traditional write, the client specifies the offset. Concurrent writes to the same region are not serializable and may contain fragments from multiple clients.
+
+In a `record append`, the client specifies only the data. GFS appends it to the file **at least once atomically** (as one continuous sequence of bytes) at an offset of GFS's choosing and returns that offset.
+
+**Record append flow**:
+1. Client pushes data to all replicas of the last chunk of the file, then sends request to primary
+2. Primary checks if appending would cause chunk to exceed 64 MB
+3. If so, it pads chunk to maximum size, tells secondaries to do the same, and replies to client to retry on next chunk
+4. If record fits (common case), primary appends data to its replica, tells secondaries to write at exact same offset, and replies success
+
+**Error handling**: If record append fails at any replica, the client retries. As a result, replicas may contain different data, possibly including duplicates of the same record in whole or in part.
+
+**GFS does not guarantee that all replicas are byte-wise identical. It only guarantees that the data is written at least once as an atomic unit**.
+
+### Snapshot
+
+The snapshot operation makes a copy of a file or directory tree almost instantaneously while minimizing interruptions of ongoing mutations.
+
+**Copy-on-write implementation**:
+1. Master revokes any outstanding leases on chunks in files to be snapshotted
+2. After leases revoked/expired, master logs the operation
+3. Master applies log record by duplicating metadata for source file/directory tree. Newly created snapshot files point to same chunks as source files
+4. When client wants to write to chunk C after snapshot, it sends request to master to find current lease holder
+5. Master notices reference count for chunk C is greater than one. It defers replying, picks new chunk handle C', and asks chunk servers with replicas of C to create new chunk C'
+6. By creating new chunk on same chunk servers as original, data can be copied locally (not over network). From this point, request handling is no different from any chunk
+
+---
+
+## Master Operation
+
+The master executes all namespace operations and manages chunk replicas throughout the system:
+* Makes placement decisions
+* Creates new chunks and replicas
+* Coordinates system-wide activities (keeping chunks fully replicated, balancing load, reclaiming unused storage)
+
+### Namespace Management and Locking
+
+GFS allows multiple operations to be active and uses locks over regions of the namespace to ensure proper serialization.
+
+**Differences from traditional file systems**:
+* GFS does not have a per-directory data structure listing all files in that directory
+* GFS does not support aliases (hard or symbolic links)
+
+**Namespace representation**:
+* Logically represented as a lookup table mapping full pathnames to metadata
+* With prefix compression, this table can be efficiently represented in memory
+* Each node in the namespace tree (file or directory name) has an associated read-write lock
+
+**Lock acquisition**:
+* Each master operation acquires a set of locks before it runs
+* Typically, if operation involves `/d1/d2/.../dn/leaf`, it acquires read-locks on directory names `/d1`, `/d1/d2`, ..., `/d1/d2/.../dn`, and either read or write lock on full pathname `/d1/d2/.../dn/leaf`
+* Allows concurrent mutations in same directory: each acquires read lock on directory name and write lock on file name
+* Read lock on directory prevents deletion, renaming, or snapshotting. Write locks on file names serialize attempts to create file with same name twice
+
+**Lock management**:
+* Lock objects allocated lazily and deleted when not in use
+* Locks acquired in consistent total order (by level in namespace tree, then lexicographically within same level) to prevent deadlock
+
+### Replica Placement
+
+A GFS cluster is highly distributed at multiple levels:
+* Hundreds of chunk servers spread across many machine racks
+* Hundreds of clients from same or different racks
+
+**Chunk replica placement policy** serves two purposes:
+* Maximize data reliability and availability
+* Maximize network bandwidth utilization
+
+**Strategy**:
+* **Spread replicas across machines**: Guards against disk or machine failures and utilizes each machine's network bandwidth
+* **Spread replicas across racks**: Ensures some replicas survive even if entire rack is damaged or offline. Also means traffic for a chunk can exploit aggregate bandwidth of multiple racks
+* **Tradeoff**: Write traffic has to flow through multiple racks, which is acceptable
+
+**Creation, Re-replication, Rebalancing**
+
+Chunk replicas are created for three reasons: chunk creation, re-replication, and rebalancing.
+
+**Chunk creation**: Master chooses where to place initially empty replicas considering:
+* Place on chunk servers with below-average disk space utilization (equalizes over time)
+* Limit number of "recent" creations on each chunk server (creation predicts imminent heavy write traffic)
+* Spread replicas across racks
+
+**Re-replication**: Master re-replicates chunk as soon as number of available replicas falls below user-specified goal. Triggered when:
+* Chunk server becomes unavailable
+* Chunk server reports replica may be corrupted
+* Disk is disabled due to errors
+* Replication goal is increased
+
+Each chunk needing re-replication is prioritized based on:
+* How far it is from replication goal (chunk that lost two replicas has higher priority than one that lost one)
+* Prefer chunks for live files over recently deleted files
+* Boost priority of chunks blocking client progress
+
+The master picks highest priority chunk and "clones" it by instructing chunk server to copy chunk data directly from existing valid replica. New replica placed with goals similar to creation (equalize disk space, limit active clone operations, spread across racks).
+
+**Limits on cloning**: Master limits number of active clone operations for cluster and each chunk server. Each chunk server limits bandwidth spent on each clone operation.
+
+**Rebalancing**: Master periodically examines current replica distribution and moves replicas for better disk space and load balancing. Also gradually fills up new chunk server rather than instantly swamping it with new chunks and heavy write traffic. When removing replicas, prefers those on chunk servers with below-average free space.
+
+### Garbage Collection
+
+GFS does not immediately reclaim available physical storage. It does so only lazily during regular garbage collection at both file and chunk levels.
+
+**Mechanism**:
+* When file is deleted, master logs deletion immediately
+* File is renamed to hidden name including deletion timestamp (instead of reclaiming resources immediately)
+* During master's regular scan of file system namespace, it removes hidden files if they have existed for more than three days (configurable)
+* During regular scan of chunk namespace, master identifies orphaned chunks (not reachable from any file) and erases metadata
+* In HeartBeat messages, each chunk server reports subset of chunks it has, and master replies with identity of all chunks no longer present in master's metadata
+* Chunk server is free to delete its replicas of such chunks
+
+**Advantages of lazy garbage collection**:
+* **Simple and reliable**: Chunk creation may succeed on some chunk servers but not others, leaving replicas master doesn't know about. Replica deletion messages may be lost. Garbage collection provides uniform way to clean up any replicas not known to be useful
+* **Batched and amortized**: Merges storage reclamation into regular background activities (namespace scans, handshakes with chunk servers). Done when master is relatively free, so master can respond promptly to client requests
+* **Safety net**: Delay in reclaiming storage provides safety net against accidental, irreversible deletion
+
+**Disadvantages**: Delay sometimes hinders user effort to fine-tune usage when storage is tight. Applications repeatedly creating and deleting temporary files may not reuse storage right away.
+
+**Mitigations**: Expedite storage reclamation if deleted file is explicitly deleted again. Allow users to apply different replication and reclamation policies to different parts of namespace (e.g., no replication, immediate deletion).
+
+### Stale Replica Detection
+
+Chunk replicas may become stale if chunk server fails and misses mutations while down.
+
+**Chunk version numbers**:
+* Master maintains chunk version number for each chunk to distinguish up-to-date and stale replicas
+* Whenever master grants new lease on chunk, it increases chunk version number and informs up-to-date replicas
+* Master and these replicas record new version number in persistent state
+* If replica is unavailable, its chunk version number is not advanced
+* When chunk server restarts and reports its chunks and version numbers, master detects stale replicas
+* If master sees version number greater than one in its records, master assumes it failed when granting lease and takes higher version to be up-to-date
+
+**Removal**: Master removes stale replicas in regular garbage collection. Before that, it effectively considers stale replica not to exist when replying to client requests for chunk information.
+
+**Safeguard**: Master includes chunk version number when informing clients which chunk server holds lease or when instructing chunk server to read chunk from another chunk server in cloning operation. Client or chunk server verifies version number when performing operation.
+
+---
+
+## Fault Tolerance and Diagnosis
+
+### High Availability
+
+GFS keeps the overall system highly available with two strategies: fast recovery and replication.
+
+**Fast Recovery**:
+* Both master and chunk server are designed to restore their state and start in seconds no matter how they terminated
+* Uses checkpoints and operation log replay
+
+**Chunk Replication**:
+* Each chunk is replicated on multiple chunk servers on different racks
+* Master clones existing replicas as needed to keep each chunk fully replicated
+
+**Master Replication**:
+* Master state is replicated for reliability
+* Operation log and checkpoints are replicated on multiple machines
+* A mutation to the state is considered committed only after its log record has been flushed to disk locally and on all master replicas
+* One master process remains in charge. When it fails, it can restart almost instantly. If its machine or disk fails, monitoring infrastructure outside GFS starts new master process elsewhere with replicated operation log
+
+**Shadow Masters**:
+* Provide read-only access to file system even when primary master is down
+* "Shadow" not "mirror" because they may lag primary slightly (typically fractions of a second)
+* Enhance read availability for files not being actively mutated or applications that don't mind slightly stale results
+* Shadow master reads replica of growing operation log and applies same sequence of changes to its data structures exactly as primary does
+* Like primary, it polls chunk servers at startup (and infrequently thereafter) to locate chunk replicas and exchanges frequent handshake messages with them
+* It depends on primary master only for replica location updates resulting from primary's decisions to create and delete replicas
+
+### Data Integrity
+
+Each chunk server uses checksumming to detect corruption of stored data.
+
+**Checksum structure**:
+* Each chunk is broken up into 64 KB blocks
+* Each block has a corresponding 32-bit checksum
+* Checksums are kept in memory and stored persistently with logging, separate from user data
+
+**Checksum usage**:
+* Before returning data from a read request, chunk server verifies checksum of the data blocks read
+* Before writing data to a chunk, chunk server verifies checksum of the data being written
+* If checksum mismatch detected, chunk server returns error and master instructs another replica to serve the request
+* Once valid replica is identified, master instructs chunk servers with bad replicas to clone from valid replica
+* Corrupted data is garbage collected during regular scan
+
+---
+
+## Key Insights
+
+GFS demonstrates several important distributed systems principles:
+
+* **Control plane vs data plane**: Master (control plane) manages metadata and orchestration; chunk servers (data plane) store actual data. Clients cache metadata and talk directly to data plane, avoiding single bottleneck.
+* **Single leader control plane**: Single master simplifies orchestration with global knowledge, can be made fault-tolerant using consensus algorithms and replication.
+* **Relaxed consistency**: Replicas don't need to be byte-wise identical, but successful writes ensure all replicas have data at that chunk index. This simplifies the system while meeting application needs.
+* **Separation of concerns**: Compute-storage disaggregation, leases separate control from data flow, background operations (garbage collection, rebalancing) run separately from foreground operations.
+* **Lazy operations**: Lazy space allocation, lazy garbage collection, and lazy lock allocation all improve performance and reduce complexity.
+* **Chunk-level operations**: Large chunk size (64 MB) reduces metadata overhead, enables efficient pipelined data transfer, and simplifies management.
+

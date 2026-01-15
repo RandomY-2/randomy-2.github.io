@@ -9,9 +9,22 @@ tags: [aurora, mysql, database, aws, cloud, oltp]
 
 ## Why Aurora?
 
-Aurora is Amazon’s answer to a very specific question:
+Aurora is Amazon's answer to a very specific question:
 
 > *As IT workloads are increasingly moving to cloud, how to model a cloud-native database?*
+
+Initially, users hosted MySQL on **EC2** instances with locally attached disks. This approach has limitations:
+* **Limited scaling**: Single-node MySQL can scale reads but not writes
+* **Limited fault tolerance**: If a physical node fails, data becomes temporarily unavailable
+
+To improve fault tolerance, Amazon introduced **EBS (Elastic Block Store)**—fault-tolerant storage servers abstracted as block devices. EBS uses Chain Replication with 2 replicas and makes EC2 instances stateless. However, EBS has issues:
+* **Huge data traffic**: Since EBS abstracts as a block device, MySQL synchronizes both dirty pages and redo logs. Changing a single byte requires transmitting the entire page
+* **Single-AZ limitation**: EBS servers are constrained to one Availability Zone (AZ) for performance, so they cannot tolerate AZ-wide failures
+
+Amazon then provided **RDS (Relational Database Service)**, a DBaaS with cross-AZ fault tolerance. However, RDS has tradeoffs:
+* **Reduced write performance**: Cross-AZ synchronization increases latency
+* **Huge data traffic remains**: Still synchronizes both dirty pages and redo logs
+* **Additional cross-AZ overhead**: Further increases network traffic
 
 As workloads move into public clouds, the environment around databases has changed:
 
@@ -84,7 +97,7 @@ And in a replicated / mirrored setup, both of these often get mirrored out to ot
 
 #### Aurora
 
-	1. Gnerates redo log records in the same MTR (mini-transaction) units as normal InnoDB.
+	1. Generates redo log records in the same MTR (mini-transaction) units as normal InnoDB.
 	2. Batches redo records.
 	3. Shards them by Protection Group (PG) - i.e., based on which logical volume segment they belong to.
 	4. Sends those redo batches over the network to the storage service (6 replicas, 3 AZs).
@@ -380,7 +393,7 @@ Replica lag is typically small (on the order of tens of milliseconds), and repli
 
 ## Recovery: Always Doing Recovery, So Startup is Cheap
 
-Traditional databases uses ARES-style crash recovery:
+Traditional databases use ARIES-style crash recovery:
 
 * **Forward processing**: apply WAL + periodically checkpoint pages to disk.
 * **Crash recovery**: run log replay synchronously while the database is offline.

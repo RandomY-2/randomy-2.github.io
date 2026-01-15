@@ -1,0 +1,358 @@
+---
+slug: zookeeper-coordination-service
+title: "ZooKeeper: Wait-free Coordination Kernel for Internet-scale Systems"
+date: "2026-01-13"
+description: "ZooKeeper is a service for coordinating processes of distributed applications, providing a simple and high-performance kernel for building coordination primitives."
+tags: [zookeeper, distributed-systems, coordination, consensus, apache, chubby]
+---
+
+## Why ZooKeeper?
+
+Large-scale distributed applications require different forms of coordination: configuration management, leader election, group membership, locks, barriers, and more. One approach is to develop specialized services for each coordination need (e.g., Amazon SQS for queuing), but this becomes unwieldy.
+
+**The Solution**: ZooKeeper provides a **coordination kernel**—a simple, high-performance service that exposes an API that enables application developers to implement their own primitives application developers.
+
+**Key Design Decisions**:
+
+* **Wait-free API over blocking primitives**: Blocking primitives like locks can cause slow or faulty clients to negatively impact faster clients, and complicate the service implementation. ZooKeeper uses a **wait-free** data model with an event-driven watch mechanism instead.
+* **FIFO client ordering + linearizable writes**: Guaranteeing both **FIFO client ordering** of all operations and **linearizable writes** enables efficient implementation while being sufficient for coordination primitives.
+* **Coordination kernel philosophy**: Instead of implementing specific primitives on the server side, ZooKeeper exposes a simple API that enables multiple forms of coordination adapted to application requirements.
+
+---
+
+## The ZooKeeper Service
+
+### Service Overview
+
+ZooKeeper provides to its clients the abstraction of a set of **data nodes (znodes)**, organized according to a hierarchical namespace (similar to a file system).
+
+![Zookeeper Namespace](/figures/zk-namespace.png)
+
+**Data Model**:
+
+The **data model** of ZooKeeper is essentially a file system with a simplified API and only full data reads and writes, or a key/value table with hierarchical keys.
+
+* Znodes are data objects that clients manipulate through the ZooKeeper API
+* Use `/A/B/C` to denote the path to znode `C`, where `C` has `B` as its parent and `B` has `A` as its parent
+* All znodes store data, and all znodes (except ephemeral znodes) can have children
+* The hierarchical namespace is useful for allocating subtrees for the namespace of different applications and for setting access rights to those subtrees
+* Unlike files in file systems, znodes are not designed for general data storage. Instead, znodes map to abstractions of the client application, typically corresponding to metadata used for coordination purposes
+* Although znodes have not been designed for general data storage, ZooKeeper does allow clients to store some information that can be used for metadata or configuration in a distributed computation
+  * For example, in a leader-based application, it is useful for an application server that is just starting to learn which other server is currently the leader → have the current leader write this information in a known location in the znode space
+
+**Znode Types**:
+
+* **Regular**: Clients manipulate regular znodes by creating and deleting them explicitly
+* **Ephemeral**: Clients create such znodes, and they either delete them explicitly, or let the system remove them automatically when the session that creates them terminates (deliberately or due to a failure).
+
+**Sequential Flag**:
+
+* When creating a new znode, a client can set a **sequential** flag
+* Nodes created with the sequential flag have the value of a monotonically increasing counter appended to its name
+* If `n` is the new znode and `p` is the parent znode, then the sequence value of `n` is never smaller than the value in the name of any other sequential znode ever created under `p`
+
+**Watches**:
+
+* ZooKeeper implements watches to allow clients to receive timely notifications of changes without requiring polling
+* When a client issues a read operation with a watch flag set, the operation completes as normal except that the server promises to notify the client when the information returned has changed
+* Watches are **one-time triggers** associated with a session; they are unregistered once triggered or the session closes
+* Watches indicate that a change has happened, but do not provide the change itself
+
+**Sessions**:
+
+* A client connects to ZooKeeper and initiates a **session**
+* Sessions have an associated timeout. ZooKeeper considers a client faulty if it does not receive anything from its session for more than that timeout
+* A session ends when clients explicitly close a session handle or ZooKeeper detects that a client is faulty
+* Sessions enable a client to move transparently from one server to another within a ZooKeeper ensemble
+
+### Client API
+
+All methods have both a synchronous and an asynchronous version.
+
+* `create(path, data, flags)`: Creates a znode with path name `path`, stores `data[]` in it, and returns the name of the new znode. `flags` enables a client to select the type of znode: regular, ephemeral, and set the sequential flag.
+
+* `delete(path, version)`: Deletes the znode `path` if that znode is at the expected `version`.
+
+* `exists(path, watch)`: Returns `true` if the znode with path name `path` exists, and returns `false` otherwise. The `watch` flag enables a client to set a watch on the znode.
+
+* `getData(path, watch)`: Returns the data and metadata (such as version information) associated with the znode. The `watch` flag works in the same way as it does for `exists()`, except that ZooKeeper does not set the watch if the znode does not exist.
+
+* `setData(path, data, version)`: Writes `data[]` to znode `path` if the `version` number is the current version of the znode.
+
+* `getChildren(path, watch)`: Returns the set of names of the children of a znode.
+
+* `sync(path)`: Waits for all updates pending at the start of the operation to propagate to the server that the client is connected to. The path is currently ignored.
+
+**Synchronous vs Asynchronous**:
+
+* Use the synchronous API when executing a single ZooKeeper operation with no concurrent tasks—the call blocks until completion
+* Use the asynchronous API to have multiple outstanding ZooKeeper operations and other tasks executed in parallel
+
+### ZooKeeper Guarantees
+
+**Linearizable writes**: All requests that update the state of ZooKeeper are serializable and respect precedence.
+
+**FIFO client order**: All requests from a given client are executed in the order that they were sent by the client.
+
+**A-linearizability (asynchronous linearizability)**:
+
+* In the original definition of linearizability by Herlihy, a client is only able to have one outstanding operation at a time (a client is one thread)
+* ZooKeeper allows a client to have multiple outstanding operations and guarantees FIFO order for operations from the same client
+* Read requests are **not linearizable** since they happen at replicas. To achieve "as linearizable as possible", clients should call `sync()` before the read operation (but still [not a real linearizable read](https://github.com/jepsen-io/jepsen/issues/399))
+* Because only update requests are A-linearizable, ZooKeeper processes read requests locally at each replica, allowing the service to scale linearly as servers are added
+
+**Liveness and Durability**:
+
+* If a majority of ZooKeeper servers are active and communicating, the service will be available
+* If the ZooKeeper service responds successfully to a change request, that change persists across any number of failures as long as a quorum of servers is eventually able to recover
+
+---
+
+## Examples of Primitives
+
+ZooKeeper is a coordination kernel, not a lock service. However, the API enables implementing various coordination primitives on the client side.
+
+### Configuration Management
+
+ZooKeeper can be used to implement dynamic configuration in a distributed application:
+
+* Configuration is stored in a znode `zc`
+* Processes start up with the full pathname of `zc` and obtain their configuration by reading `zc` with the watch flag set to `true`
+* If the configuration in `zc` is ever updated, the processes are notified and read the new configuration, again setting the watch flag to `true`
+
+### Rendezvous
+
+When the final system configuration is not known a priori (e.g., IP address of the final master during an ongoing election, etc):
+
+* Use a rendezvous znode `zr`, which is a node created by the client
+* The client passes the full pathname of `zr` as a startup parameter of the master and worker processes
+* When the master is finally elected, it fills in `zr` with information about addresses and ports it is using
+* When workers start, they read `zr` with watch set to `true`. If `zr` has not been filled in yet (master election unfinished), the worker waits to be notified when `zr` is updated
+* If `zr` is an ephemeral node, master and worker processes can watch for `zr` to be deleted and clean themselves up when the client ends
+
+### Group Membership
+
+We take advantage of ephemeral nodes to implement group membership:
+
+* Designate a znode `zg` to represent the group
+* When a process member of the group starts, it creates an ephemeral child znode under `zg`. If each process has a unique name or identifier, that name is used as the name of the child znode; otherwise, the process creates the znode with the `SEQUENTIAL` flag
+* After the child znode is created under `zg`, the process starts normally. If the process fails or ends, the znode that represents it under `zg` is automatically removed
+* Processes can obtain group information by simply listing the children of `zg`. If a process wants to monitor changes in group membership, the process can set the watch flag to `true` and refresh the group information when change notifications are received
+
+### Simple Locks
+
+The simplest lock implementation uses "lock files":
+
+* The lock is represented by a znode
+* To acquire a lock, a client tries to create the designated znode with the `EPHEMERAL` flag. If the create succeeds, the client holds the lock. Otherwise, the client can read the znode with the watch flag set to be notified if the current holder dies
+* A client releases the lock when it dies or explicitly deletes the znode. Other clients waiting for a lock try again once they observe the znode being deleted
+
+**Problems with simple locks**:
+
+* **Herd effect**: If there are many clients waiting to acquire a lock, they will all vie for the lock when it is released even though only one client can acquire the lock
+* Only implements exclusive locking (no Read/Write locks)
+
+### Simple Locks without Herd Effect
+
+```
+Lock
+1 n = create(l + "/lock-", EPHEMERAL|SEQUENTIAL)
+2 C = getChildren(l, false)
+3 if n is lowest znode in C, exit
+4 p = znode in C ordered just before n
+5 if exists(p, true) wait for watch event
+6 goto 2
+
+Unlock
+1 delete(n)
+```
+
+To avoid the herd effect, we line up all the clients requesting the lock and each client obtains the lock in order of request arrival:
+
+* Define a lock znode `l`
+* To acquire the lock:
+  1. Create a sequential ephemeral child znode under `l` (e.g., `l/_c_<sequence-number>`)
+  2. Get the children of `l` with watch set to `true`
+  3. If the created znode has the lowest sequence number, the client holds the lock
+  4. Otherwise, watch for the znode with the next lower sequence number (the one immediately preceding yours)
+* When the znode you're watching is deleted, check again if you now hold the lock
+
+The removal of a znode only causes one client to wake up, since each znode is watched by exactly one other client, so we do not have the herd effect. There is no polling or timeouts.
+
+### Read/Write Locks
+
+```
+Write Lock
+1 n = create(l + "/write-", EPHEMERAL|SEQUENTIAL)
+2 C = getChildren(l, false)
+3 if n is lowest znode in C, exit
+4 p = znode in C ordered just before n
+5 if exists(p, true) wait for event
+6 goto 2
+
+Read Lock
+1 n = create(l + "/read-", EPHEMERAL|SEQUENTIAL)
+2 C = getChildren(l, false)
+3 if no write znodes lower than n in C, exit
+4 p = write znode in C ordered just before n
+5 if exists(p, true) wait for event
+6 goto 3
+```
+
+To implement read/write locks, we change the lock procedure slightly and have separate read lock and write lock procedures:
+
+* **Write locks**: Similar to the simple lock without herd effect, but znodes are named with a "write-" prefix
+* **Read locks**: Similar procedure, but znodes are named with a "read-" prefix. Since read locks may be shared, only earlier write lock znodes prevent the client from obtaining a read lock
+
+When there are several clients waiting for a read lock and they get notified when a "write-" znode with a lower sequence number is deleted, all those read clients should be released since they may now have the lock—this is desired behavior, not a herd effect.
+
+### Double Barrier
+
+Double barriers enable clients to synchronize the beginning and the end of a computation:
+
+* Represent a barrier in ZooKeeper with a znode `b`
+* Every process `p` registers with `b` (by creating a znode as a child of `b`) on entry, and unregisters (removes the child) when it is ready to leave
+* Processes can enter the barrier when the number of child znodes of `b` exceeds the barrier threshold
+* Processes can leave the barrier when all of the processes have removed their children
+* To enter, processes watch for the existence of a `ready` child of `b` that will be created by the process that causes the number of children to exceed the barrier threshold
+* To leave, processes watch for a particular child to disappear and only check the exit condition once that znode has been removed
+
+---
+
+## ZooKeeper Implementation
+
+### Architecture Overview
+
+![Zookeeper Architecture](/figures/zk-architecture.png)
+
+ZooKeeper provides high availability by replicating the ZooKeeper data on each server that composes the service.
+
+**Request Processing**:
+
+* Upon receiving a request, a server prepares it for execution (request processor)
+* If such a request requires coordination among the servers (write requests), they use an agreement protocol (atomic broadcast), and finally servers commit changes to the ZooKeeper database fully replicated across all servers
+* In the case of read requests, a server simply reads the state of the local database and generates a response
+
+**Replicated Database**:
+
+* The replicated database is an **in-memory database** containing the entire data tree
+* For recoverability, updates are efficiently logged to disk, and writes are forced to disk before they are applied to the in-memory database
+* ZooKeeper keeps a replay log (write-ahead log) of committed operations and generates periodic snapshots
+
+**Server Roles**:
+
+* Every ZooKeeper server services clients
+* Clients connect to exactly one server to submit requests
+* Read requests are serviced from the local replica of each server database
+* Requests that change the state of the service (write requests) are processed by an agreement protocol
+* As part of the agreement protocol, write requests are forwarded to a single server, the **leader**
+* The rest of the ZooKeeper servers, called **followers**, receive message proposals from the leader and agree upon state changes
+
+### Request Processor
+
+Since the messaging layer is atomic, we guarantee that the local replicas never diverge. Unlike the requests sent from clients, the transactions are **idempotent**:
+
+* When the leader receives a write request, it calculates what the state of the system will be when the write is applied and transforms it into a transaction that captures this new state
+* The future state must be calculated because there may be outstanding transactions that have not yet been applied to the database
+* For example, if a client does a conditional `setData` and the version number in the request matches the future version number of the znode being updated, the service generates a `setDataTXN` that contains the new data, the new version number, and updated timestamps
+* If an error occurs (such as mismatched version numbers or the znode to be updated does not exist), an `errorTXN` is generated instead
+
+### Atomic Broadcast (Zab)
+
+All requests that update ZooKeeper state are forwarded to the leader. The leader executes the request and broadcasts the change to the ZooKeeper state through **Zab**, an atomic broadcast protocol.
+
+**Zab Properties**:
+
+* Zab uses simple majority quorums to decide on a proposal, so Zab (and thus ZooKeeper) can only work if a majority of servers are correct
+* Zab guarantees that changes broadcast by a leader are delivered in the order they were sent and all changes from previous leaders are delivered to an established leader before it broadcasts its own changes
+* During normal operation, Zab delivers all messages in order and exactly once
+* But since Zab does not persistently record the id of every message delivered, Zab may redeliver a message during recovery
+* Because we use idempotent transactions, multiple delivery is acceptable as long as they are delivered in order
+* ZooKeeper requires Zab to redeliver at least all messages that were delivered after the start of the last snapshot
+
+### Replicated Database
+
+When a ZooKeeper server recovers from a crash, it needs to recover its internal state. ZooKeeper uses periodic snapshots and only requires redelivery of messages since the start of the snapshot.
+
+**Fuzzy Snapshots**:
+
+* ZooKeeper uses **fuzzy snapshots** since it does not lock the ZooKeeper state to take the snapshot
+* Instead, it does a depth-first scan of the tree atomically reading each znode's data and metadata and writing them to disk
+* The snapshot may have applied some subset of the state changes delivered during the generation of the snapshot
+* But since state changes are idempotent, we can apply them twice as long as we apply the state changes in order
+
+### Client-Server Interactions
+
+**Write Processing and Notifications**:
+
+* When a server processes a write request, it also sends out and clears notifications relative to any watch that corresponds to that update
+* Servers process writes in order and do not process other writes or reads concurrently
+* Servers handle notifications locally. Only the server that a client is connected to tracks and triggers notifications for that client
+
+**Read Requests**:
+
+* Read requests are handled locally at each server. Each read request is processed and tagged with a `zxid` that corresponds to the last transaction seen by the server
+* The `zxid` defines the partial order of the read requests with respect to the write requests
+* This provides excellent read performance because it is just an in-memory operation on the local server, with no disk activity or agreement protocol to run
+
+**Stale Reads and Sync**:
+
+* One drawback of using fast reads is not guaranteeing precedence order for read operations—a read operation may return a stale value, even though a more recent update to the same znode has been committed
+* For applications that require the latest value, ZooKeeper implements `sync`
+* To improve consistency, a client calls `sync` followed by the read operation. However, there is a small chance that `sync` still doesn't return correct data (as mentioned [above](#zookeeper-guarantees), even with `sync()`, reads are still not a real linearizable read)
+* The FIFO order guarantee of client operations together with the global guarantee of sync enables the result of the read operation to reflect any changes that happened before the sync was issued in most cases, but this does not provide true linearizability
+
+**FIFO Order and Session Management**:
+
+* ZooKeeper servers process requests from clients in FIFO order
+* Responses include the `zxid` that the response is relative to
+* Even heartbeat messages during intervals of no activity include the last `zxid` seen by the server that the client is connected to
+* If the client connects to a new server, that new server ensures that its view of the ZooKeeper data is at least as recent as the view of the client by checking the last `zxid` of the client against its last `zxid`
+  * If the client has a more recent view than the server, the server does not reestablish the session with the client until the server has caught up
+  * The client is guaranteed to be able to find another server that has a recent view of the system since the client only sees changes that have been replicated to a majority of the ZooKeeper servers
+
+**Session Failure Detection**:
+
+* To detect client session failures, ZooKeeper uses timeouts
+* The leader determines that there has been a failure if no other server receives anything from a client session within the session timeout
+* If the client sends requests frequently enough, then there is no need to send any other message
+* Otherwise, the client sends heartbeat messages during periods of low activity
+* If the client cannot communicate with a server to send a request or heartbeat, it connects to a different ZooKeeper server to re-establish its session
+
+---
+
+## Key Insights
+
+### Is ZooKeeper Linearizable?
+- **Not for reads.** A plain `getData/getChildren/exists` can be served by a lagging follower, so it may return stale data. Even `sync()` is a best-effort freshness barrier rather than a strict linearizable-read primitive in all edge cases.
+- **Writes are effectively linearizable.** A successful write is globally ordered/committed (via quorum agreement) and will not be rolled back.
+
+Overall, ZooKeeper describes its consistency guarantees as:
+
+- **Sequential Consistency**
+  Updates from a client will be applied in the order that they were sent.
+
+- **Atomicity**
+  Updates either succeed or fail — there are no partial results.
+
+- **Single System Image**
+  A client will see the same view of the service regardless of the server that it connects to.
+
+- **Reliability**
+  Once an update has been applied, it will persist from that time forward until a client overwrites the update. This guarantee has two corollaries:
+  - If a client gets a successful return code, the update will have been applied. On some failures (communication errors, timeouts, etc.) the client will not know if the update has applied or not. We take steps to minimize the failures, but the guarantee is only present with successful return codes. (This is called the monotonicity condition in Paxos.)
+  - Any updates that are seen by the client, through a read request or successful update, will never be rolled back when recovering from server failures.
+
+- **Timeliness**
+  The client’s view of the system is guaranteed to be up-to-date within a certain time bound (on the order of tens of seconds). Either system changes will be seen by a client within this bound, or the client will detect a service outage.
+
+### ZooKeeper (Zab) vs Raft
+
+- **Raft’s leader-centric replication and its throughput trade-off**
+  - In **Raft**, both reads ands writes flow **through the leader**: the leader appends the entry and replicates it to followers, then commits after reaching a quorum. This leader-mediated replication is the cornerstone of Raft’s linearizablity.
+  - Because the **leader is a bottleneck**, adding more nodes does **not** make throughput scale linearly.
+  - Recently, there are optimizations to achieve [linearizable follower read in raft](https://docs.pingcap.com/tidb/stable/follower-read/#:~:text=Follower%20Read%20includes%20a%20set,TiDB%20prioritizes%20ensuring%20successful%20reads.)
+
+- **ZooKeeper’s follower-read optimization and read scalability**
+  - ZooKeeper/Zab commonly supports **fast follower reads**: reads are served **locally** by any replica without running an agreement protocol on the critical path.
+  - In practice, this means **read throughput can scale roughly linearly** with the number of servers, while accepting that reads may be stale unless the application adds an explicit freshness barrier (e.g., `sync()` + read).
