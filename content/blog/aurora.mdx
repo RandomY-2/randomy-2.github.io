@@ -403,7 +403,6 @@ Aurora uses the same redo logic for crash recovery but keeps log applicator runn
 On crash:
 
 1. The database engine restarts and runs a **volume recovery protocol** with the storage service:
-
    * For each PG, it contacts a **read quorum** of segments.
    * It determines the highest LSN for which all prior log records are guaranteed available across the quorum → **VCL**.
    * It then determines **VDL** as the highest CPL ≤ VCL.
