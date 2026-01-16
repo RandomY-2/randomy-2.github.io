@@ -1,6 +1,6 @@
 ---
 slug: zookeeper-coordination-service
-title: "ZooKeeper: Wait-free Coordination Kernel for Internet-scale Systems"
+title: "ZooKeeper: Coordination Kernel for Internet-scale Systems"
 date: "2026-01-13"
 description: "ZooKeeper is a service for coordinating processes of distributed applications, providing a simple and high-performance kernel for building coordination primitives."
 tags: [zookeeper, distributed-systems, coordination, consensus, apache, chubby]
@@ -14,9 +14,22 @@ Large-scale distributed applications require different forms of coordination: co
 
 **Key Design Decisions**:
 
-* **Wait-free API over blocking primitives**: Blocking primitives like locks can cause slow or faulty clients to negatively impact faster clients, and complicate the service implementation. ZooKeeper uses a **wait-free** data model with an event-driven watch mechanism instead.
-* **FIFO client ordering + linearizable writes**: Guaranteeing both **FIFO client ordering** of all operations and **linearizable writes** enables efficient implementation while being sufficient for coordination primitives.
-* **Coordination kernel philosophy**: Instead of implementing specific primitives on the server side, ZooKeeper exposes a simple API that enables multiple forms of coordination adapted to application requirements.
+- **Sequential Consistency**
+  Updates from a client will be applied in the order that they were sent.
+
+- **Atomicity**
+  Updates either succeed or fail — there are no partial results.
+
+- **Single System Image**
+  A client will see the same view of the service regardless of the server that it connects to (but read can be stale).
+
+- **Reliability**
+  Once an update has been applied, it will persist from that time forward until a client overwrites the update. This guarantee has two corollaries:
+  - If a client gets a successful return code, the update will have been applied. On some failures (communication errors, timeouts, etc.) the client will not know if the update has applied or not. We take steps to minimize the failures, but the guarantee is only present with successful return codes. (This is called the monotonicity condition in Paxos.)
+  - Any updates that are seen by the client, through a read request or successful update, will never be rolled back when recovering from server failures.
+
+- **Timeliness**
+  The client’s view of the system is guaranteed to be up-to-date within a certain time bound (on the order of tens of seconds). Either system changes will be seen by a client within this bound, or the client will detect a service outage.
 
 ---
 
@@ -326,25 +339,6 @@ When a ZooKeeper server recovers from a crash, it needs to recover its internal 
 ### Is ZooKeeper Linearizable?
 - **Not for reads.** A plain `getData/getChildren/exists` can be served by a lagging follower, so it may return stale data. Even `sync()` is a best-effort freshness barrier rather than a strict linearizable-read primitive in all edge cases.
 - **Writes are effectively linearizable.** A successful write is globally ordered/committed (via quorum agreement) and will not be rolled back.
-
-Overall, ZooKeeper describes its consistency guarantees as:
-
-- **Sequential Consistency**
-  Updates from a client will be applied in the order that they were sent.
-
-- **Atomicity**
-  Updates either succeed or fail — there are no partial results.
-
-- **Single System Image**
-  A client will see the same view of the service regardless of the server that it connects to.
-
-- **Reliability**
-  Once an update has been applied, it will persist from that time forward until a client overwrites the update. This guarantee has two corollaries:
-  - If a client gets a successful return code, the update will have been applied. On some failures (communication errors, timeouts, etc.) the client will not know if the update has applied or not. We take steps to minimize the failures, but the guarantee is only present with successful return codes. (This is called the monotonicity condition in Paxos.)
-  - Any updates that are seen by the client, through a read request or successful update, will never be rolled back when recovering from server failures.
-
-- **Timeliness**
-  The client’s view of the system is guaranteed to be up-to-date within a certain time bound (on the order of tens of seconds). Either system changes will be seen by a client within this bound, or the client will detect a service outage.
 
 ### ZooKeeper (Zab) vs Raft
 
