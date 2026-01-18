@@ -4,11 +4,14 @@ title: "Lakehouse Demystified"
 date: "2025-08-13"
 description: "Revisit Lakehouse paper after 4 years."
 tags: [lakehouse, data-lake, data-warehouse, delta-lake, iceberg, hudi, cidr, parquet, orc, metadata]
+category: system-papers
 ---
 
 ## Where We Have Been
 
-![Figure 1: Data Platform Generations](/figures/data_generation.png)
+<div align="center">
+![Figure 1: Data Platform Generations](/figures/data_generation.png)
+</div>
 
 ### First generation: classic data warehouses
 
@@ -65,7 +68,9 @@ Pain points:
 direct-access data formats**, such as Apache Parquet, (ii) have **first-class support for machine learning and data
 science**, and (iii) offer **state-of-the-art performance**.
 
-![Figure 2: Lakehouse Architecture](/figures/lakehouse_architecture.png)
+<div align="center">
+![Figure 2: Lakehouse Architecture](/figures/lakehouse_architecture.png)
+</div>
 
 The core idea is to keep data in open, directly accessible formats (Parquet/ORC) on low-cost object storage and add a
 **transactional metadata layer** that abstracts files into managed tables. This layer enables ACID semantics across
@@ -98,7 +103,9 @@ files via OPTIMIZE/compaction to bound small-file counts and improve scan effici
 
 ## Advanced Analytics, Natively
 
-![Figure 3: Lakehouse AI](/figures/lakehouse_ai.png)
+<div align="center">
+![Figure 3: Lakehouse AI](/figures/lakehouse_ai.png)
+</div>
 
 ML/DS frameworks already read Parquet/ORC; in a Lakehouse they simply consult the transactional metadata log to
 determine **which files comprise the current table version**, avoiding exports and proprietary barriers.

@@ -1,7 +1,7 @@
 ---
 slug: zookeeper-coordination-service
 title: "ZooKeeper: Coordination Kernel for Internet-scale Systems"
-date: "2026-01-13"
+date: "2026-01-07"
 description: "ZooKeeper is a service for coordinating processes of distributed applications, providing a simple and high-performance kernel for building coordination primitives."
 tags: [zookeeper, distributed-systems, coordination, consensus, apache, chubby]
 ---
@@ -39,7 +39,9 @@ Large-scale distributed applications require different forms of coordination: co
 
 ZooKeeper provides to its clients the abstraction of a set of **data nodes (znodes)**, organized according to a hierarchical namespace (similar to a file system).
 
+<div align="center">
 ![Zookeeper Namespace](/figures/zk-namespace.png)
+</div>
 
 **Data Model**:
 
@@ -236,7 +238,9 @@ Double barriers enable clients to synchronize the beginning and the end of a com
 
 ### Architecture Overview
 
+<div align="center">
 ![Zookeeper Architecture](/figures/zk-architecture.png)
+</div>
 
 ZooKeeper provides high availability by replicating the ZooKeeper data on each server that composes the service.
 

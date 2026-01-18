@@ -4,6 +4,7 @@ title: "Dynamo, Amazon's Highly Available Key-value Store"
 date: "2025-10-21"
 description: "Dynamo, Amazon's Highly Available Key-value Store"
 tags: [dynamo, kv, database, Amazon, AWS]
+category: system-papers
 ---
 
 ## Why Dynamo?
@@ -36,14 +37,18 @@ distributed to nodes with higher capacity.
 
 ## System Design
 
-![Figure 1: Dynamo Design Choices](/figures/dynamo-design-choices.png)
+<div align="center">
+![Figure 1: Dynamo Design Choices](/figures/dynamo-design-choices.png)
+</div>
 
 ### Partition via Consistent Hashing
 
 In services such as GFS, there is a control plane that provides metadata about which node to request for which data,
 which can lead to single-point-of-failure. Dynamo uses **consistent hashing with virtual nodes**.
 
-![Figure 2: Consistent hashing](/figures/dynamo-consistent-hashing.png)
+<div align="center">
+![Figure 2: Consistent hashing](/figures/dynamo-consistent-hashing.png)
+</div>
 
 In traditional consistent hashing, each key is mapped to a point on the ring by hashing the key. Ownership is defined
 by walking clockwise to the first token greater than the key’s hash. In Dynamo, each physical node owns multiple tokens
@@ -78,7 +83,9 @@ version.
 successful `put(key, context, value)` takes the client-supplied `context` (a prior clock), increments the coordinator’s
 own counter, and attaches the new clock to the stored version.
 
-![Figure 3: Vector Clocks](/figures/dynamo-vector-clocks.png)
+<div align="center">
+![Figure 3: Vector Clocks](/figures/dynamo-vector-clocks.png)
+</div>
 
 **Reading the diagram (Figure 3).** A write starts at node `Sx`, yielding `[Sx:1]`, then `[Sx:2]`. Replicas `Sy` and `Sz`
 later handle independent writes that both *include* `[Sx:2]`, producing `[Sx:2, Sy:1]` and `[Sx:2, Sz:1]`. These two

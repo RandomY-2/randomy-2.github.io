@@ -4,6 +4,7 @@ title: "GFS, Google's Distributed File System"
 date: "2026-01-02"
 description: "GFS is a scalable distributed file system for large distributed data-intensive applications, providing fault tolerance while running on inexpensive commodity hardware."
 tags: [gfs, google, distributed-systems, file-system, storage, hdfs, big-data]
+category: system-papers
 ---
 
 ## Why GFS?
@@ -46,7 +47,9 @@ GFS is Google's scalable distributed file system designed for large distributed 
 
 ## Architecture
 
+<div align="center">
 ![Figure 1: GFS Architecture](/figures/gfs-architecture.png)
+</div>
 
 A GFS cluster consists of **a single master and multiple chunk servers** and is accessed by multiple clients.
 
@@ -160,7 +163,9 @@ With less than 64 bytes of metadata per 64 MB chunk, and file namespace data typ
 
 ## Consistency Model
 
+<div align="center">
 ![Figure 2: GFS Consistency Model](/figures/gfs-consistency-model.png)
+</div>
 
 GFS has a **relaxed consistency model** that supports highly distributed applications while remaining relatively simple and efficient to implement.
 

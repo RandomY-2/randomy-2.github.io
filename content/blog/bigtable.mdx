@@ -4,6 +4,7 @@ title: "Bigtable, Google's Distributed Storage System"
 date: "2025-12-26"
 description: "Bigtable is a distributed storage system for managing structured data designed to scale to petabytes across thousands of commodity servers."
 tags: [bigtable, google, distributed-systems, nosql, storage, sstable, gfs, chubby]
+category: system-papers
 ---
 
 ## Why Bigtable?
@@ -29,7 +30,9 @@ format: (row: string, column: string, time: int64) → string
 
 Consider the **Web table** as a concrete example: we want to store a large collection of web pages and their metadata for use across multiple projects. URLs serve as row keys, different aspects of web pages (like language, links, metadata) become column names, and the actual page contents go into a `contents:` column with timestamps marking when each page was fetched, as illustrated in Figure 1.
 
+<div align="center">
 ![Figure 1: Bigtable Data Model Example](/figures/bigtable-data-model-example.png)
+</div>
 
 ### Rows
 
@@ -122,7 +125,9 @@ The Bigtable implementation has three major components:
 
 Bigtable uses a **three-level hierarchy** (analogous to B+ tree) to store tablet location information:
 
+<div align="center">
 ![Figure 2: Bigtable Tablet Hierarchy](/figures/bigtable-tablet-hierarchy.png)
+</div>
 
 **Level 1**: Chubby file contains the location of the **root tablet**
 
@@ -173,7 +178,9 @@ The client library caches tablet locations to reduce lookup overhead. When a cli
 
 The persistent state of a tablet is stored in GFS:
 
+<div align="center">
 ![Figure 3: Bigtable Tablet Representation](/figures/bigtable-tablet-representation.png)
+</div>
 
 * Updates are committed to a **commit log** (redo records)
 * Recently committed updates are stored in memory in a sorted buffer called a **memtable**

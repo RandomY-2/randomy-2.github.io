@@ -1,11 +1,12 @@
 ---
 
 slug: aurora-amazon-cloud-native-database
-title: "Aurora, Amazon’s Cloud-Native Relational Database"
+title: "Aurora, Amazon's Cloud-Native Relational Database"
 date: "2025-12-06"
-description: "Amazon Aurora rethinks MySQL’s architecture for the cloud by treating the log as the database and pushing durability into a multi-AZ storage service."
+description: "Amazon Aurora rethinks MySQL's architecture for the cloud by treating the log as the database and pushing durability into a multi-AZ storage service."
 tags: [aurora, mysql, database, aws, cloud, oltp]
--------------------------------------------------
+category: system-papers
+---
 
 ## Why Aurora?
 
@@ -65,13 +66,17 @@ This leads to Aurora's design choices:
 * Use **quorum replication across AZs** with fast, asynchronous gossip.
 * Aggressively reduce **network write amplification**, not just disk write amplification.
 
+<div align="center">
 ![Aurora Overview](/figures/aurora-overview.png)
+</div>
 
 ---
 
 ## High-Level Architecture: Compute Decoupled from a Log-Centric Storage Service
 
+<div align="center">
 ![Aurora Architecture](/figures/aurora-architecture.png)
+</div>
 
 At a high level, Aurora consists of a database engine and a storage service:
 
@@ -206,7 +211,9 @@ Because repairs are fast and localized, the probability of a catastrophic multi-
 
 Consider a highly available MySQL deployment across 2 AZs with EBS and synchronous mirroring:
 
+<div align="center">
 ![Traditional Mirrored MySQL](/figures/aurora-mirrored-mysql.png)
+</div>
 
 For each OLTP write, MySQL typically produces:
 
@@ -236,7 +243,9 @@ Aurora changes the data path:
 * **Only redo log records are sent to the storage service**.
 * **No data pages** are ever written out by the engine:
 
+<div align="center">
 ![Aurora Network IO](/figures/aurora-network-io.png)
+</div>
 
 In an Aurora cluster with one primary instance and multiple replicas instances deployed across multiple AZs:
 * The primary only writes log records to the storage service and streams those log records as well as metadata updates to the replica instances
@@ -268,7 +277,9 @@ fashion without impacting write throughput of the database engine.
 
 On each storage node, the pipeline for log records looks roughly like this:
 
+<div align="center">
 ![Aurora Storage Node Pipeline](/figures/aurora-storage-pipeline.png)
+</div>
 
 1. **Receive log record** and enqueue in memory.
 2. **Persist record to local SSD** and acknowledge back to the engine.

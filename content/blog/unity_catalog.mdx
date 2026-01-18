@@ -67,7 +67,9 @@ Unity Catalog addresses these limitations by being:
 
 Unity Catalog operates within the Databricks Lakehouse platform, which consists of three key components:
 
+<div align="center">
 ![Databricks Lakehouse platform](/figures/dbx-lakehouse-platform.png)
+</div>
 
 * **Data lake storage.** The Lakehouse platform decouples storage from compute, allowing customers to choose their preferred storage providers (e.g., S3, ADLS, GCS) and bring existing large datasets without costly migrations. These datasets can be stored in open formats such as Delta Lake, Iceberg, or Parquet.
 
@@ -83,7 +85,9 @@ The data lake storage and DBR are part of the **data plane**, which customers ca
 
 All data and AI assets in UC are organized within a metastore, which defines a three-level hierarchical namespace. Assets are referenced using fully qualified names of the form `catalog.schema.table`.
 
+<div align="center">
 ![Unity Catalog Object Model](/figures/unity-catalog-object-model.png)
+</div>
 
 * **Metastore.** A metastore serves as the root of the namespace and provides the highest level of naming isolation. Each metastore is associated with a "home region," where its primary metadata is stored. Every Databricks workspace—and its workloads—is attached to a single metastore, and objects in other metastores are inaccessible by default unless explicitly shared via Delta Sharing.
 
@@ -196,7 +200,9 @@ To mitigate this overhead, UC incorporates both batching and caching mechanisms:
 
 ## System Architecture
 
+<div align="center">
 ![Unity Catalog Layered Architecture](/figures/unity-catalog-layered-architecture.png)
+</div>
 
 ### Catalog-Engine Separation
 

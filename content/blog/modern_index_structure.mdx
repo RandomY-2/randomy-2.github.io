@@ -4,6 +4,7 @@ title: "Beyond the Classic B-Tree: The Evolution Towards Modern Variants for Cac
 date: "2025-07-13"
 description: "A survey of B+-Tree evolution to tackle cache hierarchy, block-oriented reads, append-friendly writes, and high-concurrency workloads."
 tags: [databases, b-tree, b+-tree, data-structures, concurrency, cache]
+category: system-papers
 ---
 
 ## Hardware Characteristics
@@ -35,7 +36,9 @@ In fact, being latch-free can help to avoid both problems, as shown in
 which traces the cache‑line “ping‑pong” that unfolds when multiple threads walk overlapping
 root‑to‑leaf paths **n1 → n2/n3 → n4–n7**:
 
-![Figure 1: Coherence Storm Triggered by Node‑Resident Latches](/figures/latch-cache-miss.png)
+<div align="center">
+![Figure 1: Coherence Storm Triggered by Node‑Resident Latches](/figures/latch-cache-miss.png)
+</div>
 
 1. **p1** starts from a cold cache, traverses **n1 → n2 → n4**, and pulls these nodes into its private cache
 **c1** while toggling their latches.
@@ -144,9 +147,13 @@ existing page state. This preserves cache locality and enables lock-free updates
 3. **Log-Structured Storage** — Bw-Trees employ their own write-optimized storage layer instead of relying on the
 Flash Translation Layer (FTL). This improves SSD write performance by controlling flushing and avoiding write amplification.
 
-![Figure 2: Bw-Tree Layers](/figures/bw-tree-archi-1.png)
+<div align="center">
+![Figure 2: Bw-Tree Layers](/figures/bw-tree-archi-1.png)
+</div>
 
-![Figure 3: Bw-Tree Architecture](/figures/bw-tree-archi-2.png)
+<div align="center">
+![Figure 3: Bw-Tree Architecture](/figures/bw-tree-archi-2.png)
+</div>
 
 These techniques directly address the hardware constraints discussed earlier. The Bw-Tree eliminates blocking synchronization
 by relying solely on

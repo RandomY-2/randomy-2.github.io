@@ -17,7 +17,9 @@ tasks, GPUs are engineered for **throughput** and **massive parallelism**.
 
 ## Architectural Divergence Between CPU and GPU
 
-![Figure 1: CPU vs. GPU](/figures/cpu-vs-gpu.png)
+<div align="center">
+![Figure 1: CPU vs. GPU](/figures/cpu-vs-gpu.png)
+</div>
 
 The above diagram provides an abstract visualization of the architectural distinctions between CPUs
 and GPUs. It represents the relative transistor allocation for different functional components using
@@ -61,7 +63,9 @@ an `if-else` branch, threads for which the condition evaluates to `true` will be
 of the `if` block, while the others are deactivated. Afterward, the inactive threads are reactivated for
 the `else` block, and the roles reverse.
 
-![Figure 3: GPU If-Else](/figures/gpu-if-else.png)
+<div align="center">
+![Figure 3: GPU If-Else](/figures/gpu-if-else.png)
+</div>
 
 It is worth emphasizing that although we speak of "cores" in both CPU and GPU contexts, they are not equivalent
 in capability or granularity. A single GPU core—a **CUDA core**--is more accurately
@@ -72,13 +76,17 @@ smaller widths (e.g., 128-bit or 256-bit registers processing 4, 8, or 16 elemen
 optimized for bulk throughput over large data arrays, whereas CPU vector units provide modest parallelism tightly
 coupled with control-rich logic. The following are more terms explained from the Cornell Workshop.
 
-![Figure 2: GPU Compute Terms](/figures/gpu-compute-terms.png)
+<div align="center">
+![Figure 2: GPU Compute Terms](/figures/gpu-compute-terms.png)
+</div>
 
 ---
 
 ## Memory Hierarchy: Cache-Coherent vs. Software-Managed
 
-![Figure 2: GPU Memory Architecture](/figures/gpu-memory-archi.png)
+<div align="center">
+![Figure 2: GPU Memory Architecture](/figures/gpu-memory-archi.png)
+</div>
 
 Memory subsystems further illustrate the architectural divergence between CPUs and GPUs.
 CPU memory hierarchies are built around deep, hardware-managed cache systems—including L1,
@@ -112,7 +120,9 @@ one source-level kernel maps to many concurrent thread instances, each operating
 
 An example CUDA and host code are as follows:
 
-![Figure 4: CUDA Code](/figures/cuda-code-example.png)
+<div align="center">
+![Figure 4: CUDA Code](/figures/cuda-code-example.png)
+</div>
 
 The drawback of heterogeneous CPU–GPU computing is the **communication overhead across the host–device boundary**.
 Even with high-bandwidth interconnects (e.g., NVLink), the latency and bandwidth of CPU–GPU transfers and kernel
@@ -139,11 +149,9 @@ CUDA expresses parallel work in a three-level hierarchy, closely mirroring the u
    therefore requires either multiple kernel launches or newer features such as *Cooperative Groups*.
 
 
-<img
-  src="/figures/thread-block-grid.png"
-  alt="Figure 3: Thread Block Grid"
-  className="mx-auto my-4"
-/>
+<div align="center">
+![Figure 3: Thread Block Grid](/figures/thread-block-grid.png)
+</div>
 
 A block is mapped to execute on a single SM and is the scope for fast barrier sync
 (`__syncthreads()`) and programmer-managed **shared memory**. Multiple blocks can co-reside

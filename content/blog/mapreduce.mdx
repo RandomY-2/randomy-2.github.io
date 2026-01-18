@@ -4,6 +4,7 @@ title: "MapReduce: Simplified Data Processing on Large Clusters"
 date: "2025-12-30"
 description: "MapReduce is a programming model and implementation for processing large data sets. Programs written in this functional style are automatically parallelized and executed on large clusters of commodity machines."
 tags: [mapreduce, google, distributed-systems, big-data, parallel-computing, hadoop, functional-programming]
+category: system-papers
 ---
 
 ## Why MapReduce?
@@ -90,7 +91,9 @@ In addition, the user writes code to fill in a `mapreduce specification` object 
 
 ### Execution Overview
 
+<div align="center">
 ![Figure 1: MapReduce Architecture](/figures/mr-architecture.png)
+</div>
 
 **Map invocations** are distributed by automatically partitioning input data into M splits, which can be processed in parallel by different machines.
 
