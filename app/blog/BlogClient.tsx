@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { BLOG_CATEGORIES, type BlogCategory, type BlogPost } from "./page";
+import { BLOG_CATEGORIES, type BlogCategory, type BlogPost } from "./types";
 
 interface BlogClientProps {
   posts: BlogPost[];

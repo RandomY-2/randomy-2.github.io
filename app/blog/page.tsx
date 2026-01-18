@@ -2,24 +2,9 @@ import fs from "fs";
 import path from "path";
 import matter from "gray-matter";
 import BlogClient from "./BlogClient";
+import { BLOG_CATEGORIES, type BlogPost } from "./types";
 
 const postsDirectory = path.join(process.cwd(), "content", "blog");
-
-// Blog categories/types
-export const BLOG_CATEGORIES = [
-  { value: "all", label: "All Posts" },
-  { value: "system-papers", label: "System" },
-  { value: "ai", label: "AI" },
-] as const;
-
-export type BlogCategory = typeof BLOG_CATEGORIES[number]["value"];
-
-export interface BlogPost {
-  slug: string;
-  title: string;
-  date: string;
-  categories: string[]; // Array of categories
-}
 
 function getBlogPosts(): BlogPost[] {
   const files = fs.readdirSync(postsDirectory).filter((f) => f.endsWith(".mdx"));
