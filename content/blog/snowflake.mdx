@@ -1,0 +1,403 @@
+---
+slug: snowflake-cloud-data-warehouse
+title: "Snowflake: The Elastic Cloud Data Warehouse"
+date: "2026-02-01"
+description: "Snowflake is a multi-tenant, transactional, secure, highly scalable and elastic cloud data warehouse with full SQL support and built-in extensions for semi-structured and schema-less data."
+tags: [snowflake, data-warehouse, cloud, sql, elastic, saas, columnar, mvcc]
+category: system-papers
+---
+
+## Why Snowflake?
+
+Traditional data warehousing systems are struggling to fit into the cloud environment for two fundamental reasons:
+
+1. **They were designed for fixed resources** and are thus unable to leverage the cloud's elasticity. Traditional systems were built to run on small, static clusters of well-behaved machines, making them a poor architectural fit for the cloud.
+
+2. **Their dependence on complex ETL pipelines and physical tuning** is at odds with the flexibility and freshness requirements of the cloud's new types of semi-structured data and rapidly evolving workloads.
+
+The cloud promises increased economies of scale, extreme scalability and availability, and a pay-as-you-go cost model. But these advantages can only be captured if the software itself is able to scale **elastically** over the pool of commodity resources that is the cloud.
+
+**The data landscape has also changed dramatically:**
+
+* It used to be that most data came from predictable, internal sources: transactional systems, ERP applications, CRM applications.
+* With the cloud, a significant and rapidly growing share of data comes from less controllable or external sources: application logs, web applications, mobile devices, social media, sensor data (IoT).
+* This data frequently arrives in **schema-less, semi-structured formats** (JSON, Avro, etc.).
+* Traditional data warehousing solutions depend on deep ETL pipelines and physical tuning that fundamentally assume predictable, slow-moving, and easily categorized data.
+
+**The Big Data alternative** (Hadoop, Spark) still lacks much of the efficiency and feature set of established data warehousing technology, and most importantly, they require significant engineering effort to roll out and use.
+
+**Snowflake's mission:** Build an enterprise-ready data warehousing solution for the cloud that combines the best of both worlds—the efficiency and features of traditional data warehouses with the scalability and flexibility required for modern cloud workloads.
+
+---
+
+## Storage Versus Compute: The Multi-Cluster, Shared-Data Architecture
+
+### The Problem with Shared-Nothing Architectures
+
+Shared-nothing architectures have become the dominant system architecture in high-performance data warehousing for scalability and commodity hardware. In a shared-nothing architecture, every query processor node has its own local disks. Tables are horizontally partitioned across nodes and each node is only responsible for the rows on its local disks.
+
+However, a pure shared-nothing architecture has an important drawback: **it tightly couples compute resources and storage resources**, which leads to problems in certain scenarios:
+
+**1. Heterogeneous Workload**
+* While the hardware is homogeneous, the workload typically is not.
+* A system configuration ideal for bulk loading (high I/O bandwidth, light compute) is a poor fit for complex queries (low I/O bandwidth, heavy compute) and vice versa.
+* Consequently, the hardware configuration needs to be a trade-off with low average utilization.
+
+**2. Membership Changes**
+* If the set of nodes changes (due to node failures or user resizing), large amounts of data need to be reshuffled.
+* Since the very same nodes are responsible for both data shuffling and query processing, a significant performance impact can be observed, limiting elasticity and availability.
+
+**3. Online Upgrade**
+* While the effects of small membership changes can be mitigated using replication, software and hardware upgrades eventually affect every node in the system.
+* Implementing online upgrades such that one node after another is upgraded without any system downtime is possible in principle, but is made very hard by the fact that everything is tightly coupled and expected to be homogeneous.
+
+In an on-premise environment, these issues can usually be tolerated. The situation is very different in the cloud:
+* Platforms like Amazon EC2 feature many different node types. Taking advantage of them is simply a matter of bringing the data to the right type of node.
+* Node failures are more frequent and performance can vary dramatically, even among nodes of the same type. Membership changes are thus not an exception—they are the norm.
+* There are strong incentives to enable online upgrades and elastic scaling.
+
+### Snowflake's Solution: Decoupled Storage and Compute
+
+For these reasons, **Snowflake separates storage and compute**. The two aspects are handled by two loosely coupled, independently scalable services:
+
+* **Compute** is provided through Snowflake's (proprietary) shared-nothing engine.
+* **Storage** is provided through Amazon S3 (or Azure Blob Storage, Google Cloud Storage).
+* To reduce network traffic between compute nodes and storage nodes, each compute node caches some table data on local disk.
+
+**Key benefits:**
+* Local disk space is not spent on replicating the whole base data, which may be very large and mostly cold (rarely accessed).
+* Instead, local disk is used exclusively for temporary data and caches, both of which are hot (suggesting the use of high-performance storage devices such as SSDs).
+* Once the caches are warm, performance approaches or even exceeds that of a pure shared-nothing system.
+
+Snowflake calls this architecture the **multi-cluster, shared-data architecture**.
+
+---
+
+## Architecture
+
+Snowflake is a service-oriented architecture composed of highly fault tolerant and independently scalable services. These services communicate through RESTful interfaces and fall into three architectural layers:
+
+* **Data Storage** - This layer uses Amazon S3 to store table data and query results.
+* **Virtual Warehouses** - The "muscle" of the system. This layer handles query execution within elastic clusters of virtual machines, called virtual warehouses.
+* **Cloud Services** - The "brain" of the system. This layer is a collection of services that manage virtual warehouses, queries, transactions, and all the metadata: database schemas, access control information, encryption keys, usage statistics and so forth.
+
+<div align="center">
+![Snowflake Architecture](/figures/snowflake-architecture.png)
+</div>
+
+### Data Storage
+
+Snowflake stores all table data in Amazon S3 (or equivalent cloud storage).
+
+**S3's properties and their implications:**
+* Compared to local storage, S3 naturally has a much higher access latency and there is a higher CPU overhead associated with every single I/O request, especially if HTTPS connections are used.
+* More importantly, S3 is a blob store with a relatively simple HTTP(S)-based PUT/GET/DELETE interface. Objects (files) can only be (over-)written in full. It is not even possible to append data to the end of a file. The exact size of a file needs to be announced up-front in the PUT request.
+* S3 does, however, support GET requests for parts (ranges) of a file.
+
+**These properties had a strong influence on Snowflake's design:**
+
+* Tables are **horizontally partitioned** into **immutable files** which are equivalent to blocks or pages in a traditional database system.
+* Within each file, the values of each attribute or column are grouped together and heavily compressed, a well-known scheme called **PAX or hybrid columnar** in the literature.
+* Each table file has a header which, among other metadata, contains the offsets of each column within the file.
+* Because S3 allows GET requests over parts of files, queries only need to download the file headers and those columns they are interested in.
+
+**Additional uses of S3:**
+* Snowflake uses S3 to store temp data generated by query operators (e.g., massive joins) once local disk space is exhausted.
+* S3 is also used for large query results.
+* Spilling temp data to S3 allows the system to compute arbitrarily large queries without out-of-memory or out-of-disk errors.
+* Storing query results in S3 enables new forms of client interactions and simplifies query processing, since it removes the need for server-side cursors found in traditional database systems.
+
+**Metadata storage:** Metadata such as catalog objects, which table consists of which S3 files, statistics, locks, transaction logs, etc. is stored in a scalable, transactional key-value store, which is part of the Cloud Services layer.
+
+### Virtual Warehouses
+
+The Virtual Warehouses layer consists of clusters of EC2 instances. Each such cluster is presented to its single user through an abstraction called a **virtual warehouse (VW)**.
+
+The individual EC2 instances that make up a VW are called **worker nodes**. Users never interact directly with worker nodes. In fact, users do not know or care which or how many worker nodes make up a VW. VWs instead come in abstract "T-Shirt sizes" ranging from X-Small to XX-Large. This abstraction allows Snowflake to evolve the service and pricing independent of the underlying cloud platform.
+
+#### Elasticity and Isolation
+
+**VWs are pure compute resources:**
+* They can be created, destroyed, or resized at any point, on demand.
+* Creating or destroying a VW has no effect on the state of the database.
+* It is perfectly legal (and encouraged) that users shut down all their VWs when they have no queries.
+* This elasticity allows users to dynamically match their compute resources to usage demands, independent of the data volume.
+
+**Query execution model:**
+* Each individual query runs on exactly one VW.
+* Worker nodes are not shared across VWs, resulting in strong performance isolation for queries.
+* Each user may have multiple VWs running at any given time, and each VW in turn may be running multiple concurrent queries.
+* Every VW has access to the same shared tables, without the need to physically copy data.
+
+**Use strategies:**
+* Shared, infinite storage means users can share and integrate all their data, one of the core principles of data warehousing.
+* Simultaneously, users benefit from private compute resources, avoiding interference of different workloads and organizational units.
+* It is common for Snowflake users to have several VWs for queries from different organizational units, often running continuously, and periodically launch on-demand VWs, for instance for bulk loading.
+
+#### Local Caching and File Stealing
+
+**Caching strategy:**
+* Each worker node maintains a cache of table data on local disk.
+* The cache is a collection of table files (S3 objects) that have been accessed in the past by the node.
+* The cache holds file headers and individual columns of files, since queries download only the columns they need.
+* The cache lives for the duration of the worker node and is shared among concurrent and subsequent worker processes (queries).
+* It follows a simple **least-recently-used (LRU)** replacement policy, oblivious of individual queries.
+
+**Consistent hashing for cache efficiency:**
+* To improve the hit rate and avoid redundant caching of individual table files across worker nodes of a VW, the query optimizer assigns input file sets to worker nodes using **consistent hashing** over table file names.
+* Subsequent or concurrent queries accessing the same table file will therefore do this on the same worker node.
+* Consistent hashing in Snowflake is **lazy**. When the set of worker nodes changes (because of node failures or VW resizing), no data is shuffled immediately.
+* Instead, Snowflake relies on the LRU replacement policy to eventually replace the cache contents.
+* This solution amortizes the cost of replacing cache contents over multiple queries, resulting in much better availability than an eager cache or a pure shared-nothing system which would need to immediately shuffle large amounts of table data across nodes.
+
+**File stealing for skew handling:**
+* Skew handling is particularly important in a cloud data warehouse. Some nodes may be executing much slower than others due to virtualization issues or network contention.
+* Snowflake deals with this problem at the scan level. Whenever a worker process completes scanning its set of input files, it requests additional files from its peers, a technique called **file stealing**.
+* If a peer finds that it has many files left in its input file set when such a request arrives, it answers the request by transferring ownership of one remaining file for the duration and scope of the current query.
+* The requestor then downloads the file directly from S3, not from its peer. This design ensures that file stealing does not make things worse by putting additional load on straggler nodes.
+
+#### Execution Engine
+
+The engine Snowflake built is **columnar, vectorized, and push-based**.
+
+**Columnar storage and execution:**
+* Generally considered superior to row-wise storage and execution for analytic workloads.
+* Enables more effective use of CPU caches and SIMD instructions.
+* Provides more opportunities for (lightweight) compression.
+
+**Vectorized execution:**
+* In contrast to MapReduce, Snowflake avoids materialization of intermediate results.
+* Instead, data is processed in pipelined fashion, in batches of a few thousand rows in columnar format.
+* This approach, pioneered by VectorWise (originally MonetDB/X100), saves I/O and greatly improves cache efficiency.
+
+**Push-based execution:**
+* Relational operators push their results to their downstream operators, rather than waiting for these operators to pull data (classic Volcano-style model).
+* Push-based execution improves cache efficiency, because it removes control flow logic from tight loops.
+* It also enables Snowflake to efficiently process DAG-shaped plans, as opposed to just trees, creating additional opportunities for sharing and pipelining of intermediate results.
+
+**Simplified execution model:**
+* There is no need for transaction management during execution. As far as the engine is concerned, queries are executed against a fixed set of immutable files.
+* There is no buffer pool. Most queries scan large amounts of data. Using memory for table buffering versus operation is a bad trade-off here.
+
+**Spilling to disk:**
+* Snowflake allows all major operators (join, group by, sort) to spill to disk and recurse when main memory is exhausted.
+* A pure main-memory engine, while leaner and perhaps faster, is too restrictive to handle all interesting workloads. Analytic workloads can feature extremely large joins or aggregations.
+
+### Cloud Services
+
+Virtual warehouses are ephemeral, user-specific resources. In contrast, the **Cloud Services layer is heavily multi-tenant**. Each service of this layer—access control, query optimizer, transaction manager, and others—is long-lived and shared across many users. Multi-tenancy improves utilization and reduces administrative overhead, which allows for better economies of scale than in traditional architectures where every user has a completely private system incarnation.
+
+Each service is replicated for high availability and scalability. Consequently, the failure of individual service nodes does not cause data loss or loss of availability, though some running queries may fail (and be transparently re-executed).
+
+#### Query Management and Optimization
+
+**Query lifecycle:**
+* All queries issued by users pass through the Cloud Services layer.
+* Here, all the early stages of the query lifecycle are handled: parsing, name resolution, access control, and plan optimization.
+
+**Optimizer design:**
+* Snowflake's query optimizer follows a typical **Cascades-style approach**, with top-down cost-based optimization.
+* All statistics used for optimization are automatically maintained on data load and updates.
+* Since Snowflake does not use indices, the plan search space is smaller than in some other systems.
+* The plan space is further reduced by postponing many decisions until execution time, for example the type of data distribution for joins.
+* This design reduces the number of bad decisions made by the optimizer, increasing robustness at the cost of a small loss in peak performance.
+* It also makes the system easier to use (performance becomes more predictable), which is in line with Snowflake's overall focus on service experience.
+
+**Query execution:**
+* Once the optimizer completes, the resulting execution plan is distributed to all the worker nodes that are part of the query.
+* As the query executes, Cloud Services continuously tracks the state of the query to collect performance counters and detect node failures.
+
+#### Concurrency Control
+
+Concurrency control is handled entirely by the Cloud Services layer.
+
+**Snapshot Isolation (SI):**
+* Snowflake decided to implement ACID transactions via **Snapshot Isolation (SI)**.
+* Under SI, all reads by a transaction see a consistent snapshot of the database as of the time the transaction started.
+* SI is implemented on top of **multi-version concurrency control (MVCC)**, which means a copy of every changed database object is preserved for some duration.
+
+**MVCC and immutable files:**
+* MVCC is a natural choice given the fact that table files are immutable, a direct consequence of using S3 for storage.
+* Changes to a file can only be made by replacing it with a different file that includes the changes.
+* It follows that write operations (insert, update, delete, merge) on a table produce a newer version of the table by adding and removing whole files relative to the prior table version.
+* File additions and removals are tracked in the metadata (in the global key-value store), in a form which allows the set of files that belong to a specific table version to be computed very efficiently.
+
+#### Pruning
+
+**The problem with traditional indices:**
+* Historically, data access in databases was limited through the use of indices, in the form of B+-trees or similar data structures.
+* While this approach proved highly effective for transaction processing, it raises multiple problems for systems like Snowflake:
+  * It relies heavily on random access, which is a problem both due to the storage medium (S3) and the data format (compressed files).
+  * Maintaining indices increases the volume of data and data loading time.
+  * The user needs to explicitly create the indices—which would go very much against the pure service approach of Snowflake.
+
+**Min-max based pruning:**
+* An alternative technique has recently gained popularity for large-scale data processing: **min-max based pruning**, also known as small materialized aggregates, zone maps, and data skipping.
+* The system maintains the data distribution information for a given chunk of data (set of records, file, block etc.), in particular minimum and maximum values within the chunk.
+* Depending on the query predicates, these values can be used to determine that a given chunk of data might not be needed for a given query.
+* Unlike traditional indices, this metadata is usually orders of magnitude smaller than the actual data, resulting in a small storage overhead and fast access.
+
+**Why pruning fits Snowflake:**
+* Pruning does not rely on user input.
+* It scales well.
+* It is easy to maintain.
+* It works well for sequential access of large chunks of data.
+* It adds little overhead to loading, query optimization, and query execution times.
+
+**Pruning in Snowflake:**
+* Snowflake keeps pruning-related metadata for every individual table file.
+* The metadata not only covers plain relational columns, but also a selection of auto-detected columns inside of semi-structured data.
+* During optimization, the metadata is checked against the query predicates to reduce ("prune") the set of input files for query execution.
+* The optimizer performs pruning not only for simple base-value predicates, but also for more complex expressions such as `WEEKDAY(orderdate) IN (6, 7)`.
+
+**Dynamic pruning:**
+* Besides static pruning, Snowflake also performs **dynamic pruning** during execution.
+* For example, as part of hash join processing, Snowflake collects statistics on the distribution of join keys in the build-side records.
+* This information is then pushed to the probe side and used to filter and possibly skip entire files on the probe side.
+* This is in addition to other well-known techniques such as bloom joins.
+
+---
+
+## Feature Highlights
+
+### Pure Software-as-a-Service Experience
+
+Snowflake provides the possibility to interact with the system using nothing but a web browser. A web UI may seem like a trivial thing, but it quickly proved itself to be a critical differentiator. The web UI makes it very easy to access Snowflake from any location and environment, dramatically reducing the complexity of bootstrapping and using the system. With a lot of data already in the cloud, it allowed many users to just point Snowflake at their data and query away, without downloading any software.
+
+### Continuous Availability
+
+Snowflake offers continuous availability that meets cloud expectations. The two main technical features in this regard are fault resilience and online upgrades.
+
+#### Fault Resilience
+
+<div align="center">
+![Snowflake Fault Resilience](/figures/snowflake-fault-resilience.png)
+</div>
+
+**Data Storage layer:**
+* The Data Storage layer of Snowflake today is S3, which is replicated across multiple data centers called "availability zones" or AZs in Amazon terminology.
+* Replication across AZs allows S3 to handle full AZ failures, and to guarantee 99.99% data availability and 99.999999999% durability.
+
+**Metadata store:**
+* Matching S3's architecture, Snowflake's metadata store is also distributed and replicated across multiple AZs.
+* If a node fails, other nodes can pick up the activities without much impact on end users.
+
+**Cloud Services layer:**
+* The remaining services of the Cloud Services layer consist of stateless nodes in multiple AZs, with a load balancer distributing user requests between them.
+* A single node failure or even a full AZ failure causes no system-wide impact, possibly some failed queries for users currently connected to a failed node.
+* These users will be redirected to a different node for their next query.
+
+**Virtual Warehouses:**
+* In contrast, Virtual Warehouses (VWs) are not distributed across AZs. This choice is for performance reasons. High network throughput is critical for distributed query execution, and network throughput is significantly higher within the same AZ.
+* If one of the worker nodes fails during query execution, the query fails but is transparently re-executed, either with the node immediately replaced, or with a temporarily reduced number of nodes.
+* To accelerate node replacement, Snowflake maintains a small pool of standby nodes. (These nodes are also used for fast VW provisioning.)
+* If an entire AZ becomes unavailable though, all queries running on a given VW of that AZ will fail, and the user needs to actively re-provision the VW in a different AZ. With full-AZ failures being truly catastrophic and exceedingly rare events, Snowflake today accepts this one scenario of partial system unavailability.
+
+#### Online Upgrade
+
+<div align="center">
+![Snowflake Online Upgrade](/figures/snowflake-online-upgrade.png)
+</div>
+
+**Design for side-by-side deployment:**
+* The system is designed to allow multiple versions of the various services to be deployed side-by-side, both Cloud Services components and virtual warehouses.
+* This is made possible by the fact that all services are effectively stateless. All hard state is kept in a transactional key-value store and is accessed through a mapping layer which takes care of metadata versioning and schema evolution.
+* Whenever Snowflake changes the metadata schema, it ensures backward compatibility with the previous version.
+
+**Upgrade procedure:**
+* To perform a software upgrade, Snowflake first deploys the new version of the service alongside the previous version.
+* User accounts are then progressively switched to the new version, at every which point all new queries issued by the respective user are directed to the new version.
+* All queries that were executing against the previous version are allowed to run to completion.
+* Once all queries and users have finished using the previous version, all services of that version are terminated and decommissioned.
+
+**Cache preservation:**
+* VWs of different versions are able to share the same worker nodes and their respective caches.
+* Consequently, there is no need to repopulate the caches after an upgrade.
+* The entire process is transparent to the user with no downtime or performance degradation.
+
+### Semi-Structured and Schema-Less Data
+
+Snowflake extends the standard SQL type system with three types for semi-structured data: **VARIANT**, **ARRAY**, and **OBJECT**.
+
+* Values of type VARIANT can store any value of native SQL type (DATE, VARCHAR etc.), as well as variable-length ARRAYs of values, and JavaScript-like OBJECTs, maps from strings to VARIANT values.
+* ARRAY and OBJECT are just restrictions of type VARIANT. The internal representation is the same: a self-describing, compact binary serialization which supports fast key-value lookup, as well as efficient type tests, comparison, and hashing.
+
+#### Post-relational Operations
+
+**Extraction:**
+* The most important operation on documents is extraction of data elements, either by field name (for OBJECTs), or by offset (for ARRAYs).
+* Snowflake provides extraction operations in both functional SQL notation and JavaScript-like path syntax.
+* The internal encoding makes extraction very efficient. A child element is just a pointer inside the parent element; no copying is required.
+* Extraction is often followed by a cast of the resulting VARIANT value to a standard SQL type. Again, the encoding makes these casts very efficient.
+
+**Flattening and aggregation:**
+* The second common operation is flattening, i.e. pivoting a nested document into multiple rows.
+* Snowflake uses SQL lateral views to represent flattening operations. This flattening can be recursive, allowing the complete conversion of the hierarchical structure of the document into a relational table amenable to SQL processing.
+* The opposite operation to flattening is aggregation. Snowflake introduces a few new aggregate and analytic functions such as `ARRAY_AGG` and `OBJECT_AGG` for this purpose.
+
+#### Columnar Storage and Processing
+
+**The challenge:**
+* The use of a serialized (binary) representation for semi-structured data is a conventional design choice for integrating semi-structured data into relational databases.
+* The row-wise representation, unfortunately, makes storage and processing of such data less efficient than that of columnar relational data—which is the usual reason for transforming semi-structured data into plain relational data.
+
+**Snowflake's solution:**
+* To achieve both the flexibility of a schema-less serialized representation and the performance of a columnar relational database, Snowflake introduces a novel automated approach to type inference and columnar storage.
+* When storing semi-structured data, the system automatically performs statistical analysis of the collection of documents within a single table file, to perform automatic type inference and to determine which (typed) paths are frequently common.
+* The corresponding columns are then removed from the documents and stored separately, using the same compressed columnar format as native relational data.
+* For these columns, Snowflake even computes materialized aggregates for use by pruning.
+
+**Query processing:**
+* During a scan, the various columns can be reassembled into a single column of type VARIANT.
+* Most queries, however, are only interested in a subset of the columns of the original document.
+* In those cases, Snowflake pushes projection and cast expressions down into the scan operator, so that only the necessary columns are accessed and cast directly into the target SQL type.
+
+**Pruning for semi-structured data:**
+* Suppose a query has a predicate over a path expression, and we would like to use pruning to restrict the set of files to be scanned.
+* The path and corresponding column may be present in most files, but only frequent enough to warrant metadata in some of the files.
+* The conservative solution is to simply scan all files for which there is no suitable metadata.
+* Snowflake improves over this solution by computing **Bloom filters** over all paths (not values!) present in the documents.
+* These Bloom filters are saved along with the other file metadata, and probed by the query optimizer during pruning.
+* Table files which do not contain paths required by a given query can safely be skipped.
+
+#### Optimistic Conversion
+
+**The problem:**
+* Because some native SQL types, notably date/time values, are represented as strings in common external formats such as JSON or XML, these values need to be converted from strings to their actual type either at write time (during insert or update) or at read time (during queries).
+* Without a typed schema or equivalent hints, these string conversions need to be performed at read time, which, in a read-dominated workload, is less efficient than doing the conversions once, during the write.
+* Another problem with untyped data is the lack of suitable metadata for pruning, which is especially important in case of dates. (Analytical workloads frequently have range predicates on date columns.)
+
+**The challenge:**
+* But applied at write time, automatic conversions may lose information. For example, a field containing numeric product identifiers may actually not be a number but a string with significant leading zeros. Similarly, what looks like a date could really be the content of a text message.
+
+**Snowflake's solution:**
+* Snowflake solves the problem by performing **optimistic data conversion**, and preserving both the result of the conversion and the original string (unless a fully reversible conversion exists), in separate columns.
+* If a query later requires the original string, it is easily retrieved or reconstructed.
+* Because unused columns are not loaded and accessed, the impact of any double storage on query performance is minimal.
+
+### Time Travel and Cloning
+
+**Time Travel:**
+* Snowflake implements Snapshot Isolation (SI) on top of multi-version concurrency control (MVCC).
+* Write operations (insert, update, delete, merge) on a table produce a newer version of the table by adding and removing whole files.
+* When files are removed by a new version, they are retained for a configurable duration (currently up to 90 days).
+* File retention allows Snowflake to read earlier versions of tables very efficiently; that is, to perform **time travel** on the database.
+
+**Cloning:**
+* Snowflake also implements a functionality called **cloning**, expressed through the new keyword `CLONE`.
+* Cloning a table creates a new table with the same definition and contents quickly and without making physical copies of table files.
+* The clone operation simply copies the metadata of the source table.
+* Right after cloning, both tables refer to the same set of files, but both tables can be modified independently thereafter.
+* The clone feature also supports whole schemas or databases, which allows for very efficient snapshots.
+
+---
+
+## Closing Thoughts
+
+Today, Snowflake has become one of the leading cloud data warehouse platforms, and its multi-cluster, shared-data architecture has influenced many subsequent systems and continues to shape the future of cloud data warehousing.
+
+* **Separation of storage and compute** — Snowflake made elasticity practical by treating compute as an on-demand, disposable resource while keeping data in durable object storage. That idea has largely become the default architecture for modern cloud analytics: independent scaling, workload isolation (multiple warehouses / clusters), and “turn compute off when idle” economics. More recently, the industry’s shift toward the **lakehouse** pushes the separation even further: object storage becomes the central data lake, and multiple compute engines sit on top, often reading/writing **open table formats** (e.g., Iceberg). In effect, the storage layer becomes *shared across tools and vendors*, while compute becomes a pluggable, competing ecosystem.
+
+* **Stateless control plane + metadata as the real state** — Snowflake’s Cloud Services layer demonstrates a pattern that shows up repeatedly in modern distributed systems: keep the control plane largely stateless so it can be replicated, upgraded, and failed over easily, while placing durable state in a scalable metadata store (transactional KV, logs, catalog state). This makes high availability and online upgrades operationally tractable: deploy side-by-side versions, gradually shift traffic, and rely on metadata versioning for compatibility. You see the same blueprint across many systems (including distributed compute frameworks): a replicated “brain” coordinating ephemeral “muscle,” with a dedicated state store anchoring correctness.
+
+* **S3-style object storage as the default data layer** — Snowflake’s embrace of blob storage wasn’t just an implementation detail, In hindsight, this aligned perfectly with where the cloud went: object storage became the cheapest, most durable, and most operationally convenient place to keep large analytical datasets. Today, countless cloud warehouses, lakehouses, and analytics stacks assume object storage as the foundation—often pairing it with columnar formats, file-level statistics, and data-skipping techniques that echo the same design constraints Snowflake internalized early.
