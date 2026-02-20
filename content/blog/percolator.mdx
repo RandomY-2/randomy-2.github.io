@@ -1,0 +1,292 @@
+---
+slug: percolator-incremental-processing-system
+title: "Percolator: Large-Scale Incremental Processing using Distributed Transactions and Notifications"
+date: "2026-02-17"
+description: "Percolator is a system for incrementally processing updates to large datasets, providing ACID transactions and an observer framework for maintaining web search indices."
+tags: [percolator, incremental-processing, transactions, acid, snapshot-isolation, bigtable, distributed-systems]
+category: system-papers
+---
+
+## Why Percolator?
+
+Building a web search index requires crawling and processing pages while maintaining invariants—e.g., only the highest-PageRank URL appears when content is duplicated, and link inversion must work across duplicates. This bulk task fits MapReduce well: one job clusters duplicates, another inverts links, and the staged structure keeps invariants easy to enforce.
+
+The real challenge is incremental updates. After recrawling a subset of pages, you can't just rerun MapReduce on the new pages: links connect new and old pages, so you must reprocess the entire repository. Google did this before Percolator. Reprocessing the full corpus wastes prior work and makes latency proportional to corpus size, not update size.
+
+This exposes a gap in existing systems:
+
+* **Databases**—insufficient for tens of petabytes and billions of updates per day across thousands of machines.
+* **MapReduce and batch systems**—cannot handle small, individual updates; they need large batches to be efficient.
+
+**Percolator** fills this gap with incremental processing. By replacing batch-based indexing with Percolator, Google processes the same volume of documents per day while cutting the average age of documents in search results by 50%.
+
+---
+
+## Design Overview
+
+<div align="center">
+![Figure 1: Percolator Architecture](/figures/percolator-architecture.png)
+</div>
+
+Percolator provides two main abstractions for performing incremental processing at large scale:
+
+1. **ACID transactions** over a random-access repository
+2. **Observers**, a way to organize an incremental computation
+
+### System Components
+
+A Percolator system consists of three binaries that run on every machine in the cluster:
+
+* **Percolator worker** - All observers are linked into the Percolator worker, which scans the Bigtable for changed columns ("notifications") and invokes the corresponding observers as a function call in the worker process.
+* **Bigtable tablet server** - The observers perform transactions by sending read/write RPCs to Bigtable tablet servers.
+* **GFS chunkserver** - Bigtable tablet servers in turn send read/write RPCs to GFS chunkservers.
+
+The system also depends on two small services:
+
+* **Timestamp oracle** - Provides strictly increasing timestamps, a property required for correct operation of the snapshot isolation protocol.
+* **Lightweight lock service** - Workers use this to make the search for dirty notifications more efficient.
+
+### Data Model
+
+From the programmer's perspective, a Percolator repository consists of a small number of tables. Each table is a collection of "cells" indexed by row and column. Each cell contains a value: an uninterpreted array of bytes. Internally, to support snapshot isolation, we represent each cell as a series of values indexed by timestamp.
+
+### Design Trade-offs
+
+The design of Percolator was influenced by the requirement to run at massive scales and the lack of a requirement for extremely low latency. Relaxed latency requirements let us take, for example, a lazy approach to cleaning up locks left behind by transactions running on failed machines. This lazy, simple-to-implement approach potentially delays transaction commit by tens of seconds. This delay would not be acceptable in a DBMS running OLTP tasks, but it is tolerable in an incremental processing system building an index of the web.
+
+Percolator has no central location for transaction management; in particular, it lacks a global deadlock detector. This increases the latency of conflicting transactions but allows the system to scale to thousands of machines.
+
+---
+
+## Bigtable Foundation
+
+Percolator is built on top of the Bigtable distributed storage system. Bigtable presents a multi-dimensional sorted map to users: keys are (row, column, timestamp) tuples. Bigtable provides lookup and update operations on each row, and Bigtable row transactions enable atomic read-modify-write operations on individual rows. Bigtable handles petabytes of data and runs reliably on large numbers of (unreliable) machines.
+
+A running Bigtable consists of a collection of tablet servers, each of which is responsible for serving several tablets (contiguous regions of the key space). A master coordinates the operation of tablet servers by, for example, directing them to load or unload tablets. A tablet is stored as a collection of read-only files in the Google SSTable format. SSTables are stored in GFS; Bigtable relies on GFS to preserve data in the event of disk loss.
+
+Bigtable allows users to control the performance characteristics of the table by grouping a set of columns into a locality group. The columns in each locality group are stored in their own set of SSTables, which makes scanning them less expensive since the data in other columns need not be scanned.
+
+The decision to build on Bigtable defined the overall shape of Percolator. Percolator maintains the gist of Bigtable's interface: data is organized into Bigtable rows and columns, with Percolator metadata stored alongside in special columns. Percolator's API closely resembles Bigtable's API: the Percolator library largely consists of Bigtable operations wrapped in Percolator-specific computation. The challenge, then, in implementing Percolator is providing the features that Bigtable does not: multi-row transactions and the observer framework.
+
+---
+
+## Transactions
+
+<div align="center">
+![Figure 2: Percolator Transaction](/figures/percolator-transaction.png)
+</div>
+
+Percolator provides cross-row, cross-table transactions with ACID snapshot-isolation semantics.
+
+### Snapshot Isolation
+
+Percolator stores multiple versions of each data item using Bigtable's timestamp dimension. Multiple versions are required to provide snapshot isolation, which presents each transaction with the appearance of reading from a stable snapshot at some timestamp. Writes appear in a different, later, timestamp.
+
+**Key properties:**
+* Snapshot isolation protects against write-write conflicts: if transactions A and B, running concurrently, write to the same cell, at most one will commit.
+* Snapshot isolation does not provide serializability; in particular, transactions running under snapshot isolation are subject to write skew.
+* The main advantage of snapshot isolation over a serializable protocol is more efficient reads. Because any timestamp represents a consistent snapshot, reading a cell requires only performing a Bigtable lookup at the given timestamp; acquiring locks is not necessary.
+
+### Lock Management
+
+<div align="center">
+![Figure 3: Percolator 2PC Columns](/figures/percolator-2pc-columns.png)
+</div>
+
+Any node in Percolator can (and does) issue requests to directly modify state in Bigtable: there is no convenient place to intercept traffic and assign locks. As a result, Percolator must explicitly maintain locks. Percolator stores its locks in special in-memory columns in the same Bigtable that stores data and reads or modifies the locks in a Bigtable row transaction when accessing data in that row.
+
+### Transaction Protocol
+
+<div align="center">
+![Figure 4: Percolator 2PC](/figures/percolator-2pc.png)
+</div>
+
+The transaction's constructor asks the timestamp oracle for a start timestamp, which determines the consistent snapshot seen by `Get()`. Calls to `Set()` are buffered until commit time. The basic approach for committing buffered writes is two-phase commit, which is coordinated by the client. Transactions on different machines interact through row transactions on Bigtable tablet servers.
+
+**Phase 1: Prewrite**
+In the first phase of commit ("prewrite"), we try to lock all the cells being written. To handle client failure we designate one lock arbitrarily as the primary. The transaction reads metadata to check for conflicts in each cell being written. There are two kinds of conflicting metadata:
+
+* If the transaction sees another write record after its start timestamp, it aborts—this is the write-write conflict that snapshot isolation guards against.
+* If the transaction sees another lock at any timestamp, it also aborts. It's possible that the other transaction is just being slow to release its lock after having already committed below our start timestamp, but we consider this unlikely, so we abort.
+
+If there is no conflict, we write the lock and the data to each cell at the start timestamp.
+
+**Phase 2: Commit**
+If no cells conflict, the transaction may commit and proceeds to the second phase. At the beginning of the second phase, the client obtains the commit timestamp from the timestamp oracle. Then, at each cell (starting with the primary), the client releases its lock and makes its write visible to readers by replacing the lock with a write record. The write record indicates to readers that committed data exists in this cell; it contains a pointer to the start timestamp where readers can find the actual data. Once the primary's write is visible, the transaction must commit since it has made a write visible to readers.
+
+**Read Operations**
+A `Get()` operation first checks for a lock in the timestamp range [0, start timestamp], which is the range of timestamps visible in the transaction's snapshot. If a lock is present, another transaction is concurrently writing this cell, so the reading transaction must wait until the lock is released. If no conflicting lock is found, `Get()` reads the latest write record in that timestamp range and returns the data item corresponding to that write record.
+
+
+### Transaction Example
+
+The following figure shows a transaction across two rows where:
+
+- step 2 corresponds to prewrite step of primary record (line 44)
+- step 3 corresponds to prewrite step of remaining records (line 45-46)
+- step 4 corresponds to commit step of primary record (line 55-58)
+- step 5 corresponds to commit step of remaining records (line 61-64)
+
+<div align="center">
+![Figure 5: Percolator Transaction Example](/figures/percolator-transaction-example.png)
+</div>
+
+### Handling Client Failures
+
+Transaction processing is complicated by the possibility of client failure (tablet server failure does not affect the system since Bigtable guarantees that written locks persist across tablet server failures). If a client fails while a transaction is being committed, locks will be left behind. Percolator must clean up those locks or they will cause future transactions to hang indefinitely.
+
+**Lazy cleanup approach:** Percolator takes a lazy approach to cleanup: when a transaction A encounters a conflicting lock left behind by transaction B, A may determine that B has failed and erase its locks. It is very difficult for A to be perfectly confident in its judgment that B is failed; as a result we must avoid a race between A cleaning up B's transaction and a not-actually-failed B committing the same transaction.
+
+**Primary lock mechanism:** Percolator handles this by designating one cell in every transaction as a synchronizing point for any commit or cleanup operations. This cell's lock is called the primary lock. Both A and B agree on which lock is primary (the location of the primary is written into the locks at all other cells). Performing either a cleanup or commit operation requires modifying the primary lock; since this modification is performed under a Bigtable row transaction, only one of the cleanup or commit operations will succeed.
+
+Specifically: before B commits, it must check that it still holds the primary lock and replace it with a write record. Before A erases B's lock, A must check the primary to ensure that B has not committed; if the primary lock is still present, then it can safely erase the lock.
+
+**Roll-forward:** When a client crashes during the second phase of commit, a transaction will be past the commit point (it has written at least one write record) but will still have locks outstanding. We must perform roll-forward on these transactions. A transaction that encounters a lock can distinguish between the two cases by inspecting the primary lock: if the primary lock has been replaced by a write record, the transaction which wrote the lock must have committed and the lock must be rolled forward, otherwise it should be rolled back (since we always commit the primary first, we can be sure that it is safe to roll back if the primary is not committed). To roll forward, the transaction performing the cleanup replaces the stranded lock with a write record as the original transaction would have done.
+
+**Liveness detection:** Since cleanup is synchronized on the primary lock, it is safe to clean up locks held by live clients; however, this incurs a performance penalty since rollback forces the transaction to abort. So, a transaction will not clean up a lock unless it suspects that a lock belongs to a dead or stuck worker. Percolator uses simple mechanisms to determine the liveness of another transaction:
+
+* Running workers write a token into the Chubby lock service to indicate they belong to the system; other workers can use the existence of this token as a sign that the worker is alive (the token is automatically deleted when the process exits).
+* To handle a worker that is live, but not working, we additionally write the wall time into the lock; a lock that contains a too-old wall time will be cleaned up even if the worker's liveness token is valid.
+* To handle long-running commit operations, workers periodically update this wall time while committing.
+
+---
+
+## Timestamps
+
+The timestamp oracle is a server that hands out timestamps in strictly increasing order. Since every transaction requires contacting the timestamp oracle twice, this service must scale well.
+
+**Scalability design:**
+* The oracle periodically allocates a range of timestamps by writing the highest allocated timestamp to stable storage; given an allocated range of timestamps, the oracle can satisfy future requests strictly from memory.
+* If the oracle restarts, the timestamps will jump forward to the maximum allocated timestamp (but will never go backwards).
+* To save RPC overhead (at the cost of increasing transaction latency) each Percolator worker batches timestamp requests across transactions by maintaining only one pending RPC to the oracle. As the oracle becomes more loaded, the batching naturally increases to compensate. Batching increases the scalability of the oracle but does not affect the timestamp guarantees.
+
+---
+
+## Notifications and Observers
+
+Transactions let the user mutate the table while maintaining invariants, but users also need a way to trigger and run the transactions. In Percolator, the user writes code ("observers") to be triggered by changes to the table, and we link all the observers into a binary running alongside every tablet server in the system. Each observer registers a function and a set of columns with Percolator, and Percolator invokes the function after data is written to one of those columns in any row.
+
+### Observer Architecture
+
+Percolator applications are structured as a series of observers; each observer completes a task and creates more work for "downstream" observers by writing to the table. In our indexing system, a MapReduce loads crawled documents into Percolator by running loader transactions, which trigger the document processor transaction to index the document (parse, extract links, etc.). The document processor transaction triggers further transactions like clustering. The clustering transaction, in turn, triggers transactions to export changed document clusters to the serving system.
+
+**Guarantee:** We do provide one guarantee: at most one observer's transaction will commit for each change of an observed column. The converse is not true, however: multiple writes to an observed column may cause the corresponding observer to be invoked only once. We call this feature message collapsing, since it helps avoid computation by amortizing the cost of responding to many notifications.
+
+### Notification Semantics
+
+To provide these semantics for notifications, each observed column has an accompanying "acknowledgment" column for each observer, containing the latest start timestamp at which the observer ran. When the observed column is written, Percolator starts a transaction to process the notification. The transaction reads the observed column and its corresponding acknowledgment column. If the observed column was written after its last acknowledgment, then we run the observer and set the acknowledgment column to our start timestamp. Otherwise, the observer has already been run, so we do not run it again.
+
+Note that if Percolator accidentally starts two transactions concurrently for a particular notification, they will both see the dirty notification and run the observer, but one will abort because they will conflict on the acknowledgment column. We promise that at most one observer will commit for each notification.
+
+### Finding Dirty Cells
+
+To implement notifications, Percolator needs to efficiently find dirty cells with observers that need to be run. This search is complicated by the fact that notifications are rare: our table has trillions of cells, but, if the system is keeping up with applied load, there will only be millions of notifications. Additionally, observer code is run on a large number of client processes distributed across a collection of machines, meaning that this search for dirty cells must be distributed.
+
+**Notify column:** To identify dirty cells, Percolator maintains a special "notify" Bigtable column, containing an entry for each dirty cell. When a transaction writes an observed cell, it also sets the corresponding notify cell. The workers perform a distributed scan over the notify column to find dirty cells. After the observer is triggered and the transaction commits, we remove the notify cell. Since the notify column is just a Bigtable column, not a Percolator column, it has no transactional properties and serves only as a hint to the scanner to check the acknowledgment column to determine if the observer should be run.
+
+**Efficient scanning:** To make this scan efficient, Percolator stores the notify column in a separate Bigtable locality group so that scanning over the column requires reading only the millions of dirty cells rather than the trillions of total data cells. Each Percolator worker dedicates several threads to the scan. For each thread, the worker chooses a portion of the table to scan by first picking a random Bigtable tablet, then picking a random key in the tablet, and finally scanning the table from that position.
+
+**Avoiding conflicts:** Since each worker is scanning a random region of the table, we worry about two workers running observers on the same row concurrently. While this behavior will not cause correctness problems due to the transactional nature of notifications, it is inefficient. To avoid this, each worker acquires a lock from a lightweight lock service before scanning the row. This lock server need not persist state since it is advisory and thus is very scalable.
+
+**Platooning problem:** The random-scanning approach requires one additional tweak: when it was first deployed we noticed that scanning threads would tend to clump together in a few regions of the table, effectively reducing the parallelism of the scan. This phenomenon is commonly seen in public transportation systems where it is known as "platooning" or "bus clumping" and occurs when a bus is slowed down (perhaps by traffic or slow loading). Since the number of passengers at each stop grows with time, loading delays become even worse, further slowing the bus. Simultaneously, any bus behind the slow bus speeds up as it needs to load fewer passengers at each stop. The result is a clump of buses arriving simultaneously at a stop.
+
+Our scanning threads behaved analogously: a thread that was running observers slowed down while threads "behind" it quickly skipped past the now-clean rows to clump with the lead thread and failed to pass the lead thread because the clump of threads overloaded tablet servers. To solve this problem, we modified our system in a way that public transportation systems cannot: when a scanning thread discovers that it is scanning the same row as another thread, it chooses a new random location in the table to scan. To further the transportation analogy, the buses (scanner threads) in our city avoid clumping by teleporting themselves to a random stop (location in the table) if they get too close to the bus in front of them.
+
+**Weak notifications:** Finally, experience with notifications led us to introduce a lighter-weight but semantically weaker notification mechanism. We found that when many duplicates of the same page were processed concurrently, each transaction would conflict trying to trigger reprocessing of the same duplicate cluster. This led us to devise a way to notify a cell without the possibility of transactional conflict. We implement this weak notification by writing only to the Bigtable "notify" column. To preserve the transactional semantics of the rest of Percolator, we restrict these weak notifications to a special type of column that cannot be written, only notified. The weaker semantics also mean that multiple observers may run and commit as a result of a single weak notification (though the system tries to minimize this occurrence). This has become an important feature for managing conflicts; if an observer frequently conflicts on a hotspot, it often helps to break it into two observers connected by a non-transactional notification on the hotspot.
+
+---
+
+## Optimizations and Discussion
+
+### RPC Overhead
+
+One of the inefficiencies of Percolator relative to a MapReduce-based system is the number of RPCs sent per work-unit. While MapReduce does a single large read to GFS and obtains all of the data for 10s or 100s of web pages, Percolator performs around 50 individual Bigtable operations to process a single document.
+
+**Conditional mutations:** One source of additional RPCs occurs during commit. When writing a lock, we must do a read-modify-write operation requiring two Bigtable RPCs: one to read for conflicting locks or writes and another to write the new lock. To reduce this overhead, we modified the Bigtable API by adding conditional mutations which implements the read-modify-write step in a single RPC. Many conditional mutations destined for the same tablet server can also be batched together into a single RPC to further reduce the total number of RPCs we send. We create batches by delaying lock operations for several seconds to collect them into batches. Because locks are acquired in parallel, this adds only a few seconds to the latency of each transaction; we compensate for the additional latency with greater parallelism. Batching also increases the time window in which conflicts may occur, but in our low-contention environment this has not proved to be a problem.
+
+**Read batching and prefetching:** We also perform the same batching when reading from the table: every read operation is delayed to give it a chance to form a batch with other reads to the same tablet server. This delays each read, potentially greatly increasing transaction latency. A final optimization mitigates this effect, however: prefetching. Prefetching takes advantage of the fact that reading two or more values in the same row is essentially the same cost as reading one value. In either case, Bigtable must read the entire SSTable block from the file system and decompress it. Percolator attempts to predict, each time a column is read, what other columns in a row will be read later in the transaction. This prediction is made based on past behavior. Prefetching, combined with a cache of items that have already been read, reduces the number of Bigtable reads the system would otherwise do by a factor of 10.
+
+### Thread-per-Request Model
+
+Early in the implementation of Percolator, we decided to make all API calls blocking and rely on running thousands of threads per machine to provide enough parallelism to maintain good CPU utilization. We chose this thread-per-request model mainly to make application code easier to write, compared to the event-driven model. Forcing users to bundle up their state each of the (many) times they fetched a data item from the table would have made application development much more difficult.
+
+**Experience:** Our experience with thread-per-request was, on the whole, positive: application code is simple, we achieve good utilization on many-core machines, and crash debugging is simplified by meaningful and complete stack traces. We encountered fewer race conditions in application code than we feared. The biggest drawbacks of the approach were scalability issues in the Linux kernel and Google infrastructure related to high thread counts. Our in-house kernel development team was able to deploy fixes to address the kernel issues.
+
+---
+
+## Closing Thoughts
+
+### Percolator vs. 2PC
+
+Percolator's transaction protocol can be understood as an optimized and decomposed version of the classic Two-Phase Commit (2PC) protocol:
+#### Classic 2PC Protocol
+
+The traditional 2PC protocol involves two types of roles:
+
+* **Coordinator** - Manages the entire process to ensure multiple participants reach a unanimous decision. The coordinator's responsibilities include:
+  * Sending Prepare requests to all participants
+  * Determining whether the transaction can commit based on participant responses
+  * Writing a commit log to durable storage
+  * Broadcasting commit/abort messages to all participants
+  * Handling rollback or retry if commit is not possible
+
+* **Participants** - Respond to the coordinator's requests, completing prepare operations and commit/abort operations based on those requests.
+
+**2PC Limitations:**
+* **Coordinator as a bottleneck** - The coordinator is a critical point that can become a bottleneck or cause blocking if it fails. If the coordinator crashes at any point before all participants have committed/aborted, the protocol blocks and must wait for coordinator recovery.
+* **Interaction latency** - The coordinator must persist the transaction's commit/abort state before sending commit/abort commands, resulting in at least 2 RPC delays (prepare + commit) and 3 persistence delays (participant prepare log + coordinator state persistence + participant commit log).
+* **Blocking behavior** - 2PC is a blocking protocol: if the coordinator fails, all participants remain in an uncertain state until the coordinator recovers.
+
+#### Percolator's Decomposition of 2PC
+
+Percolator eliminates the centralized coordinator by decomposing its responsibilities into stateful and stateless components:
+
+**Stateful components (stored in Bigtable):**
+* **Commit log** - The primary record's write column serves as the commit log, persisting the coordinator's decision
+* **Transaction state** - Primary record stores transaction ID, MVCC version, and other metadata
+
+**Stateless components (handled by clients):**
+* **Prepare request broadcasting** - Clients directly send prepare requests (prewrite phase) to all participants
+* **Commit decision** - Clients determine whether to commit based on conflict detection results
+* **Commit message broadcast** - Clients modify secondary records' write columns to make writes visible
+* **Rollback/roll-forward** - Clients drive recovery by inspecting primary record state to determine whether to roll back or roll forward
+
+
+Percolator uses the concept of a primary record to serve as the synchronization point for the entire transaction:
+
+* The primary record stores the transaction's commit state (equivalent to the coordinator's commit log)
+* All other records (secondary records) store a pointer to the primary record's location
+* Commit proceeds in two steps: first commit the primary (making the decision durable), then commit all secondaries
+* If the client crashes, other transactions can inspect the primary record to determine whether to roll back or roll forward the stranded locks
+
+This design eliminates the need for a separate coordinator process while maintaining the atomicity guarantees of 2PC.
+
+#### Advantages
+
+**1. Eliminates coordinator bottleneck**
+* No single coordinator process that can become a bottleneck or single point of failure
+* Coordinator responsibilities are distributed across clients and Bigtable
+
+**2. Better fault tolerance**
+* If a client crashes, other transactions can determine the state by inspecting the primary record
+* No need to wait for a coordinator to recover—recovery is driven by any transaction encountering stranded locks
+
+**3. Scalability**
+* Multiple clients can coordinate transactions concurrently without a centralized bottleneck
+* The system scales horizontally as the number of clients increases
+
+#### Limitations
+
+**1. Write-friendly but read-unfriendly**
+
+Percolator's transaction protocol is optimized for writes but can be problematic for reads:
+
+* **Longer lock holding time** - Because the commit process involves first writing the primary record, then asynchronously committing secondary records, participants hold locks longer than in traditional 2PC
+* **Read waiting** - Under snapshot isolation, readers must wait for locks to be released. The extended lock holding time means readers wait longer
+
+**2. Performance overhead**
+
+Building on Bigtable's single-row transaction model introduces limitations:
+
+* **Sharding details hidden** - Bigtable hides sharding details, so Percolator needs to view each row as a separate participant in the 2PC process with potentially a separate RPC call, whereas traditional 2PC is shard-based
+* **Sequential commit of participants** - Primary needs to be committed first before secondary records can be committed, adding latency
