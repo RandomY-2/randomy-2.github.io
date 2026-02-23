@@ -1,0 +1,270 @@
+---
+slug: spanner-google-globally-distributed-database
+title: "Spanner: Google's Globally Distributed Database"
+date: "2026-02-22"
+description: "Spanner is Google's scalable, multi-version, globally distributed, and synchronously replicated database with externally consistent reads and writes at global scale."
+tags: [spanner, google, distributed-systems, database, paxos, truetime, consistency, replication]
+category: system-papers
+---
+
+## Why Spanner?
+
+Spanner is Google's scalable, multi-version, globally distributed, and synchronously replicated database. It addresses limitations that emerged from Bigtable and similar systems: users consistently complained about difficulty with complex, evolving schemas and the desire for strong consistency in the presence of wide-area replication.
+
+**Evolution from Bigtable:**
+* Spanner evolved from a Bigtable-like versioned key-value store into a **temporal multi-version database**.
+* Data is stored in schematized semi-relational tables, versioned and automatically timestamped with commit times.
+* Old versions are subject to configurable garbage-collection policies; applications can read data at old timestamps.
+* Spanner supports general-purpose transactions and provides a SQL-based query language.
+
+**Key differentiators at global scale:**
+* **Externally consistent reads and writes** (linearizability): if transaction T1 commits before T2 starts, then T1's commit timestamp is smaller than T2's.
+* **Globally consistent reads** at a timestamp across the entire database.
+
+Spanner is the first system to provide such guarantees at global scale. The key enabler is the **TrueTime API**, which exposes clock uncertainty; Spanner's timestamp guarantees depend on the bounds TrueTime provides. When uncertainty is large, Spanner slows down to wait it out.
+
+---
+
+## Implementation
+
+<div align="center">
+![Figure 1: Spanner Universe Architecture](/figures/spanner-universe.png)
+</div>
+
+A Spanner deployment is called a **universe**. Given that Spanner manages data globally, there are only a handful of running universes (e.g., test/playground, development/production, production-only).
+
+Spanner is organized as a set of **zones**, where each zone is roughly analogous to a Bigtable deployment. Zones are the unit of administrative deployment and the set of locations across which data can be replicated. Zones can be added or removed as datacenters come online or go offline.
+
+**Architecture components:**
+* **Zone** — Contains one zonemaster and between one hundred and several thousand spanservers. Zones are also the unit of physical isolation.
+* **Zonemaster** — Assigns data to spanservers.
+* **Spanservers** — Serve data to clients.
+* **Location proxies** — Per-zone; clients use them to locate spanservers for their data.
+* **Universe master** — Singleton; primarily a console for status information and interactive debugging.
+* **Placement driver** — Singleton; handles automated movement of data across zones on the timescale of minutes, communicating periodically with spanservers to move data for replication constraints or load balancing.
+
+### Spanserver Software Stack
+
+<div align="center">
+![Figure 2: Spanserver Software Stack](/figures/spanner-spanserver.png)
+</div>
+
+Each spanserver is responsible for between 100 and 1000 instances of a data structure called a **tablet**. A tablet implements a bag of mappings:
+
+```
+(key:string, timestamp:int64) → string
+```
+
+Unlike Bigtable, Spanner assigns timestamps to data—a key way in which Spanner behaves like a multi-version database. A tablet's state is stored in B-tree-like files and a write-ahead log on Colossus (the successor to GFS).
+
+**Replication via Paxos:**
+* Each spanserver implements a Paxos state machine on top of each tablet.
+* Each state machine stores its metadata and log in its corresponding tablet.
+* Tablets are replicated across data centers (zones).
+* The set of replicas for a tablet is collectively a **Paxos group**.
+* Paxos supports long-lived leaders with time-based leader leases (default 10 seconds).
+* The implementation logs every Paxos write twice (tablet log and Paxos log); this is a known area for future optimization.
+* Paxos is pipelined for throughput over WAN; writes are applied in order.
+
+**Concurrency control:**
+* At every **leader** replica, each spanserver implements a **lock table** for two-phase locking, mapping key ranges to lock states.
+* Long-lived Paxos leaders are critical for efficient lock-table management.
+* Spanner is designed for long-lived transactions (e.g., report generation), which perform poorly under optimistic concurrency control in the presence of conflicts.
+* Operations requiring synchronization acquire locks; others bypass the lock table.
+
+**Distributed transactions:**
+* At every leader, each spanserver implements a **transaction manager** for distributed transactions.
+* The transaction manager implements a **participant leader**; other replicas are **participant slaves**.
+* Single-group transactions bypass the transaction manager (lock table + Paxos suffice).
+* Multi-group transactions use **two-phase commit**: one group is chosen as the **coordinator** (coordinator leader + coordinator slaves).
+* Transaction manager state is stored in the underlying Paxos group and thus replicated.
+
+---
+
+## Directories and Placement
+
+<div align="center">
+![Figure 3: Directories and Placement](/figures/spanner-directories.png)
+</div>
+
+On top of the key-value mappings, Spanner supports a **directory**—a set of contiguous keys sharing a common prefix. Directories allow applications to control data locality through key design.
+
+**Directory as placement unit:**
+* A directory is the **unit of data placement**. All data in a directory has the same replication configuration.
+* Data is moved between Paxos groups **directory by directory**.
+* Directories can be moved for load shedding, colocation of frequently accessed data, or to bring data closer to accessors.
+* A Paxos group may contain **multiple directories**. This implies Spanner tablets differ from Bigtable tablets: a Spanner tablet is not necessarily a single lexicographically contiguous partition of the row space but a container that may encapsulate multiple partitions. This design enables colocating directories that are frequently accessed together.
+
+**Movedir:**
+* **Movedir** is the background task for moving directories between Paxos groups, and for adding or removing replicas.
+* It is not implemented as a single transaction to avoid blocking reads and writes during bulky moves.
+* Movedir registers the move, migrates data in the background, then uses a transaction to atomically move the final nominal amount and update metadata.
+
+**Placement specification:**
+* Administrators control: number and types of replicas, geographic placement.
+* Applications tag databases/directories with placement options (e.g., "North America, 5 replicas, 1 witness").
+* User A's data might have three replicas in Europe; user B's, five in North America.
+
+**Fragments:**
+* A directory is sharded into **fragments** if it grows too large.
+* Fragments may be served from different Paxos groups. Movedir moves fragments, not whole directories.
+
+---
+
+## Data Model
+
+<div align="center">
+![Figure 4: Spanner Schema Example](/figures/spanner-schema.png)
+</div>
+
+Spanner exposes schematized semi-relational tables, a query language, and general-purpose transactions. The data model is layered on directory-bucketed key-value mappings.
+
+**Structure:**
+* An application creates one or more **databases** in a universe.
+* Each database contains an unlimited number of **schematized tables** with rows, columns, and versioned values.
+* Rows must have names: every table has an ordered set of one or more primary-key columns.
+* Primary keys form the row name; tables define a mapping from primary-key columns to non-primary-key columns.
+
+**Interleaving and directories:**
+* Every database must be partitioned into one or more **hierarchies of tables** via `INTERLEAVE IN` declarations.
+* The table at the top of a hierarchy is a **directory table**.
+* Each row in a directory table with key K, together with all descendant rows starting with K in lexicographic order, forms a directory.
+* `ON DELETE CASCADE` deletes child rows when a directory row is deleted.
+* Interleaving lets clients describe locality relationships across tables, which is essential for performance in a sharded, distributed database.
+
+In the above example schema, `Users` is the directory table of this database, and `Albums` is a child table, so all alums with the same `uid` stay
+closly with the user entry.
+
+---
+
+## TrueTime
+
+<div align="center">
+![Figure 5: TrueTime API](/figures/spanner-truetime.png)
+</div>
+
+TrueTime explicitly represents time as a **TTinterval**—an interval with bounded time uncertainty. Unlike standard time interfaces, it exposes uncertainty to clients. Endpoints are of type **TTstamp**.
+
+* `TT.now()` returns a TTinterval guaranteed to contain the absolute time during which it was invoked.
+* `TT.after()` and `TT.before()` are convenience wrappers around `TT.now()`.
+* The time epoch is analogous to UNIX time with leap-second smearing.
+* Define the instantaneous error bound as ε (half the interval width) and the average error bound as ε̄.
+
+**Formal guarantee:**
+Denote the absolute time of event *e* by *t*<sub>abs</sub>(*e*). For an invocation `tt = TT.now()`, TrueTime guarantees:
+
+*t*<sub>abs</sub>(*e*) ∈ [tt.earliest, tt.latest]
+
+**Implementation:**
+* **Time masters** per datacenter: most have GPS receivers with dedicated antennas; others ("Armageddon masters") use atomic clocks.
+* **Timeslave daemon** per machine: polls multiple masters, applies a variant of Marzullo's algorithm to reject liars, and synchronizes local clocks.
+* Masters regularly compare time against each other. Each master also cross-checks the rate at which its reference advances time against its own local clock, and evicts itself if there is substantial divergence.
+* Between synchronizations, daemons advertise slowly increasing time uncertainty from worst-case clock drift.
+* ε is typically a sawtooth from ~1 ms to ~7 ms over each 30-second poll interval; ε̄ ≈ 4 ms. Drift rate is 200 μs/s.
+
+---
+
+## Concurrency Control
+
+<div align="center">
+![Figure 6: Transaction Types](/figures/spanner-transactions.png)
+</div>
+
+### Timestamp Management
+
+Spanner supports:
+* **Read-write transactions** — Use two-phase locking.
+* **Read-only transactions** — Predeclared snapshot-isolation transactions; reads execute at a system-chosen timestamp without locking.
+* **Snapshot reads** — Reads in the past without locking; client may specify timestamp or staleness bound.
+
+Read-only and snapshot reads execute at any replica that is sufficiently up-to-date.
+
+#### Paxos Leader Leases
+
+* Leaders use timed leases (default 10 seconds).
+* Leases can be extended via successful writes or explicit request-vote RPC.
+* **Disjointness invariant:** For each Paxos group, each leader's lease interval is disjoint from every other leader's (only a single leader
+exists in a Paxos group at any time).
+  * Majority voting prevents multiple Paxos machines to become leaders at the same time.
+  * When abdicating, a leader must wait until `TT.after(s_max)` is true, where *s*<sub>max</sub> is the maximum timestamp used by that leader.
+This avoids cases where multiple leaders co-exist
+
+#### Assigning Timestamps to Read-Write Transactions
+
+* Transactional reads/writes use two-phase locking; timestamps are assigned after all locks are acquired but before any are released.
+* The commit timestamp is the timestamp of the Paxos write representing the commit.
+
+**Monotonicity invariant:** Within each Paxos group, timestamps are assigned in monotonically increasing order, even across leaders. This is maintained by disjointness.
+
+**External consistency invariant:** If T2 starts after T1 commits, then *s*<sub>2</sub> > *s*<sub>1</sub>. Formally:
+
+*t*<sub>abs</sub>(*e*<sub>1</sub><sup>commit</sup>) < *t*<sub>abs</sub>(*e*<sub>2</sub><sup>start</sup>) ⇒ *s*<sub>1</sub> < *s*<sub>2</sub>
+* **Start rule:** The coordinator assigns `s_i >= TT.now().latest` (computed after *e*<sub>i</sub><sup>server</sup>, the arrival of the commit request).
+* **Commit wait:** The coordinator ensures clients cannot see *T*<sub>i</sub>'s data until `TT.after(s_i)` is true. This guarantees *s*<sub>i</sub> < *t*<sub>abs</sub>(*e*<sub>i</sub><sup>commit</sup>).
+
+#### Serving Reads at a Timestamp
+
+* Each replica tracks **safe time** *t*<sub>safe</sub>, the maximum timestamp at which the replica is up-to-date.
+* A replica can serve a read at *t* if *t* ≤ *t*<sub>safe</sub>.
+* *t*<sub>safe</sub> = min(*t*<sub>safe</sub><sup>Paxos</sup>, *t*<sub>safe</sub><sup>TM</sup>).
+
+* *t*<sub>safe</sub><sup>Paxos</sup>: Timestamp of the highest-applied Paxos write. Writes will not occur at or below this timestamp.
+
+* *t*<sub>safe</sub><sup>TM</sup>: ∞ if there are no prepared (uncommitted) transactions. Otherwise, consider prepared transactions at group *g*: each participant leader assigns a prepare timestamp *s*<sub>i,g</sub><sup>prepare</sup>
+to transaction *T*<sub>i</sub>, and the coordinator ensures the commit timestamp satisfies *s*<sub>i</sub> ≥ *s*<sub>i,g</sub><sup>prepare</sup> for all *g*. Until a prepared transaction commits or aborts, its effects are indeterminate.
+Thus *t*<sub>safe</sub><sup>TM</sup> = min<sub>i</sub>(*s*<sub>i,g</sub><sup>prepare</sup>) − 1 over all transactions *T*<sub>i</sub> prepared at replicas in *g*: reads may safely execute only at timestamps strictly below the earliest prepare timestamp.
+
+#### Assigning Timestamps to Read-Only Transactions
+
+* Phase 1: Assign *s*<sub>read</sub>.
+* Phase 2: Execute reads as snapshot reads at *s*<sub>read</sub>.
+* The snapshot reads can execute at any replicas that are sufficiently up-to-date.
+* Choosing *s*<sub>read</sub> = `TT.now().latest` preserves external consistency, but the read will block if *t*<sub>safe</sub> has not yet advanced to that timestamp at the replicas. Assigning *s*<sub>read</sub> may also advance *s*<sub>max</sub> to preserve
+the leader-lease disjointness invariant. To reduce blocking, Spanner assigns the **oldest** timestamp that still preserves external consistency.
+
+### Read-Write Transaction Protocol
+
+* Writes are buffered at the client until commit; reads do not see the transaction's own writes.
+* Reads use wound-wait to avoid deadlocks. The client sends reads to leader replicas, which acquire read locks and read the most recent data.
+* Client sends keepalive messages to prevent participant timeouts.
+* At commit: client chooses a coordinator, sends commit messages to each participant leader with coordinator identity and buffered writes.
+
+**Non-coordinator participants:**
+1. Acquire write locks.
+2. Choose prepare timestamp (preserving monotonicity).
+3. Log prepare record via Paxos.
+4. Notify coordinator of prepare timestamp.
+
+**Coordinator:**
+1. Acquire write locks, skip prepare phase.
+2. Choose *s* ≥ all prepare timestamps, > `TT.now().latest`, and > any previous timestamps (monotonicity).
+3. Log commit (or abort) record via Paxos.
+4. **Commit wait:** Wait until `TT.after(s)` before applying.
+5. Send commit timestamp to client and participants. All apply at *s* and release locks.
+
+The expected commit-wait delay is at least 2ε̄ as coordinator needs to choose a commit timestamp based on `TT.now().latest`
+and wait until that timestamp is guaranteed to be in the past.
+
+### Read-Only Transactions
+
+* Every read-only transaction requires a **scope** expression summarizing the keys to be read (inferred for standalone queries).
+* **Single Paxos group:** Client issues to that group's leader, which assigns *s*<sub>read</sub> and executes. Spanner can use `LastTS()` (timestamp of last committed write) when there are no prepared transactions, improving over `TT.now().latest`.
+* **Multiple Paxos groups:** Spanner currently uses *s*<sub>read</sub> = `TT.now().latest` without a negotiation round; reads may be sent to any sufficiently up-to-date replica.
+
+### Schema-Change Transactions
+
+TrueTime enables atomic schema changes without blocking. A schema-change transaction:
+* Is assigned an explicit **future timestamp** in the prepare phase.
+* Allows concurrent reads/writes with timestamps before that time to proceed; those with timestamps after must block behind the schema change.
+* Without TrueTime, defining the schema change at time *t* would be meaningless.
+
+### Refinements
+
+**Fine-grained *t*<sub>safe</sub><sup>TM</sup>:**
+A single prepared transaction can stall *t*<sub>safe</sub> for all reads. Augmenting *t*<sub>safe</sub><sup>TM</sup> with a fine-grained mapping from key ranges to prepared timestamps (in the lock table) removes false conflicts: reads are checked only against safe times for overlapping key ranges.
+
+**Fine-grained LastTS():**
+If a transaction just committed, a non-conflicting read-only transaction might be delayed. A fine-grained mapping from key ranges to commit timestamps allows assigning *s*<sub>read</sub> as the max LastTS over conflicting key ranges (unless a conflicting prepared transaction exists).
+
+**Advancing *t*<sub>safe</sub><sup>Paxos</sup> without writes:**
+*t*<sub>safe</sub><sup>Paxos</sup> cannot advance without Paxos writes. Spanner uses **MinNextTS(*n*)**—the minimum timestamp that may be assigned to Paxos sequence *n* + 1. A replica can advance *t*<sub>safe</sub><sup>Paxos</sup> to MinNextTS(*n*) − 1 when it has applied through *n*. Leaders enforce MinNextTS via their leases; *s*<sub>max</sub> is advanced to the highest MinNextTS value. Leaders advance MinNextTS every 8 seconds by default; slaves in idle groups can serve reads at timestamps &gt; 8 seconds old when there are no prepared transactions.
