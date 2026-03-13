@@ -1,0 +1,201 @@
+---
+slug: f1-google-distributed-relational-database
+title: "F1: Google's Distributed Relational Database"
+date: "2026-02-24"
+description: "F1 is a hybrid distributed database built on Spanner that combines high availability and NoSQL scalability with SQL consistency and usability, powering Google AdWords."
+tags: [f1, google, spanner, distributed-systems, database, sql, olap, oltp, adwords]
+category: system-papers
+---
+
+## Why F1?
+
+F1 is a distributed relational database system built at Google as the new storage backend for **AdWords**. It is a hybrid database that combines high availability, the scalability of NoSQL systems like Bigtable, and the consistency and usability of traditional SQL databases.
+
+**Built on Spanner:** F1 sits on top of Spanner, which provides synchronous cross-datacenter replication and strong consistency. Synchronous replication implies higher commit latency; F1 mitigates that through a hierarchical schema model with structured data types and careful application design.
+
+**What F1 adds:** Beyond Spanner’s storage and replication, F1 provides a distributed SQL query engine, transactionally consistent secondary indexes, asynchronous schema changes, optimistic transactions, and automatic change history recording and publishing.
+
+---
+
+## Design Goals
+
+F1’s design is driven by four goals:
+
+* **Scalability** — Scale up by adding resources, without complex sharding or rebalancing. The previous sharded MySQL system was hard to scale and rebalance; users needed joins and complex queries, which forced careful shard design and made resharding risky.
+* **Availability** — No downtime: datacenter outages, planned maintenance, and schema changes must not take the system down. AdWords is core business; downtime has direct revenue impact.
+* **Consistency** — ACID transactions and always-consistent views. Applications must not have to cope with concurrency anomalies; the cost of handling them is high and not worth the performance gains.
+* **Usability** — Full SQL, indexes, and ad hoc query support. These are requirements, not optional features.
+
+The design accepts higher latency for typical reads and writes and compensates with schema and application patterns: hierarchical clustering, structured types, and an ORM that encourages batching, parallelism, and asynchronous reads so user-facing transactions can perform on par with the prior MySQL system.
+
+---
+
+## Basic Architecture
+
+<div align="center">
+![Figure 1: F1 Architecture](/figures/f1-architecture.png)
+</div>
+
+Users talk to F1 through the **F1 client** library. The client sends requests to one of many **F1 servers**, which read and write remote data and coordinate query execution.
+
+**Latency and placement:**
+* The client and load balancer prefer an F1 server in a nearby datacenter. Requests can still be sent to remote datacenters under load or failure.
+* F1 servers are usually co-located with the Spanner servers that hold the data, so they have fast access to the underlying store. For availability and load balancing, they can also talk to Spanner in other datacenters. Spanner servers in each datacenter read from the Colossus File System (CFS) in that same datacenter; CFS is not globally replicated, so Spanner never talks to remote CFS.
+
+**Stateless servers:** F1 servers are mostly stateless, so a client can use a different server per request. The exception is pessimistic transactions, where the client must hold locks and is bound to one F1 server for the duration. Because servers do not own data, adding or removing F1 servers does not require data movement and scales throughput easily.
+
+**Distributed queries:** An F1 cluster has a **shared slave pool**—processes that only run parts of distributed query plans on behalf of regular F1 servers. The **F1 master** maintains slave membership, monitors health, and distributes the list of available slaves. Throughput scales by adding more Spanner servers, F1 servers, or F1 slaves; only adding Spanner servers involves data re-distribution, and that is transparent to F1 and clients.
+
+---
+
+## Spanner Foundation
+
+F1 relies on Spanner for storage, replication, and transaction semantics.
+
+**Data organization in Spanner:** Rows are partitioned into **directories** by ancestry in the schema. Each directory has one or more **fragments**; large directories can have multiple fragments. **Groups** hold a set of directory fragments. A group usually has one replica tablet per datacenter. Data is replicated synchronously with Paxos; one replica is the **Paxos leader** and is the entry point for all transactional activity for that group. Readonly replicas do not vote in Paxos and cannot become leader.
+
+**Transactions:** Spanner provides serializable **pessimistic** transactions with strict two-phase locking: multiple reads (shared or exclusive locks), then a single write that upgrades locks and commits. Commits are replicated synchronously via Paxos. Transactions are most efficient when they touch data in a single group. **Cross-group** transactions use **two-phase commit (2PC)** on top of Paxos, adding a round trip and roughly doubling commit latency. 2PC works up to tens of participants; with hundreds, abort rate and latency grow.
+
+**Timestamps and reads:** Every transaction gets a commit timestamp; these timestamps define a global total order. Spanner uses synchronized hardware clocks to assign globally ordered timestamps and supports multi-version consistent reads, including snapshot reads, without read locks. The **global safe timestamp** is a timestamp below which no in-flight or future transaction can commit (typically 5–10 seconds behind current time). Reads at that timestamp can run on any replica, including readonly replicas, and do not block on running transactions.
+
+---
+
+## Data Model
+
+<div align="center">
+![Figure 2: F1 Hierarchical Schema](/figures/f1-schema.png)
+</div>
+
+### Hierarchical Schema
+
+At the logical level, F1 has a relational schema similar to a traditional RDBMS, with extensions: explicit **table hierarchy** and columns with **Protocol Buffer** types.
+
+Tables can be organized in a **hierarchy**. Physically, each child table is **clustered** and **interleaved** with its parent: the child’s primary key must have the parent’s primary key as a **prefix**. For example, AdWords has `Customer (CustomerId)`, child `Campaign (CustomerId, CampaignId)`, and child `AdGroup (CustomerId, CampaignId, AdGroupId)`. A root table row is a **root row**. All descendant rows for that root row live in a single Spanner **directory**, so they are normally on one Spanner server. Child rows are stored under the parent ordered by primary key.
+
+**Benefits:**
+* **Single directory, single request:** Fetching all Campaign and AdGroup rows for a Customer can be one Spanner request; both child tables are keyed by `CustomerId`, so range reads and ordered merge-joins are natural.
+* **Fewer 2PCs:** Transactions limited to one root usually stay in one directory and avoid 2PC. Cross-root transactions should still minimize the number of roots to keep latency and abort rate low.
+
+### Protocol Buffers
+
+F1 supports columns with structured **Protocol Buffer** types (typed, optional, repeated, and nested fields).
+
+* **Repeated fields** can replace child tables when the number of child records has a low upper bound. The whole protocol buffer is stored as one unit in Spanner, avoiding extra tables and joins and letting users read/write logical business objects atomically.
+* Tables are often split into a few columns by access pattern: group fields that are read together, separate static from hot-updated data, or allow different permissions or concurrent updates per column. Fewer columns often improves performance where Spanner has non-trivial per-column overhead.
+
+### Indexing
+
+All F1 indexes are **transactional** and fully consistent. Indexes are stored as separate tables in Spanner, keyed by (index key, base table primary key). Index keys can be scalar columns or fields extracted from Protocol Buffers (including repeated fields).
+
+* **Local index:** Index key has the root row primary key as a prefix (e.g. `(CustomerId, Keyword)` used to store unique keywords for each customer is a local index). Entries live in the same Spanner directory as the root row, so local index updates add little cost and do not add 2PC participants.
+* **Global index:** Index key does not include the root key (e.g. `(Keyword)` mapping to Customers). Global indexes are sharded across many directories and servers. A single-row write that touches a global index automatically adds one 2PC participant, which is acceptable; bulk inserts into tables with global indexes can involve many participants and scale poorly, so global indexes are used sparingly and bulk operations are kept small.
+
+---
+
+## Schema Changes
+
+F1 makes **all schema changes non-blocking** in a system that is massively distributed and where each server holds a local copy of the schema.
+
+**Asynchronous application:** Schema changes are applied **asynchronously** on different servers at different times, so two servers may run with different schemas. To avoid corruption (e.g. one server adding an index entry and another deleting the row without deleting the index entry), F1:
+
+* Ensures at most **two** schemas are active cluster-wide (current and next), with schema leases so no server uses a schema after its lease expires.
+* Breaks each change into **phases** such that consecutive phases are mutually compatible. For example, adding an index: first add it in delete-only mode (so old-schema servers never add entries), then enable full writes, then run a MapReduce to backfill existing rows, then make the index visible for reads.
+
+A detailed treatment of the protocol—intermediate states (delete-only, write-only), consistency preservation, and implementation—is in [F1: Online, Asynchronous Schema Change](/blog/f1-online-asynchronous-schema-change).
+
+---
+
+## Transactions
+
+Each F1 transaction has multiple reads, optionally followed by a single write that commits. F1 supports three transaction types on top of Spanner:
+
+* **Snapshot transactions** — Read-only, at a fixed Spanner snapshot timestamp. Default is the global safe timestamp (often 5–10 seconds old) from a local replica. Callers can request a specific timestamp or “current” (higher latency, possible remote RPCs). Used by default for SQL and MapReduce; multiple clients can see a consistent view of the database at the same timestamp.
+* **Pessimistic transactions** — Map directly to Spanner transactions. They use a stateful protocol and hold locks, so all requests in one pessimistic transaction go to the same F1 server. Server restart aborts the transaction. Reads can take shared or exclusive locks.
+* **Optimistic transactions** — A long read phase (no Spanner locks) and a short write phase. F1 returns a last-modification timestamp per row read (in a hidden lock column). The client sends these back at commit; the server runs a short Spanner pessimistic transaction, re-reads those timestamps, and aborts if any changed; otherwise it applies the writes.
+
+**F1 clients use optimistic by default:** Optimistic transactions tolerate bad or slow clients (no long-held locks), can run arbitrarily long (e.g. waiting for user input), are easy to retry on the server (self-contained commits), and allow server failover (all state on the client). Drawbacks: they do not prevent **insertion phantoms** (timestamps exist only for existing rows), and under high contention (e.g. many clients incrementing a counter) they cause many aborts; for such cases pessimistic locking or application-level batching is used.
+
+### Flexible Locking
+
+F1 provides **row-level** locking by default via one lock column per row. The schema can define additional lock columns covering subsets of columns (**column-level locking**) for higher concurrency, or a lock column in a parent covering child columns to serialize writes in that subtree (e.g. to enforce “at most N keywords per AdGroup” or avoid phantoms).
+
+---
+
+## Change History
+
+**Change History** is a first-class feature: all tables are change-tracked by default (tables or columns can opt out).
+
+Every transaction produces one or more **ChangeBatch** Protocol Buffers with primary key and before/after values for changed columns. ChangeBatches are stored in normal F1 tables that are children of each root table; the key includes the root key and commit timestamp. A transaction that touches multiple root rows writes one ChangeBatch per root (with cross-references). Thus per root row, change history is stored in commit order, queryable with SQL, and **co-located** with the data, so these writes usually do not add extra Spanner participants and have minimal latency impact.
+
+---
+
+## Query Processing
+
+F1’s SQL engine has these properties:
+
+* Queries run either as **low-latency centralized** plans or **distributed** plans with high parallelism.
+* All data is remote; **batching** is used heavily to hide network latency.
+* Data is arbitrarily partitioned with limited ordering; plans use **hash repartitioning** often.
+* Operators **stream** data to the next stage to maximize pipelining.
+* Hierarchically clustered tables have optimized access methods.
+* Query data can be consumed in parallel.
+* Protocol Buffer-valued columns provide first-class support for structured data types.
+* Spanner’s snapshot consistency gives globally consistent results.
+
+### Central vs Distributed Execution
+
+* **Centralized** execution runs the whole query on one F1 server (typical for short OLTP-style queries).
+* **Distributed** execution spreads work over the F1 slave pool (OLAP-style), always with snapshot transactions.
+* The optimizer uses heuristics to choose the mode.
+
+### Remote Data and Batching
+
+F1 does not store data locally; the main cost is **network latency**, not disk. Latency is mitigated by batching and parallelism, and storage is spread across many nodes, so parallel accesses scale well.
+
+The **lookup join** operator is a prime example: it collects rows from the outer table, deduplicates lookup keys, and batches until ~50 MB or 100,000 unique keys, then does one batched lookup on the inner table, joins in memory with a hash table, and streams results. Operators stream aggressively, which often discards input order but maximizes concurrency and limits buffering.
+
+### Distributed Query Example
+
+<div align="center">
+![Figure 3: Distributed query plan example](/figures/f1-query-plan.png)
+</div>
+
+In a typical plan, data is streamed bottom-up: a scan feeds a lookup join (e.g. AdClick scan → lookup AdGroupCreative by index), then repartition by hash (e.g. CustomerId, CreativeId) for a distributed hash join, then repartition again by grouping keys for distributed aggregation. The coordinator receives results from the penultimate plan parts and streams to the client.
+
+### Distributed Execution Overview
+
+**Plan structure:** A full distributed query plan consists of potentially tens of **plan parts**, each representing a set of workers that execute the same query subplan. Plan parts are organized as a directed acyclic graph (DAG): data flows up from the leaves to a single **root node**—the only node with no out-edges, i.e. the only sink. The root node, also called the **query coordinator**, runs on the F1 server that received the SQL request from the client. The coordinator plans the query, receives results from the penultimate plan parts, performs any final aggregation, sorting, or filtering, and streams results back to the client (except for partitioned consumers, where multiple clients consume sharded streams).
+
+**Why F1 repartitions:** Many distributed databases exploit explicit co-partitioning of data to push work down to nodes that own the partitions. F1 cannot: data is always remote, and Spanner applies arbitrary, effectively random partitioning that can also change over time. To run operations efficiently, F1 must frequently repartition data. Because input data is not range-partitioned and range partitioning would depend on accurate statistics, F1 uses only **hash partitioning**.
+
+**Network and repartitioning:** Repartitioning is often seen as costly due to network traffic. In F1, clusters of several hundred worker processes are connected so that servers can communicate with each other at close to full network interface speed. That makes repartitioning feasible without worrying as much about network capacity or rack affinity; a tradeoff is that cluster size is bounded by the available network switch hardware.
+
+**Hash-based operators:**
+* **Distributed hash join** — Both inputs are repartitioned by a hash of the join keys (e.g. CustomerId and CreativeId in the example). Each worker owns one partition, loads the smaller input (by planner estimate) into an in-memory hash table, then streams the larger input and probes the hash table, streaming out join results.
+* **Distributed aggregation** — Data is aggregated locally in small buffers, then repartitioned by a hash of the grouping keys; each partition runs a full aggregation. If hash tables exceed memory, F1 spills to disk using standard algorithms.
+
+**In-memory execution and failure:** Operators run in memory and stream data as much as possible; there is no checkpointing of intermediate results to disk, so queries run at the speed of data processing. Any server failure can cause the whole query to fail. Failed queries are retried transparently, which usually hides these failures. In practice, queries up to about an hour are sufficiently reliable; much longer queries may see too many failures.
+
+### Hierarchical Table Joins (Cluster Join)
+
+For tables on a single ancestry path (e.g. `Customer` and `Campaign`), F1 can **cluster join**: one Spanner request returns both tables in interleaved primary-key order (depth-first).
+
+```sql
+SELECT *
+FROM Customer JOIN
+Campaign USING (CustomerId)
+```
+
+<div align="center">
+![Figure 4: Cluster join example](/figures/f1-cluster-join.png)
+</div>
+
+F1 does a merge-join-like **cluster join** with a small buffer (e.g. one row per table) and streams results. Only one ancestry path can be joined this way in one request; joins to sibling tables use other strategies (e.g. lookup join) with bounded memory.
+
+### Partitioned Consumers
+
+Large result sets can be consumed in parallel by multiple clients: the client requests distributed retrieval, F1 returns multiple endpoints, and the client connects to all and reads in parallel. Because of streaming and hash repartitioning, slow readers can slow others; breaking this dependency with disk-backed buffering is a possible future improvement.
+
+### Queries with Protocol Buffers
+
+F1 SQL treats Protocol Buffer columns as first-class: path expressions (e.g. `c.Info.country_code`) and full protos (e.g. `c.Info`) in SELECT. **PROTO JOIN** joins on the implicit “foreign key” of a repeated field inside a proto (e.g. `Customer` to `Whitelist.feature`). Subqueries on repeated fields (scalar or EXISTS) iterate over the repeated values in the current row’s proto. Performance caveats: entire proto columns are read from Spanner even when only a few fields are needed, and parsing is done in F1; pushing parsing and field selection into Spanner is a future optimization.
