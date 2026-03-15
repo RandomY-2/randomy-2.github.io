@@ -1,0 +1,155 @@
+---
+slug: dynamodb-transactions
+title: "Distributed Transactions at Scale in Amazon DynamoDB"
+date: "2026-03-05"
+description: "How Amazon added serializable transactions to DynamoDB using timestamp ordering, a two-phase protocol, and optimistic concurrency control—all without locks and without slowing down single-item operations."
+tags: [dynamodb, amazon, aws, transactions, distributed-systems, database, key-value, timestamp-ordering]
+category: system-papers
+---
+
+## Why Transactions in DynamoDB?
+
+DynamoDB is Amazon's fully managed key-value and document database, designed for single-digit millisecond latency at any scale. For years it supported only single-item operations. Adding multi-item transactions was a top customer request, but the design had to respect DynamoDB's core tenets: **predictable performance at scale**, **no blocking**, and **no regression for existing workloads**.
+
+The DynamoDB transaction design has a unique combination of capabilities:
+
+* **Transactions are submitted as a single request.** Unlike traditional `BEGIN`/`COMMIT` APIs (e.g. PostgreSQL), DynamoDB transactions are not long-lived sessions that hold server resources. A client submits a full set of operations in one call; it either succeeds or fails immediately. This avoids tying up resources in a multi-tenant service and keeps performance predictable.
+
+* **Non-transactional operations bypass two-phase coordination.** Single `GetItem` and `PutItem` calls go directly to the storage node for the item's key, with no coordinator involved. Requiring every read/write to use the full transaction protocol would have been too costly for these frequent operations. Instead, single-item operations are serialized with respect to transactions on the storage node itself.
+
+* **Updates are in-place (no MVCC).** DynamoDB stores a single version of each item. Adding multi-version concurrency control would have required deep changes to the storage engine, version retention policies, and additional storage costs passed on to customers. The trade-off is that read-only and read-write transactions can conflict.
+
+* **No locks.** Two-phase locking restricts concurrency, introduces deadlocks, and requires a recovery mechanism to release locks if a client fails mid-transaction. DynamoDB uses optimistic concurrency control: transactions proceed without acquiring locks and are rejected if they conflict.
+
+* **Timestamp ordering for serialization.** Each transaction is assigned a timestamp that defines its position in the serial order. As long as transactions appear to execute at their assigned time, serializability is achieved. A key innovation is extending classical timestamp ordering to exploit the semantics of a key-value store.
+
+---
+
+## DynamoDB API
+
+### Key-Value Store
+
+A DynamoDB table is a collection of items, and each item is a collection of attributes. Each item is uniquely identified by a primary key. DynamoDB provides a simple interface to store or retrieve items from a table or an index.
+
+### Read and Write Operations
+
+<div align="center">
+![Figure 1: DynamoDB API](/figures/ddb-transaction-ddb-api.png)
+</div>
+
+The most common operations are `GetItem`, `PutItem`, `UpdateItem`, and `DeleteItem`. The last three are collectively called writes. A write can optionally specify a **condition** (a predicate on current item state) that must be satisfied for the operation to succeed.
+
+### Transactional Operations
+
+<div align="center">
+![Figure 2: DynamoDB Transaction API](/figures/ddb-transaction-transaction-api.png)
+</div>
+
+DynamoDB provides two transaction APIs:
+
+* **`TransactGetItems`** — Reads the latest versions of items from one or more tables. All items are read at a single logical point in time, returning a consistent snapshot. The request is rejected if a conflicting write transaction is currently modifying any item in the read set.
+
+* **`TransactWriteItems`** — A synchronous, idempotent write operation that atomically creates, deletes, or updates multiple items across one or more tables. It uses a **client request token** to guarantee idempotency. The transaction may include preconditions on current item values; the request is rejected if any precondition fails.
+
+Both are executed in a **serializable** order with respect to all other DynamoDB operations.
+
+---
+
+## Transaction Execution
+
+<div align="center">
+![Figure 3: DynamoDB Transaction Architecture](/figures/ddb-transaction-architecture.png)
+</div>
+
+### Transaction Routing
+
+All requests to DynamoDB first reach a fleet of **request routers**, which authenticate the request and route it to the appropriate storage node based on the item's key. Non-transactional operations are sent directly to the storage node.
+
+Transaction operations follow a different path: the request router forwards them to a fleet of **transaction coordinators**. Any coordinator can handle any transaction. The coordinator breaks the transaction into item-level operations and runs a distributed protocol with the storage nodes that own those items.
+
+### Timestamp Ordering
+
+Upon receiving a transaction, the coordinator assigns a **timestamp** from its local clock. This timestamp defines the transaction's logical position in the serial order. Because there are many coordinators operating in parallel, different transactions get timestamps from different coordinators.
+
+Once a timestamp is assigned and preconditions checked, each storage node independently ensures that operations on its items are executed in the proper order, rejecting conflicting transactions that cannot be ordered correctly.
+
+Although serializability holds even without synchronized clocks, more accurate clocks yield more successful transactions and a serialization order closer to real time. DynamoDB coordinators source their clocks from AWS's time-sync service, keeping them within a few microseconds of each other. Even so, transactions can arrive at storage nodes out of order due to network delays, coordinator recovery, and other issues. Storage nodes handle this using stored timestamps.
+
+### Write Transaction Protocol
+
+A **two-phase protocol** ensures atomicity and proper ordering of multi-item writes.
+
+**Phase 1 — Prepare.** The coordinator sends a prepare message to the primary storage node for each item being written. The message includes the transaction timestamp, transaction ID, and the intended operation. A storage node accepts the transaction if all of the following hold for every local item in the transaction:
+
+1. All preconditions on the item are met.
+2. The write would not violate system restrictions (e.g. max item size).
+3. The transaction's timestamp is greater than the item's last write timestamp.
+4. No other prepared transaction is attempting to write the same item.
+
+(Conditions 3 and 4 are correct but over-restrictive and can be relaxed—see the optimizations section below.)
+
+**Phase 2 — Commit or Cancel.** If all storage nodes accept, the coordinator commits: each storage node performs the write and records the transaction's timestamp as the item's new last write timestamp. Items whose preconditions were checked but that are not being written also have their timestamps updated. If any storage node rejects, the coordinator cancels the entire transaction.
+
+After all storage nodes finish the commit or cancellation, the coordinator responds to the request router, which forwards the result to the client.
+
+**Handling deletes.** Deleting an item removes the last write timestamp along with the item. Rather than maintaining per-item tombstones (expensive in storage and garbage collection), DynamoDB stores a **partition-level max delete timestamp**. When an item is deleted, the partition's max delete timestamp is updated if the transaction's timestamp exceeds the current value. When a storage node receives a prepare for a write to a non-existent item, it compares the new transaction's timestamp against this partition-level max delete timestamp to decide acceptance. This is a correct and efficient approximation—occasionally a transaction is rejected when it would not have been if per-item tombstones were maintained, but in practice this is insignificant.
+
+### Read Transaction Protocol
+
+Read transactions use a **two-phase write-less protocol**: no timestamps are persisted for reads, so read transactions never turn into write operations on persistent, replicated data.
+
+**Phase 1.** The coordinator reads all items in the transaction's read set. If any item is currently being written by another transaction, the read transaction is rejected. Along with each item's value, the storage node returns the item's current committed **log sequence number (LSN)**—the sequence number of the last acknowledged write. The LSN increases monotonically.
+
+**Phase 2.** The items are read again. If the LSNs have not changed between the two phases (meaning no writes occurred), the read transaction returns successfully with the values from the first phase. If any LSN changed, the transaction is rejected.
+
+In both success and failure, the storage node returns the LSN, allowing the coordinator to **redrive** another round of reads for the affected items without restarting the entire transaction. If an item is currently being prepared by a write transaction, the storage node simply rejects the read.
+
+### Recovery and Fault Tolerance
+
+**Storage node failures** are transparent to the protocol. Each item's data is replicated within a group; if a primary storage node fails, leadership fails over to another replica. Transaction metadata is persistently stored and replicated, so the new primary has everything it needs. The coordinator does not even know it is talking to a different storage node.
+
+**Coordinator failures** are the bigger concern. Coordinators maintain a persistent **transaction ledger** (itself a DynamoDB table, keyed by transaction ID) recording each transaction and its outcome. A fleet of **recovery managers** periodically scans the ledger looking for transactions that have not completed within a reasonable time. Stalled transactions are assigned to a new coordinator, which resumes the protocol. If the original coordinator was not actually failed (false positive), it is safe for multiple coordinators to finish the same transaction concurrently—duplicate write attempts on an item are ignored by the storage node.
+
+Storage nodes also participate in recovery: if a storage node receives a request for an item that has a stalled prepared transaction (timestamp older than a threshold), it notifies a recovery manager with the item key and pending transaction ID. The recovery manager checks the ledger and resumes execution if needed.
+
+---
+
+## Adapting Timestamp Ordering for Key-Value Operations
+
+Classical timestamp ordering was designed for general-purpose databases. DynamoDB's key-value semantics enable several optimizations that dramatically reduce conflicts and keep single-item operations fast.
+
+### Single-Item Reads Always Succeed
+
+A `GetItem` that is not part of a transaction is routed directly to the storage node, bypassing coordinators. The storage node immediately returns the latest stored value—even if a prepared transaction may later overwrite the item. Implicitly, this read is assigned a timestamp between the last completed write and the pending transaction. In other words, the read is serialized between the last committed write and any prepared-but-not-yet-committed transaction.
+
+### Single-Item Writes Can Jump Ahead of Prepared Transactions
+
+Non-transactional writes (`PutItem`, `UpdateItem`, `DeleteItem`) are also routed directly to storage nodes. The storage node assigns a write timestamp **earlier** than the timestamps of any prepared transactions. Because a prepared transaction has not yet performed its write, the newly arriving put can safely be serialized before it.
+
+There is one exception: if the prepared transaction checked a **condition** on the item, the new write cannot jump ahead if it might violate that condition. For example, if a transaction checked that an account balance is ≥ $100 and is in the prepared state, the system cannot let a concurrent withdrawal that reduces the balance below $100 jump ahead. In general, it is challenging to determine whether an arbitrary condition might be violated, though common conditions like numerical bounds checks can be handled.
+
+### Buffering Writes Instead of Rejecting Them
+
+Even when a new single-item write would violate a prepared transaction's condition, the storage node need not reject it. Instead, it can **buffer** the write until the prepared transaction commits or cancels. A prepared transaction is expected to resolve quickly, so the delay is typically less than rejecting the write and forcing the client to retry.
+
+As a further optimization, if the incoming write is an unconditional `PutItem` or `DeleteItem`, the storage node can assign it a timestamp **later** than all prepared transactions and execute it immediately. If a prepared transaction with an earlier timestamp later commits, its write will be ignored (it would have been overwritten anyway).
+
+### Write Transactions Can Succeed with Old Timestamps
+
+If a write transaction arrives at a storage node that has already performed a write with a later timestamp, the transaction can still be accepted and enter the prepared state. If it commits, its write is simply ignored: even if it had executed at its assigned earlier time, the later write would have overwritten it completely. This argument holds for `PutItem` and `DeleteItem` (which fully overwrite or remove the item) but not for `UpdateItem` (which partially modifies the item—the final value depends on execution order).
+
+The benefit: a transaction with an old timestamp that has no effect on some items may still contain writes to other items that succeed.
+
+### Multiple Prepared Transactions on the Same Item
+
+A storage node can prepare multiple transactions that write the same item. For put and delete operations that fully overwrite or remove the item, these transactions can commit in any order as long as the transaction with the latest timestamp is the last one to perform its write. For `UpdateItem` operations that do partial modifications, transactions must execute in timestamp order since the final value depends on the sequence.
+
+### Single-Round Read Transactions
+
+The two-phase read protocol can be collapsed into a single round. Suppose storage nodes support a `GetItemWithTimestamp` operation that takes a read timestamp as a parameter. It returns the latest item value if the item's last write timestamp is earlier than the given read timestamp and all prepared transactions have later timestamps; otherwise it rejects the request.
+
+The coordinator assigns a timestamp, calls `GetItemWithTimestamp` in parallel for all items, and returns the results if none are rejected. The subtlety is that a storage node could later accept a write with a timestamp earlier than the previously executed read, violating serializability. This is a well-known issue with timestamp ordering, addressed by having storage nodes maintain a **read timestamp** per item in addition to the write timestamp. Future write transactions must then have timestamps later than both the read and write timestamps.
+
+### Single-Round Write Transactions Within a Partition
+
+If all items in a write transaction reside in the same partition (and hence the same storage node), the two-phase protocol collapses to a **single round**. The storage node performs all precondition checks and, if they pass, immediately executes all writes, reporting the outcome to the coordinator.
