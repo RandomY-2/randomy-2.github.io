@@ -4,6 +4,9 @@ import { notFound } from "next/navigation";
 import matter from "gray-matter";
 import { MDXRemote } from "next-mdx-remote/rsc";
 import fs from "fs/promises";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 
 const postsDir = path.join(process.cwd(), "content", "blog");
 
@@ -30,7 +33,15 @@ export default async function BlogPost({
       <article className="prose lg:prose-lg mx-auto">
         <h1 className="mb-0">{data.title}</h1>
         <p className="mt-0 text-sm text-gray-500">{data.date}</p>
-        <MDXRemote source={content} />
+        <MDXRemote
+          source={content}
+          options={{
+            mdxOptions: {
+              remarkPlugins: [remarkMath],
+              rehypePlugins: [rehypeKatex],
+            },
+          }}
+        />
       </article>
     );
   } catch {

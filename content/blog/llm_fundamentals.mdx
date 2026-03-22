@@ -1,0 +1,281 @@
+---
+slug: llm-fundamentals
+title: "From N-grams to Transformers and Beyond"
+date: "2026-03-12"
+description: "A comprehensive guide to the foundations of large language models, covering statistical language models, word embeddings, RNNs, the Transformer architecture, prompt engineering, tokenization, scaling laws, and model limitations."
+tags: [llm, transformer, attention, nlp, deep-learning, gpt, tokenization, prompt-engineering]
+category: ai
+---
+
+## Language Models and Transformer
+
+### Statistical Language Models and the N-gram Idea
+
+Before the rise of deep learning, statistical methods were the mainstream approach to language modeling. The core idea is that the probability of a sentence appearing equals the product of the conditional probabilities of each word in the sentence.
+
+For a sentence $S$ composed of words $w_1, w_2, \ldots, w_m$, its probability $P(S)$ can be expressed as:
+
+$$
+P(S) = P(w_1, w_2, \ldots, w_m) = P(w_1) \cdot P(w_2 \mid w_1) \cdot P(w_3 \mid w_1, w_2) \cdots P(w_m \mid w_1, \ldots, w_{m-1})
+$$
+
+This formula is called the **chain rule of probability**. However, directly calculating this is almost impossible because conditional probabilities are too difficult to estimate from a corpus—the word sequence may have never appeared in the training data.
+
+To solve this problem, researchers introduced the **Markov Assumption**: we can approximately assume that a word's probability of appearing is only related to the limited $n - 1$ words before it.
+
+Language models built on this assumption are called **N-gram models**. Here, "N" represents the context window size we consider.
+
+- **Bigram (N=2)**: The simplest case, where a word's appearance depends only on the one word before it.
+
+$$
+P(w_i \mid w_1, \ldots, w_{i-1}) \approx P(w_i \mid w_{i-1})
+$$
+
+- **Trigram (N=3)**: A word's appearance depends on the two words before it:
+
+$$
+P(w_i \mid w_1, \ldots, w_{i-1}) \approx P(w_i \mid w_{i-2}, w_{i-1})
+$$
+
+These probabilities can be calculated through **Maximum Likelihood Estimation (MLE)** in large corpora:
+
+$$
+P(w_i \mid w_{i-1}) = \frac{\text{Count}(w_{i-1}, w_i)}{\text{Count}(w_{i-1})}
+$$
+
+N-gram models, although simple and effective, have two fatal flaws:
+
+1. **Data Sparsity**: If a word sequence has never appeared in the corpus, its probability estimate is 0. Smoothing techniques can alleviate but not eradicate this issue.
+2. **Poor Generalization**: The model cannot understand semantic similarity between words.
+
+---
+
+### Neural Network Language Models and Word Embeddings
+
+The fundamental flaw of N-gram models is treating words as isolated, discrete symbols. To overcome this, researchers turned to neural networks and proposed representing words with continuous vectors:
+
+$$
+P(w_t \mid w_{t-n+1}, \ldots, w_{t-1}) = \text{softmax}\!\Big(W_2 \cdot \tanh\!\big(W_1 \cdot [C(w_{t-n+1});\; \ldots;\; C(w_{t-1})] + b_1\big) + b_2\Big)
+$$
+
+Where $C(w)$ is the embedding lookup that maps word $w$ to its vector, the semicolons denote concatenation of the $n{-}1$ context embeddings, and $W_1, W_2, b_1, b_2$ are learnable parameters.
+
+Its core idea can be divided into two steps:
+
+1. **Build a semantic space**: Map each word in the vocabulary to a point in a high-dimensional continuous vector space. This point is called a **Word Embedding**. Semantically similar words have vectors that are close together.
+2. **Learn the mapping from context to the next word**: Use neural networks to learn a function whose input is the word vectors of the previous $n-1$ words and whose output is the probability distribution over the vocabulary for the next word.
+
+In this architecture, word embeddings are automatically learned during model training. To complete the task of predicting the next word, the model continuously adjusts each word's vector position, ultimately encoding rich semantic information.
+
+Once words are represented as vectors, we can measure relationships between them using **Cosine Similarity**, which calculates the cosine of the angle between two vectors:
+
+$$
+\text{CosineSimilarity}(\mathbf{A}, \mathbf{B}) = \frac{\mathbf{A} \cdot \mathbf{B}}{\|\mathbf{A}\| \times \|\mathbf{B}\|}
+$$
+
+- Cosine value of **1** (0° angle): complete correlation
+- Cosine value of **0** (90° angle): no relationship
+- Cosine value of **-1** (180° angle): complete negative correlation
+
+---
+
+### Recurrent Neural Networks (RNN) and LSTM
+
+Although neural network introduced word embeddings to solve the generalization problem, their **context window remains fixed** (input vector dimension). To break this limitation, **Recurrent Neural Networks (RNN)** emerged with a core idea: add "memory" capability to the network.
+
+<div align="center">
+![Figure 1: RNN Architecture](/figures/llm-fundamental-rrn-architecture.png)
+</div>
+
+RNN introduces a **hidden state** vector—the network's short-term memory. At each step, the network reads the current input word and combines it with the hidden state from the previous time step, generating a new hidden state to pass forward. This cyclical process allows information to propagate through the sequence:
+
+$$
+h_t = \tanh(W_{xh} \cdot x_t + W_{hh} \cdot h_{t-1} + b_h)
+$$
+
+$$
+y_t = W_{hy} \cdot h_t + b_y
+$$
+
+Where $x_t$ is the input at time step $t$, $h_t$ is the hidden state, $y_t$ is the output, and $W_{xh}$, $W_{hh}$, $W_{hy}$ are learnable weight matrices shared across all time steps.
+
+Standard RNNs have a serious practical problem: the **Long-term Dependency Problem**. During backpropagation through long sequences, gradients undergo repeated multiplications, causing them to rapidly approach zero (**gradient vanishing**) or become extremely large (**gradient explosion**). This prevents the model from learning how early information affects later outputs.
+
+**Long Short-Term Memory (LSTM)** networks were designed to solve this. LSTM's core innovation introduces **Cell State** and a sophisticated **Gating Mechanism**:
+
+<div align="center">
+![Figure 2: LSTM Architecture](/figures/llm-fundamental-lstm-architecture.webp)
+</div>
+
+- **Forget Gate**: Decides which information to discard from the previous cell state.
+
+$$
+f_t = \sigma(W_f \cdot [h_{t-1}, x_t] + b_f)
+$$
+
+- **Input Gate**: Decides which new information from the current input to store, combined with a candidate cell state $\tilde{C}_t$.
+
+$$
+i_t = \sigma(W_i \cdot [h_{t-1}, x_t] + b_i)
+$$
+
+$$
+\tilde{C}_t = \tanh(W_C \cdot [h_{t-1}, x_t] + b_C)
+$$
+
+- **Cell State Update**: The old cell state $C_{t-1}$ is updated by forgetting some old information and adding new candidate information.
+
+$$
+C_t = f_t \odot C_{t-1} + i_t \odot \tilde{C}_t
+$$
+
+- **Output Gate**: Decides what to output to the hidden state based on the current cell state.
+
+$$
+o_t = \sigma(W_o \cdot [h_{t-1}, x_t] + b_o)
+$$
+
+$$
+h_t = o_t \odot \tanh(C_t)
+$$
+
+Here $\sigma$ is the sigmoid function, $\odot$ denotes element-wise multiplication, and $[h_{t-1}, x_t]$ is the concatenation of the previous hidden state and the current input.
+
+The cell state acts as an information highway independent of the hidden state, allowing information to flow more smoothly across time steps.
+
+---
+
+### Transformer Architecture Analysis
+
+RNNs and LSTMs process data **sequentially**: time step $t$ must wait for step $t-1$ to complete. This prevents large-scale parallel computation and limits training speed. The **Transformer** architecture completely abandoned recurrent structures and relied entirely on **Attention** to capture dependencies, enabling truly parallel computation.
+
+#### Overall Encoder-Decoder Structure
+
+The original Transformer follows a classic **Encoder-Decoder** architecture:
+
+<div align="center">
+![Figure 3: Transformer Architecture](/figures/llm-fundamental-transformer-architecture.png)
+</div>
+
+1. **Encoder**: "Understands" the entire input sentence. It reads all input tokens and generates a contextually rich vector representation for each.
+2. **Decoder**: "Generates" the target sentence. It references its own preceding output and "consults" the encoder's understanding to generate the next word.
+
+**Encoder Layer** — each layer applies self-attention followed by a feed-forward network, both wrapped with residual connections and layer normalization:
+
+$$
+Z = \text{LayerNorm}(X + \text{MultiHeadAttn}(Q{=}X,\; K{=}X,\; V{=}X))
+$$
+
+$$
+\text{EncoderOut} = \text{LayerNorm}(Z + \text{FFN}(Z))
+$$
+
+**Decoder Layer** — each layer has three sub-layers: masked self-attention over the decoder's own output, cross-attention over the encoder output, and a feed-forward network:
+
+$$
+Z_1 = \text{LayerNorm}(X + \text{MaskedMultiHeadAttn}(Q{=}X,\; K{=}X,\; V{=}X))
+$$
+
+$$
+Z_2 = \text{LayerNorm}(Z_1 + \text{MultiHeadAttn}(Q{=}Z_1,\; K{=}\text{EncoderOut},\; V{=}\text{EncoderOut}))
+$$
+
+$$
+\text{DecoderOut} = \text{LayerNorm}(Z_2 + \text{FFN}(Z_2))
+$$
+
+#### From Self-Attention to Multi-Head Attention
+
+Consider reading the sentence: "The agent learns because **it** is intelligent." When we read "it," our brain unconsciously focuses more on "agent" to resolve the reference. **Self-Attention** is a mathematical model of this phenomenon—it allows the model to consider all other words when processing each word and assign different attention weights accordingly.
+
+Self-attention introduces three learnable roles for each input token vector:
+
+- **Query (Q)**: The current token actively "querying" others for information.
+- **Key (K)**: The "label" or "index" of tokens that can be queried.
+- **Value (V)**: The "content" carried by the token.
+
+These three vectors are obtained by multiplying the original embedding vector by three learnable weight matrices ($W^Q, W^K, W^V$). The computation proceeds as:
+
+1. **Generate Q, K, V**: For each word, produce its Q, K, V vectors through weight matrices.
+2. **Calculate relevance scores**: Compute dot products between word A's Q vector and all K vectors.
+3. **Stabilize and normalize**: Divide scores by $\sqrt{d_k}$ (the dimension of K) to prevent small gradients, then apply Softmax to produce weights summing to 1.
+4. **Weighted sum**: Multiply the weights by each word's V vector and sum the results.
+
+If only one attention calculation is performed (single-head), the model may only learn one type of association. **Multi-Head Attention** splits Q, K, V vectors into $h$ parts along the dimension, with each part independently performing attention. This is like having $h$ different experts examining the sentence from different perspectives. Their outputs are concatenated and integrated through a linear transformation.
+
+**Scaled Dot-Product Attention** — the core building block that computes a weighted sum of values based on query-key similarity:
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+$$
+
+**Multi-Head Attention** — each head $i$ independently projects Q, K, V with its own learned weight matrices and performs attention. The $h$ outputs are concatenated and projected:
+
+$$
+Q_i = X W_i^Q, \quad K_i = X W_i^K, \quad V_i = X W_i^V
+$$
+
+$$
+\text{head}_i = \text{Attention}(Q_i,\; K_i,\; V_i)
+$$
+
+$$
+\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h) \; W^O
+$$
+
+Where $W_i^Q, W_i^K, W_i^V \in \mathbb{R}^{d_{\text{model}} \times d_k}$ are per-head projections with $d_k = d_{\text{model}} / h$, and $W^O \in \mathbb{R}^{d_{\text{model}} \times d_{\text{model}}}$ is the final output projection.
+
+#### Feed-Forward Neural Network
+
+In each Encoder and Decoder layer, the multi-head attention sublayer is followed by a **Position-wise Feed-Forward Network (FFN)**. If the attention layer "dynamically aggregates" relevant information from the entire sequence, then the FFN extracts higher-order features from that aggregated information.
+
+The key word is "position-wise"—this FFN acts independently on each token vector in the sequence. All positions share the same weights, maintaining the ability to process each position independently while reducing parameter count. The structure consists of two linear transformations with a ReLU activation:
+
+$$
+\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2
+$$
+
+#### Residual Connections and Layer Normalization
+
+In each encoder and decoder layer, all submodules are wrapped by an **Add & Norm** operation:
+
+- **Residual Connection (Add)**: Directly adds the submodule's input $x$ to its output $\text{Sublayer}(x)$. During backpropagation, gradients can bypass the submodule and propagate directly, solving the vanishing gradients problem in deep networks. Formula: $\text{Output} = x + \text{Sublayer}(x)$.
+- **Layer Normalization (Norm)**: Normalizes all features of a single sample to mean 0 and variance 1. This stabilizes the input distribution of each layer, accelerating convergence and improving training stability.
+
+#### Positional Encoding
+
+Self-attention computes relationships between any two tokens but contains no information about token order. For self-attention, "agent learns" and "learns agent" are equivalent. **Positional Encoding** solves this by adding a "position vector" to each token embedding.
+
+This position vector is not learned but calculated through a fixed mathematical formula using sine and cosine functions:
+
+$$
+PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)
+$$
+
+$$
+PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)
+$$
+
+Where $pos$ is the position in the sequence and $i$ is the dimension index.
+
+---
+
+### Decoder-Only Architecture
+
+The Transformer's architecture is "encoder + decoder." But later there was an increasing number of models such as GPT that only kept the decoder—the **Decoder-Only** architecture.
+
+The working mode is called **Autoregressive**:
+
+1. Give the model a starting text (e.g., "Agent is").
+2. The model predicts the next most likely word (e.g., "a").
+3. Append "a" to the input, forming "Agent is a".
+4. Predict the next word again (e.g., "powerful").
+5. Repeat until a complete sentence is generated or a stop condition is reached.
+
+How does the decoder prevent "peeking" at future words? Through **Masked Self-Attention**. After computing the attention score matrix but before Softmax, the model applies a mask that replaces scores for all future positions with a very large negative number. After Softmax, these positions become probability 0, mathematically preventing the model from attending to any information after the current position.
+
+**Advantages of Decoder-Only Architecture:**
+
+- **Unified Training Objective**: The model's only task is "predict the next word," ideal for pre-training on massive unlabeled text.
+- **Simple Structure, Easy to Scale**: Fewer components mean easier scaling. GPT-4, Llama, and other models with hundreds of billions of parameters are all based on this architecture.
+- **Naturally Suited for Generation**: The autoregressive mode perfectly matches all generative tasks—dialogue, writing, code generation—making it the foundation for building general agents.
