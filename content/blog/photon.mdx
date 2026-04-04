@@ -1,0 +1,262 @@
+---
+slug: photon-vectorized-query-engine
+title: "Photon: A Fast Query Engine for Lakehouse Systems"
+date: "2026-03-28"
+description: "Photon is a vectorized query engine written in C++ for Databricks' Lakehouse platform. It tackles the unique challenges of executing queries over raw, uncurated data while maintaining full semantic compatibility with Apache Spark."
+tags: [photon, lakehouse, query-engine, vectorized-execution, databricks, spark, columnar, simd, hash-join, adaptive-execution]
+category: system-papers
+---
+
+## Why Photon?
+
+The Lakehouse architecture promises to unify data lakes and data warehouses into a single tier: warehouse-grade governance, ACID transactions, and rich SQL support directly over open-format data in cloud object storage. This eliminates the complex ETL pipelines and data duplication of the traditional two-tier model, but it places new demands on the query execution engine.
+
+**The engine must handle two very different ends of a data spectrum:**
+
+1. **Clean, structured data** — tables designed with constraints, statistics, and multidimensional clustering and stored in popular columnar file formats like Parquet.
+
+2. **Raw, unstructured data** — sub-optimal layouts with small files, hundreds of columns, sparse or large values, no useful clustering or statistics. Strings are pervasive (even for integers and dates), schemas lack nullability annotations, and placeholder values stand in for NULLs.
+
+The existing Databricks Runtime (DBR) was built on Apache Spark's JVM-based SQL engine. While functional, it was hitting performance ceilings: CPU-bound workloads exposed JVM limitations, JIT compiler bailouts created performance cliffs on wide tables, and garbage collection struggled on large heaps. At the same time, I/O optimizations (NVMe SSD caching, auto-optimized shuffle, Delta Lake file pruning) had shifted the bottleneck squarely onto in-memory execution.
+
+Photon is Databricks' answer: a vectorized query engine written in C++ that integrates with Apache Spark's execution framework and delivers substantial speedups while maintaining full semantic compatibility with the existing Spark DataFrame API.
+
+---
+
+## Design Decisions
+
+Designing Photon required tackling two key challenges, both of which shaped every foundational decision that followed.
+
+### Challenge 1: Supporting Raw, Uncurated Data
+
+The Lakehouse environment challenges query engines with a far greater variety of data than traditional SQL warehouses. On one end of the spectrum, "clean" tabular datasets are carefully organized for read performance — schemas with constraints, statistics, and indices. On the other end, uncurated raw data may have sub-optimal layouts: small files, hundreds of columns, sparse or large values, and no useful clustering or statistics. Many users wish to query both kinds.
+
+Strings are especially prevalent in raw data, used even to represent numeric data like integers and dates. Raw data is frequently denormalized, so string columns may use placeholder values for unknown or missing values instead of NULL. Schema information such as nullability or string encoding (ASCII vs. UTF-8) is typically absent.
+
+An execution engine for the Lakehouse must therefore be flexible enough to deliver good performance on arbitrary unstructured data and excellent performance on structured data.
+
+This challenge led to two design decisions:
+
+* choosing vectorized-interpreted execution over code generation (to enable runtime adaptivity on data with no statistics)
+* implementing the engine in native C++ (to break through JVM performance ceilings on large records and wide tables).
+
+### Challenge 2: Supporting Existing Spark APIs
+
+To integrate into DataBrick's existing infrastructure, Photon needed to support Apache Spark's existing semantics. Customers run Spark workloads with a mix of SQL operators and UDFs, and SQL workloads on Databricks must experience the same semantics as Spark workloads. This meant Photon had to share resources with user-defined code (as happens in Spark) and match the behavior of Spark's existing Java-based SQL engine exactly.
+
+To address this, Photon integrates closely with the Apache Spark-based Databricks Runtime (DBR). DBR is a fork of Apache Spark that provides the same APIs but contains improvements to reliability and performance. Photon fits into DBR as a new set of physical operators that can be used for part of the query plan by DBR's query optimizer, integrating with Spark's memory manager, monitoring, and I/O systems. By integrating at the operator level, customers continue to run their workloads unmodified and obtain Photon's benefits transparently. Queries can partially run in Photon and fall back to Spark SQL for unsupported operations, while features are continuously added to reduce these transitions. Photon also plugs into features like live metrics, so queries that use Photon appear in the Spark UI just as before. Finally, Photon is rigorously tested (unit, end-to-end, and fuzz) to ensure that its semantics do not diverge from Spark SQL's, preventing unexpected behavior changes in existing workloads.
+
+---
+
+
+## Background: Databricks' Lakehouse Platform
+
+### Architecture Overview
+
+<div align="center">
+![Figure 1: DataBricks Architecture](/figures/photon-dbr-archi.png)
+</div>
+
+Databricks' Lakehouse platform consists of four main components:
+
+1. **Data Lake Storage** — Databricks decouples storage from compute, allowing customers to choose their own low-cost cloud storage provider (S3, ADLS, GCS). Customers connect Databricks to their existing datasets in cloud storage, avoiding data lock-in and expensive migrations. Data is stored in open file formats such as Apache Parquet.
+
+2. **Automatic Data Management** — A majority of Databricks customers use Delta Lake, an open-source ACID table storage layer over cloud object stores. Delta Lake enables warehouse-style features — ACID transactions, time travel, audit logging, and fast metadata operations — over tabular datasets, storing both data and metadata as Parquet. Databricks implements additional optimizations on top of the Delta Lake format, such as automatic data clustering (clustering records based on common query predicates to enable data skipping and reduce I/O) and caching.
+
+3. **Elastic Execution Layer** — The "data plane" on which all processing runs, responsible for executing both internal queries (auto data-clustering, metadata access) and customer queries (ETL, ML, SQL). This layer reads and processes exabytes of data per day and must be scalable, reliable, and performant. Photon fits here, handling single-threaded query execution on each partition of the data processed.
+
+4. **User Interface** — The layer through which customers interact with their data.
+
+### The Databricks Runtime
+
+The Databricks Runtime (DBR) is the component that handles all query execution. It provides all of Apache Spark's APIs but contains several performance and robustness improvements. Photon is positioned at the lowest level of DBR, handling single-threaded task execution within DBR's multi-threaded shared-nothing execution model.
+
+**Execution hierarchy:**
+
+* **Jobs** — applications submitted to DBR.
+* **Stages** — each job is broken into stages. A stage reads one or more files or data exchanges and ends with either a data exchange or a result. Stage boundaries are blocking (the next stage starts after the previous one ends), which enables fault tolerance and adaptive execution by replaying stages or re-planning queries at stage boundaries.
+* **Tasks** — each stage is broken into tasks that execute the same code on different partitions of data.
+
+DBR uses a single **driver node** for scheduling, query planning, and other centralized tasks. The driver manages one or more **executor nodes**, each running a multithreaded task execution process with a task scheduler and thread pool. The driver converts SQL text or a DataFrame object into a **query plan** — a tree of SQL operators (Filter, Project, Shuffle, etc.) that maps to a list of stages — and then launches tasks to execute each stage.
+
+### End-to-End Query Execution
+
+<div align="center">
+![Figure 2: Example Query](/figures/photon-example-query.png)
+</div>
+
+To illustrate how Photon fits into the system, consider a SQL query that joins a `customer` table with an `orders` table, both backed by Delta files in the user's cloud account:
+
+1. The Databricks service routes the query to a cluster's **driver node**. The driver creates a query plan, including logical optimizations (operator re-ordering) and physical planning (choosing join strategies). If the `orders` table is partitioned by date, the driver can prune partitions to avoid scanning unnecessary data. If the data is clustered, additional files can be skipped based on predicates.
+
+2. The driver converts the finalized physical plan to executable code via the Apache Spark RDD API and sends the serialized code to each **executor node**.
+
+3. The executors run this code as **tasks** on partitions of the input data. Each task fetches data from the user's cloud storage (or from a local SSD cache if the table was previously queried), then evaluates the remaining query operators using the in-memory execution engine — which is where Photon takes over.
+
+---
+
+## Photon Execution Engine
+
+Photon is implemented in C++ rather than running on the JVM. Several factors drove this decision:
+
+* **Performance ceilings in the JVM** — Squeezing more performance out of the JVM-based engine required deep knowledge of JIT internals to ensure the compiler produced optimal code (e.g., SIMD-vectorized loops). The lack of control over memory pipelining and custom SIMD kernels created a hard ceiling.
+
+* **Performance cliffs** — The existing engine used Java code generation and was constrained by JIT limits on generated method size and code cache size. When these limits were exceeded (common with 100+ column tables in the Lakehouse), the JVM fell back to a far slower Volcano-style interpreted path.
+
+* **GC pressure** — Garbage collection performance degraded seriously on heaps greater than 64 GB, a relatively small limit for modern cloud instances. This forced the JVM engine to use manually managed off-heap memory anyway, negating much of the JVM's memory management advantage.
+
+### Vectorized Interpretation over Code Generation
+
+Modern high-performance query engines follow one of two designs:
+
+* **Interpreted vectorized** (MonetDB/X100 style) — dynamic dispatch to choose code paths, but process data in batches to amortize overhead, enable SIMD, and exploit caches.
+
+* **Code-generated** (HyPer / Spark SQL style) — produce specialized code at runtime to eliminate virtual function calls entirely.
+
+Photon chose the vectorized approach for a combination of technical and practical reasons:
+
+* **Easier to develop and scale.** Code generation produces executing code at runtime, making debugging, profiling, and stack trace analysis difficult without custom instrumentation. The vectorized approach is "just C++," for which existing tooling is highly tailored.
+
+* **Better observability.** Code generation collapses and inlines operators into fused processing loops, making it hard to efficiently report per-operator metrics. Vectorized execution preserves operator boundaries while amortizing overhead via batching. Each operator maintains its own metrics — critical for debugging customer workloads where queries may not be shareable with engine developers.
+
+* **Runtime adaptivity.** In the Lakehouse, traditional constraints and statistics may be absent. Photon can discover batch-level properties at runtime and choose optimized code paths via dynamic dispatch, which is already fundamental to the vectorized model. Achieving the same adaptivity in a code-generating engine would require compiling many branches at runtime or re-compiling parts of the query dynamically. Even HyPer, the benchmark for code-generating engines, includes an interpreter to circumvent compilation costs in certain scenarios.
+
+* **Specialization is still possible.** Code generation has clear performance advantages in some scenarios: complex expression trees benefit from common sub-expression elimination, unused columns are pruned via dead-store elimination, and sparse batches are non-issues since tuples are processed without interpretation overhead. Despite this, Photon can get similar benefits by creating specialized fused operators for the most common cases. For example, the `BETWEEN` expression (`col >= left AND col <= right`) is common but would incur high interpretation overhead as a conjunction, so Photon implements a specialized fused kernel for it. The trade-off in complexity frees engineering time for these specializations, closing the performance gap in many cases.
+
+### Columnar over Row-Oriented Execution
+
+Photon defaults to a columnar in-memory data representation:
+
+* **SIMD-friendly** — values of the same type stored contiguously enable auto-vectorization and hand-coded SIMD intrinsics.
+* **Better data pipelining** — tight loops over columns exploit CPU prefetching and the memory hierarchy, and enable more efficient data serialization for exchanges and spilling.
+* **Zero-copy scans** — since Parquet is columnar, Photon avoids the expensive column-to-row pivot step at scan time.
+* **Dictionary encoding** — reduces memory usage for string and variable-length data, which is especially common in Lakehouse workloads.
+* **Efficient writes** — writing columnar data back out (e.g., for Delta Lake) is also simpler with a columnar engine.
+
+In practice, Photon does pivot to row format in specific scenarios. For example, hash table entries are stored as rows since columnar storage there would require expensive random accesses during key comparisons and probing.
+
+### Partial Rollout
+
+A final design choice was to enable partial rollout of the new engine. Photon integrates with the existing Spark SQL engine at the operator level: queries can partially run in Photon and fall back to Spark SQL for unsupported operations. This meant the new engine needed to integrate not only with the execution framework (task scheduling, memory management, etc.) but also with the existing SQL engine's data format and operator interfaces. Customers can run workloads unmodified and obtain Photon's benefits transparently, while Photon features are continuously expanded to reduce fallback transitions. This ability to partially roll out has given Databricks valuable operational experience using Photon in the field.
+
+---
+
+## Vectorized Execution in Photon
+
+### Column Vectors and Column Batches
+
+<div align="center">
+![Figure 3: Column Batch](/figures/photon-column-batch.png)
+</div>
+
+The basic unit of data in Photon is a **column vector**: a contiguous buffer of values plus a byte vector indicating NULL-ness for each value. Column vectors can also hold batch-level metadata such as string encoding (e.g., ASCII vs. UTF-8).
+
+A **column batch** is a collection of column vectors that logically represents rows. In addition to one column vector per column, a column batch contains a **position list** — the indices of rows that are "active" (not yet filtered out). Accessing a row in the column batch requires indirection through this position list.
+
+An alternative design would use a byte vector (bitmask) to mark active rows — more SIMD-friendly, but requiring iteration over all rows even in sparse batches. Photon's experiments showed that the position list approach led to better overall performance for all but the simplest queries, since loops iterate over O(active rows) instead of O(batch size).
+
+### Vectorized Execution Kernels
+
+<div align="center">
+![Figure 4: Execution Kernel](/figures/photon-example-kernel.png)
+</div>
+
+Photon's operators are built around **execution kernels**: highly optimized functions that process loops over one or more vectors. Nearly all data-plane operations — expressions, hash table probes, serialization, statistics computation — are implemented as kernels.
+
+Kernels can use hand-coded SIMD intrinsics, but often rely on compiler auto-vectorization with hints such as `RESTRICT` annotations on inputs. They are specialized for different input types using C++ templates and are invoked at the granularity of vectors, with the column batch position list passed as input.
+
+### Filters and Conditionals
+
+Filters modify the position list of a column batch. A filtering expression takes column vectors as input and returns a subset of the input position list as output. Conditional expressions like `CASE WHEN` modify the position list so only the relevant rows are "turned on" for each branch, while writing to the same output vector. Modifying inactive rows (even for SIMD purposes) is disallowed, since inactive positions may still contain valid data from other branches.
+
+### Vectorized Hash Table
+
+Photon's hash table is optimized for vectorized access. Lookups proceed in three batched steps:
+
+1. **Hashing** — a hashing kernel evaluates the hash function on a batch of keys.
+2. **Probing** — a probe kernel uses the hash values to load pointers to hash table entries (stored as rows to support composite keys).
+3. **Comparing** — entries are compared against lookup keys column-by-column; a position list is produced for non-matching rows, which continue probing via quadratic probing.
+
+Each step benefits from vectorization. Hashing and key comparison benefit from SIMD. The probe step issues random memory accesses, but because the independent loads are close together in the kernel code, the hardware can parallelize them — achieving effects similar to software prefetching but without the difficulty of manual tuning across different hardware configurations.
+
+### Memory Management
+
+Photon uses a layered memory management strategy:
+
+* **Transient column batches** — allocated from an internal buffer pool that caches allocations and uses a most-recently-used mechanism. Since query operators are fixed during execution, the number of vector allocations per input batch is constant, keeping hot memory in use.
+
+* **Variable-length data** (e.g., string buffers) — managed by an append-only pool that is freed before each new batch. Usage is tracked by a global memory tracker that could adjust batch sizes for large strings.
+
+* **Large persistent allocations** (e.g., for aggregations or joins) — tracked separately using an external memory manager. This fine-grained approach handles the large input records that are frequent in Lakehouse workloads more robustly than the Spark SQL engine.
+
+### Adaptive Execution
+
+A major challenge in the Lakehouse is the absence of statistics, metadata, or normalization guarantees on query inputs. Photon addresses this through **batch-level adaptivity**: at runtime, it builds metadata about a batch and selects the optimal execution kernel.
+
+Every kernel adapts to at least two variables:
+
+* **No NULLs in the batch** — removes branching, improving performance.
+* **No inactive rows in the batch** — avoids position list indirection, enabling SIMD.
+
+Additional per-kernel specializations include:
+
+* **ASCII-only strings** — many string expressions have an optimized path for ASCII data (vs. general UTF-8). Photon computes and stores ASCII-ness metadata per column vector and selects the appropriate kernel at runtime.
+
+* **Batch compaction** — sparse batches are selectively compacted at runtime. This is especially impactful when probing large hash tables, since dense batches can exploit memory parallelism by issuing loads in parallel, while sparse batches incur high memory latency without saturating bandwidth.
+
+---
+
+## Integration with the Databricks Runtime
+
+### Converting Spark Plans to Photon Plans
+
+<div align="center">
+![Figure 5: Plan Conversion](/figures/photon-plan-conversion.png)
+</div>
+
+Photon integrates via a new rule in Catalyst, Spark SQL's extensible optimizer. The rule walks the physical plan bottom-up starting at file scan nodes and maps each supported Spark operator to a Photon equivalent.
+
+When the rule encounters an unsupported operator, it inserts a **transition node** that converts Photon's columnar format to the row-wise format that the legacy engine expects. Plans are only converted starting from the scan node to avoid regressions from too many column-to-row pivots. An **adapter node** sits between the file scan and the first Photon node: it maps Spark's columnar scan output to Photon column batches via zero-copy pointer sharing.
+
+### Executing Photon Plans
+
+At task execution time, the Photon plan is serialized into a Protobuf message and passed via JNI to the Photon C++ library. Internally, Photon uses the same `HasNext()`/`GetNext()` pull-based interface as Spark, operating at column batch granularity.
+
+**Adapter node (leaf).** The adapter makes a C++ → Java JNI call per batch, passing native pointers. On the Java side, Spark's scan produces columnar data in off-heap memory via `OffHeapColumnVector`, which stores values as contiguous primitives — the same layout Photon expects. The adapter simply points Photon's column vectors at this off-heap memory without copying. The overhead of a JNI call is roughly 23ns, comparable to a C++ virtual function call.
+
+**Transition node (root).** The transition node pivots columnar data to rows for the legacy engine. Since Spark's scan already produces columnar data when reading columnar formats, one such pivot is required even without Photon — so adding Photon does not introduce additional pivoting overhead.
+
+### Unified Memory Management
+
+Photon and Spark share the same cluster and must have a consistent view of memory to avoid OOM kills. Photon hooks into Spark's unified memory manager, separating the concepts of **reservations** and **allocations**:
+
+* **Reservations** request memory from Spark's manager. This can trigger a **spill**, where Spark asks some memory consumer to release memory. Photon implements the memory consumer API, so Spark can ask Photon to spill on behalf of other operators (e.g., a Spark sort task), and Photon can cause other Spark operators to spill in return. This differs from engines where operators get a fixed budget and can only "self-spill."
+
+* **Allocations** are purely local to Photon after memory is reserved. Spilling operators like hash join and grouping aggregation process each input batch in two phases: a reservation phase (where spilling is handled) and an allocation phase (where transient data is produced safely).
+
+The spill policy mirrors Apache Spark's: to satisfy a request for N bytes, sort consumers from least to most allocated memory and spill the first consumer holding at least N bytes. This minimizes the number of spills and avoids spilling more data than necessary.
+
+### Managing On-Heap vs. Off-Heap Memory
+
+With Photon, most memory usage is off-heap, so the JVM's garbage collector runs infrequently. This becomes problematic when Photon relies on on-heap memory for certain operations — for example, broadcast hash join uses Spark's Java-based broadcasting mechanism, requiring a copy from off-heap to on-heap. The transient on-heap memory is not garbage collected promptly, potentially causing Java `OutOfMemoryError` for subsequent allocations. Photon solves this by adding a listener that cleans up Photon-specific state after query termination, tying lifecycle to the query rather than a GC generation.
+
+### Interaction with Other SQL Features
+
+Despite representing a plan change, Photon is compatible with many non-trivial performance features in DBR and Spark:
+
+* **Adaptive query execution (AQE)** — Photon operators export the statistics (shuffle file sizes, output row counts) that AQE uses to re-partition and re-plan at stage boundaries.
+* **Reuse optimizations** — shuffle, exchange, and subquery reuse all work with Photon.
+* **Dynamic file pruning** — critical in the Lakehouse for data skipping.
+* **Live metrics** — Photon integrates with Spark's metrics system, so queries appear in the Spark UI as before.
+
+### Ensuring Semantic Consistency
+
+Photon must produce identical results to Spark SQL, since the same expression can run in either engine depending on plan structure. Subtle differences exist between Java and C++: integer-to-floating-point casts behave differently, and time-based expressions depend on specific versions of the IANA timezone database.
+
+Photon uses three layers of testing to guard against divergence:
+
+**Unit tests.** A native C++ testing framework specifies input/output tables for SQL expressions and evaluates them across all kernel specializations (with NULLs, without NULLs, with inactive rows, etc.), verifying that inactive rows are not overwritten. Photon also runs Spark's open source expression unit tests by compiling queries for supported expressions and comparing results between engines.
+
+**End-to-end tests.** Full queries are submitted against both Spark and Photon, and results are compared. A dedicated suite tests Photon-specific behavior (OOM handling, plan transformations), and the full Spark SQL test suite runs with Photon enabled for additional coverage.
+
+**Fuzz tests.** Random queries are generated and executed against both engines. Specialized fuzzers target features with known behavioral differences — for example, Photon's decimal implementation can operate on inputs of different types for performance (Spark always casts to the output type first), and a dedicated fuzzer verifies that results match or fall within a behavior whitelist.

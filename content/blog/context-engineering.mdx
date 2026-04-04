@@ -1,0 +1,129 @@
+---
+slug: context-engineering-agent-memory
+title: "Context Engineering and Agent Memory Management"
+date: "2026-03-22"
+description: "A practical guide to context engineering for LLM agents, covering context rot, compaction, just-in-time retrieval, sub-agents, KV-cache-aware prompt design, and a layered memory architecture spanning working, episodic, semantic, and perceptual memory."
+tags: [ai, agents, llm, context-engineering, memory, rag, retrieval, agentic-systems]
+category: ai
+---
+
+## Why Context Engineering?
+
+<div align="center">
+![Context Engineering Overview](/figures/context-engineering-overview.png)
+</div>
+
+Large language models have two structural limitations at inference time. First, they are effectively **stateless**: a model call does not automatically carry forward facts, decisions, and partial results from earlier steps. Second, a model's knowledge is **frozen at training time**—it cannot natively remember user preferences, track a multi-hour task, or access the latest project-specific information unless supporting systems are built around it.
+
+**Prompt engineering** addresses part of this: role definitions, output schemas, examples, tool hints, and behavioral constraints. But an agent operates in a loop—observe input, inspect prior state, retrieve external information, call tools, generate an answer or next action, and store what matters for later. Each iteration produces candidate information that may or may not deserve to appear in the next model call. The engineering challenge is:
+
+> What is the highest-value set of tokens to place in front of the model for this exact step?
+
+That broader problem is **context engineering**—the systematic design of how context is gathered, filtered, organized, and compressed before each model call. The word *context* means every token visible at inference time: system instructions, tool schemas, conversation history, retrieved documents, memory recalls, structured notes, runtime observations, and intermediate tool outputs. Prompt engineering is a subset; context engineering manages the **entire information budget**.
+
+---
+
+## Context Rot
+
+Long-context models can accept huge prompts, but more context is not the same as better context. In real agents, each tool call appends an observation—logs, search results, file reads, command output, API responses. Over dozens or hundreds of turns, the history grows large. Even if the model can technically accept that many tokens, performance degrades earlier than the absolute limit.
+
+This phenomenon is **context rot**: as the visible context grows, the model's ability to accurately recall details, maintain focus, and reason cleanly declines. Needle-in-a-haystack benchmarks quantify the effect. Three factors drive it:
+
+1. **Attention is a limited resource.** Transformers allow each token to interact with all others, so as context grows, attention must spread across a much larger field.
+2. **Training distribution mismatch.** Models are typically trained on far more short sequences than extremely long ones, making long-range dependency handling inherently harder.
+3. **Positional precision degrades.** Techniques that extend context length improve reach but trade off some positional precision.
+
+Context is a limited resource with diminishing marginal returns. Strong agent systems aim for **high signal density**, not maximum volume.
+
+---
+
+## A Context Pipeline: Gather, Select, Structure, Compress
+
+A practical context pipeline has four stages.
+
+**Gather.** The system collects candidate information from multiple sources: system instructions, recent messages, memory hits, RAG results, notes, tool outputs, and runtime metadata. The goal is recall, not precision—a broad candidate pool.
+
+**Select.** The system scores candidates and keeps only the most useful. A straightforward relevance-plus-recency strategy is often more robust than an overengineered priority taxonomy:
+
+$$
+\text{score} = w_r \cdot \text{relevance} + w_t \cdot \text{recency}
+$$
+
+**Structure.** Selected information is arranged into a stable template:
+
+```text
+[Role & Policies]
+...
+[Task]
+...
+[Evidence]
+...
+[Context]
+...
+[Output]
+...
+```
+
+Stable structure improves debugging, evaluation, and agent consistency. A well-structured context package answers five implicit questions: *Who am I?* (role, policies, constraints), *What am I trying to do?* (the current task), *What do I already know?* (prior memory and recent state), *What evidence is relevant now?* (retrieved facts, files, search results), and *How should I respond?* (format, style, or next-action requirements).
+
+**Compress.** If the result exceeds budget, the system compresses it without destroying the skeleton—removing stale tool output, summarizing older history, truncating low-value sections, preserving only decision-relevant artifacts. The goal is to preserve the information most likely to matter in the next reasoning step.
+
+---
+
+## Context Offload
+
+<div align="center">
+![Context Offload](/figures/context-engineering-offload.png)
+</div>
+
+The context window should not be treated as the only storage medium. When a tool returns a large log, a long web page, a JSON payload, or source file contents, the naive approach is to paste the whole thing into the conversation and leave it there. That is expensive, noisy, and fragile.
+
+**Context offload** moves large artifacts out of the active prompt and into an external store—typically the file system—keeping only a compact, reversible reference in the context:
+
+- Instead of keeping an entire log inline, write it to `/tmp/build.log` and keep the path.
+- Instead of keeping a fetched page inline, keep the URL and a short summary.
+- Instead of preserving a full dataset preview, store it in a file and keep a retrieval pointer.
+
+File systems have three properties that make them effective as an **external working store** for agents: large capacity, persistence across turns, and random access when the agent needs to read only a specific part. The information is not gone—it has been removed from the high-cost part of the system (the active token budget) while remaining recoverable on demand.
+
+---
+
+## Compaction and Summarization
+
+When the prompt grows too large, blind truncation is the worst option because it is **irreversible**. If a critical error message sat near the end of a long log, or a key clue was buried in a large list, that information is permanently lost.
+
+**Compaction** is a better approach: shrink active context while preserving the ability to recover details later. In practice this means saving the full artifact to disk, replacing it in the conversation with a compact summary, and keeping a pointer so the agent can reload the original if needed. For example, after a large tool output:
+
+```text
+Full test output written to /tmp/test-run-2026-03-22.log. Read with tail/grep if needed.
+```
+
+That one sentence is dramatically cheaper than thousands of log tokens but preserves recoverability. Compaction is **reversible compression**.
+
+**Summarization** is a further fallback when even compaction is insufficient—the conversation itself is too long and there are no more large artifacts to offload. Summarization is useful but **lossy**: once precise tool output and exact message history are replaced with a summary, some information becomes fuzzier. The right ordering is: compaction first, summarization second, truncation only as a last resort when information loss is acceptable. Making summarization recoverable—by preserving the full prior transcript in external storage (e.g., a JSONL history file)—turns a lossy prompt-level operation into a recoverable system-level operation.
+
+---
+
+## Retrieval: Pre-Inference RAG vs. Just-in-Time Search
+
+Not all retrieval strategies are equivalent. **Pre-inference retrieval** (classic RAG) chunks, embeds, indexes, and retrieves documents before generation—effective for stable corpora and FAQ-like systems.
+
+Many modern coding and agentic systems rely more heavily on **just-in-time retrieval**, where the agent dynamically decides how to search: `grep` for a symbol definition, `find` candidate files, `jq` into JSON, open a specific log, read only the relevant file section, and follow the result with another targeted query. Just-in-time retrieval has several advantages:
+
+* **Stays close to the latest state.** An embedding index may lag behind reality; direct search against the live file system reflects the newest version immediately.
+* **Supports progressive exploration.** The agent can search, inspect, refine, and search again—natural for debugging and codebase navigation.
+* **Avoids overengineering early.** RAG systems require chunking strategies, embedding models, retrieval policies, reranking, and evaluation. For many agent tasks, simpler direct search works well.
+
+RAG is not obsolete—it is one retrieval tool. Just-in-time search is another. Strong agents often need both, but neither should be confused with context engineering itself.
+
+---
+
+## Context Isolation Through Sub-Agents
+
+Complex tasks often contain subproblems that generate large volumes of local exploration: searching a codebase, running tests, reading documentation, investigating logs, drafting internal reports. If the main agent performs all of this in its own context, the main context gets polluted with low-level detail.
+
+**Sub-agents** solve this by performing exploration in separate local contexts. Each sub-agent receives its own system prompt, has its own tool permissions, performs a deep exploration, and returns only a concise summary or artifact to the main agent.
+
+This produces three benefits. First, **cleaner main context**: the main agent sees only condensed results, not entire exploration traces. Second, **better specialization**: a read-only explorer agent can be optimized for search and analysis; a modifier agent can be optimized for edits. Third, **better control**: sub-agents can receive narrower permissions than the main agent, improving safety and predictability.
+
+Sub-agents are not only an orchestration pattern—they are a **context-management primitive**.

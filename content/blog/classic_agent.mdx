@@ -1,0 +1,200 @@
+---
+slug: classic-agent-designs
+title: "Classic Agent Designs: From Chain-of-Thought to Tool-Calling Agents"
+date: "2026-03-17"
+description: "A practical guide to classic LLM agent architectures, including Chain-of-Thought, ReAct, Plan-and-Execute, Reflection, router patterns, and modern tool-calling agents."
+tags: [agents, llm, react, tool-calling, planning, reflection, ai-systems, prompting]
+category: ai
+---
+
+## Why Agent Design Matters
+
+A LLM answers from its context window. An agent goes further: it decides what information is missing,
+whether to search, retrieve, calculate, or call an API, breaks complex problems into substeps,
+inspects intermediate results, revises its own output, and hands work to specialized components.
+The agent focuses on the **control flow around the model**.
+
+The architecture chosen affects latency, cost, interpretability, failure modes, reliability, debuggability, and ease of integrating external systems. In practice, most modern agent frameworks are built by combining a small set of core design patterns. A simple way to organize these patterns is to ask: **when does the system decide what to do next?**
+
+That yields several common families:
+
+1. **Reason-then-answer** (Chain-of-Thought)
+2. **Reason-act-observe loops** (ReAct)
+3. **Plan-then-execute**
+4. **Reflective / self-critique**
+5. **Tool-native agents**
+6. **Router and multi-agent systems**
+
+---
+
+## Chain-of-Thought Reasoning
+
+[Wei et al. (2022)](https://arxiv.org/abs/2201.11903) showed that prompting models with "let's
+think step by step" or providing few-shot exemplars with explicit reasoning chains dramatically
+improves performance on math, logic, and structured decomposition tasks. The key insight is that
+externalizing reasoning in the token stream gives the model a form of working memory within the
+forward pass.
+
+```text
+Question -> intermediate reasoning -> final answer
+```
+
+Chain-of-Thought works well when all required information is already in context: self-contained
+math problems, structured decomposition, multi-hop reasoning over provided passages. Its limitation
+is fundamental—it cannot access fresh information, query a database, or verify itself against the
+outside world. The model may reason fluently but still hallucinate facts.
+
+---
+
+## ReAct: Reason + Act
+
+[Yao et al. (2023)](https://arxiv.org/abs/2210.03629) introduced ReAct, recognizing that thinking and acting are complementary.
+Thinking guides action, while action results in turn correct thinking.
+
+```text
+Thought -> Action -> Observation -> Thought -> Action -> Observation -> ...
+```
+
+<div align="center">
+![ReAct Agent](/figures/agent-reAct.png)
+</div>
+
+A typical ReAct sequence looks like: (1) the model reasons that it lacks some information, (2) it takes an action such as search or retrieval, (3) it receives an observation, (4) it updates its reasoning, (5) it either acts again or finishes. Earlier patterns leaned too far in one direction—pure reasoning was good at decomposition but poor at grounding; pure action pipelines could execute steps but were brittle and unguided. ReAct showed that reasoning and acting should form a loop.
+
+```python
+history = []
+
+while True:
+    thought = model(reason_over=history)
+    action = model(select_action_from=thought)
+
+    if action == "finish":
+        return model(final_answer_from=history)
+
+    observation = execute(action)
+    history.append((thought, action, observation))
+```
+
+ReAct is effective for open-ended research, retrieval-heavy question answering, debugging, and settings where interpretability matters. Its weaknesses are practical: the original implementation relied on fragile prompt formatting where actions are expressed as free-form text strings that must be parsed, validated, and mapped to real functions. Repeated loops can be slow, and models can get stuck in overthinking or unnecessary actions.
+
+ReAct remains deeply influential because it introduced the core principle that an agent should **interleave cognition and interaction**—a principle that survives in every modern agent architecture.
+
+---
+
+## Plan-and-Execute
+
+ReAct iteratively decides the next step based on the current state. Plan-and-Execute separates the workflow into two phases:
+
+```text
+Goal -> Plan -> Execute step 1 -> Execute step 2 -> ... -> Final result
+```
+
+<div align="center">
+![Plan-and-Execute Agent](/figures/agent-plan-and-execute.png)
+</div>
+
+A planner generates a high-level strategy, and an executor carries out each step. This provides better global coherence, makes progress easier to monitor, and simplifies recovery from partial failures. The cost is rigidity: the initial plan may be wrong or incomplete, and execution may drift from the plan as new information surfaces.
+
+Modern systems often use a hybrid with replanning:
+
+```text
+Plan -> Execute -> Re-evaluate -> Update plan -> Continue
+```
+
+[Wang et al. (2023)](https://arxiv.org/abs/2305.04091) formalized this in LLM+P and related work, showing that separating strategic reasoning from execution improves performance on multi-step tasks. This hybrid preserves global structure without becoming too rigid—the plan provides scaffolding while the executor retains the ability to adapt.
+
+---
+
+## Reflection
+
+In ReAct and Plan-and-Solve, once the agent completes a task, its workflow ends. However, the
+initial answers they generate, whether action trajectories or final results, may contain errors
+or have room for improvement.
+
+Another important pattern adds an extra pass where the model critiques or revises its own work:
+
+```text
+Draft -> Critique -> Revision -> Final answer
+```
+
+<div align="center">
+![Reflection Agent](/figures/agent-reflection.png)
+</div>
+
+LLMs often produce answers that are plausible but flawed. Reflection introduces a second verification stage.
+[Shinn et al. (2023)](https://arxiv.org/abs/2303.11366) formalized this in **Reflexion**, showing that self-critique paired with external feedback signals significantly improves quality on coding, writing, and analysis tasks.
+
+Reflection becomes much stronger when the system can check itself against an external signal—compiler errors, test failures, retrieval evidence, calculator results, schema validation errors. Without such feedback, reflection can easily become a fancy way to guess again: a weak critic does not help, and the model may rationalize mistakes instead of fixing them. The practical pattern that works well is a coding agent that writes a solution, runs tests, inspects failures, reflects on the error, patches the code, and reruns tests—reflection paired with external verification.
+
+---
+
+## Tool-Calling Agents
+
+Tool-calling agents are the most important modern extension of the earlier patterns. Instead of expressing actions in free-form text, the model emits a **structured tool invocation**:
+
+```json
+{
+  "tool": "search_docs",
+  "arguments": {
+    "query": "latest revenue recognition policy"
+  }
+}
+```
+
+The runtime executes the tool, returns the output, and the model continues. Compare this with classic ReAct:
+
+```text
+Thought: I should search for the policy.
+Action: Search["latest revenue recognition policy"]
+Observation: ...
+```
+
+The ReAct version is readable but brittle—someone has to parse the action string, validate it, map it to a real function, and handle errors. Tool-calling systems replace informal textual actions with structured invocations that are safer to validate, integrate better with APIs and internal services, support easier retries and error handling, reduce ambiguity through schema-based interfaces, and provide clearer separation between model decisions and system execution.
+
+```python
+messages = [user_request]
+
+while True:
+    response = model(messages, tools=tool_schemas)
+
+    if response.type == "tool_call":
+        result = execute_tool(response.name, response.arguments)
+        messages.append(response)
+        messages.append({"role": "tool", "content": result})
+    else:
+        return response
+```
+
+Tool calling does **not** eliminate reasoning—it changes how actions are represented. In many modern systems, reasoning is internal or partially hidden while the action portion becomes structured and machine-readable. Tool-calling agents are often **ReAct with better interfaces**: the industry moved from free-form textual action descriptions to structured, validated, machine-executable actions. That is an implementation improvement, not a conceptual replacement.
+
+Tool-calling agents excel in production systems, API integrations, enterprise workflows, database and search access, code execution, and environments requiring guardrails and observability. Their failure modes are familiar: poor tool selection, incorrect arguments, repeated unnecessary tool calls, over-reliance on tools when the answer is already known, and brittle tool definitions. Tool calling solves the interface problem, not the intelligence problem.
+
+---
+
+## Router-Based Agents
+
+Not every task should go to one general-purpose agent. A **router** chooses which specialized component handles the request:
+
+```text
+User request -> Router -> Specialist -> Result
+```
+
+<div align="center">
+![Router Agent](/figures/agent-router.png)
+</div>
+
+A router might dispatch among a search agent, coding agent, calendar agent, retrieval QA agent, math toolchain, or policy compliance agent. Different tasks have different optimal workflows. Instead of forcing one large agent to do everything—accumulating tool confusion and failure modes—the system sends each task to a specialized path with domain-specific guardrails.
+
+Routing improves modularity, makes systems easier to scale, and allows specialists to be evaluated independently. The risk is that routing mistakes send tasks down the wrong path, and coordination overhead increases with the number of specialists. In production, routing is often more reliable than one monolithic agent with access to every tool.
+
+---
+
+## Multi-Agent Systems
+
+<div align="center">
+![Multi-Agent System](/figures/agent-multi-agent.webp)
+</div>
+
+If routing chooses one specialist, **multi-agent systems** allow multiple specialists to collaborate. A planner creates subtasks, a researcher gathers evidence, a writer drafts output, a critic reviews the draft, and an executor calls tools. This mirrors how humans divide labor: different roles encourage better decomposition and clearer responsibilities.
+
+The costs are significant—much more latency, much more cost, and agents can amplify each other's mistakes. Orchestration becomes the real challenge. Many tasks that seem to call for multiple agents are better served by a single well-designed tool-calling agent. Multi-agent design is most useful when specialization is real, not decorative: when different task classes genuinely need different workflows, models, or guardrails.
