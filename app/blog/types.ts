@@ -3,6 +3,7 @@ export const BLOG_CATEGORIES = [
   { value: "all", label: "All Posts" },
   { value: "system-papers", label: "System" },
   { value: "ai", label: "AI" },
+  { value: "maths", label: "Maths" },
 ] as const;
 
 export type BlogCategory = typeof BLOG_CATEGORIES[number]["value"];

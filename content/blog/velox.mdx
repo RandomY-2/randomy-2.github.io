@@ -1,0 +1,223 @@
+---
+slug: velox-database-acceleration-library
+title: "Velox: An Open Source Unified Execution Engine"
+date: "2026-04-12"
+description: "Velox is Meta's open source C++ database acceleration library that provides reusable, extensible, and high-performance data processing components. Rather than building yet another siloed engine, Velox extracts the common execution layer shared across data systems into a single library."
+tags: [velox, meta, query-engine, vectorized-execution, columnar, simd, expression-eval, hash-join, memory-management, c++]
+category: system-papers
+---
+
+## Why Velox?
+
+The modern data landscape is fragmented. Organizations run a growing collection of specialized computation engines — batch processing, interactive SQL, stream processing, ML preprocessing — each targeting a specific workload. Although these engines differ meaningfully in their language frontends (SQL, DataFrames, DSLs), optimizers, and distributed runtimes, their core execution layers are remarkably similar. Every engine needs a type system, a columnar in-memory representation, expression evaluation, operators (joins, aggregations, sorts), serialization, and resource management.
+
+**The problem with this duplication is threefold:**
+
+1. **Efficiency** — runtime optimizations (SIMD, lazy evaluation, adaptive predicate reordering, encoding-aware evaluation) are developed in isolation. Each engine reinvents the wheel, and most never implement the full set.
+
+2. **Inconsistency** — users working across engines encounter different behavior for the same data types and functions. The same `upper()` or `date_trunc()` call may produce different results depending on which engine executes it.
+
+3. **Engineering cost** — every optimization, bug fix, and new feature must be implemented and maintained separately in each engine.
+
+Velox is an open source C++ database acceleration library that provides reusable, extensible, high-performance data processing components. Rather than being a standalone query engine, Velox sits on the **data plane** — it takes a fully optimized query plan as input and executes it locally using available resources. It does not provide a SQL parser, a DataFrame layer, or a global query optimizer. Individual engines remain responsible for the **control plane** (language frontend, optimization, task distribution) and plug Velox in as their execution backend.
+
+The value proposition: optimizations developed once in Velox benefit every engine that adopts it; consistent function packages eliminate behavioral divergence; and engineering effort shifts from reimplementation to shared improvement.
+
+---
+
+## Library Overview
+
+Velox is modular by design. Its high-level components are:
+
+* **Type** — a generic type system for scalar, complex, and nested data types (structs, maps, arrays, tensors, etc.), with extensibility for engine-specific types.
+
+* **Vector** — an Arrow-compatible columnar memory layout supporting multiple encodings (flat, dictionary, constant, sequence/RLE, bias/frame-of-reference), lazy materialization, and out-of-order writes.
+
+* **Expression Eval** — a fully vectorized expression evaluation engine with common subexpression elimination, constant folding, encoding-aware evaluation, and dictionary memoization.
+
+* **Functions** — APIs for building custom scalar functions (both simple row-by-row and vectorized batch-by-batch interfaces) and aggregate functions. Pre-built function packages for Presto and Spark dialects are included.
+
+* **Operators** — implementations of common operators: TableScan, Project, Filter, Aggregation, Exchange/Merge, OrderBy, HashJoin, MergeJoin, Unnest, and more.
+
+* **I/O** — a generic connector interface with pluggable format encoders/decoders (ORC, Parquet) and storage adapters (S3, HDFS).
+
+* **Serializers** — a serialization interface for network communication, supporting PrestoPage and Spark's UnsafeRow wire protocols.
+
+* **Resource Management** — memory arenas, buffer management, task/driver/thread pool primitives, spilling, and caching.
+
+---
+
+## Vectors and Memory Layout
+
+### Columnar Representation
+
+Velox Vectors represent columnar datasets in memory and serve as input/output to most components. The basic layout extends Apache Arrow: a `size` variable (number of rows), a data type, and an optional nullability bitmap. Vectors support both fixed-size elements (integers, floats) and variable-size elements (strings, arrays, maps, structs), with arbitrary nesting.
+
+All data is stored in Velox Buffers — contiguous memory chunks allocated from a pool. Buffers are reference-counted and support copy-on-write: a single Buffer can be shared by multiple Vectors, but only singly-referenced data is mutable.
+
+Vectors can leverage multiple encoding formats — flat, dictionary, constant, sequence/RLE, and bias (frame of reference) — though the component producing a Vector is responsible for choosing the encoding.
+
+### Lazy Vectors
+
+**Lazy Vectors** are only populated upon first use. This is particularly valuable for cardinality-reducing operations (joins, conditionals in projections): depending on selectivity, materialization can be scoped to only the surviving rows, or avoided entirely. When reading from remote storage (S3, HDFS), lazy vectors can optimize away entire I/O operations for sparsely accessed columns. They also support running a callback over loaded data, enabling computation pushdown (e.g., aggregations) without materializing an intermediate Vector.
+
+### Divergences from Apache Arrow
+
+Although compatible with Apache Arrow, Velox deliberately extends the format in three areas:
+
+**Strings.** Arrow uses the traditional variable-size layout (contents buffer + offsets/lengths buffer). Velox uses a **StringView** representation: 16 bytes of metadata per string element, plus a separate data buffer.
+
+```cpp
+struct StringView {
+    uint32_t size_;
+    char prefix_[4];
+    union {
+        char inlined[8];
+        const char* data;
+    } value_;
+};
+```
+
+The 4-byte prefix is always stored inline, short-circuiting failed comparisons in operations like filtering and sorting. Strings up to 12 bytes are fully inlined, requiring no access to the secondary buffer. Operations like `trim()` and `substr()` can execute zero-copy by updating only the metadata pointers.
+
+**Out-of-order writes.** To efficiently support conditionals (`IF`, `SWITCH`), Velox supports out-of-order writes to output vectors. The condition is first evaluated to produce a bitmask, then each branch writes results to the single output vector at arbitrary positions. Primitive types and strings (fixed 16-byte metadata) naturally support this. For variable-size types (arrays, maps), Velox maintains both lengths and offsets buffers, allowing elements to be sliced and rearranged without copying.
+
+**Additional encodings.** Velox adds constant encoding (all values identical — useful for literals and partition keys) and RLE encoding, both common in data warehouse workloads.
+
+---
+
+## Expression Evaluation
+
+Velox provides a vectorized expression evaluation engine that serves multiple roles: it powers the FilterProject operator, enables consistent predicate pushdown in TableScan and I/O connectors, and can be used standalone for engines that only need expression evaluation (real-time infrastructure, ML preprocessing).
+
+### Compilation
+
+Expression evaluation takes expression trees as input (column references, constants, function calls, CASTs, lambdas). The compilation step transforms these into an executable form, applying several optimizations:
+
+**Common Subexpression Elimination (CSE).** Identical subexpressions are identified and computed only once. For example, in `strpos(upper(a), 'FOO') > 0 OR strpos(upper(a), 'BAR') > 0`, the subexpression `upper(a)` is shared. The FilterProject operator benefits further by creating a single compiled expression for all filter and project expressions, allowing subexpressions to be shared across them.
+
+**Constant Folding.** Deterministic subexpressions independent of input columns are evaluated at compile time. For example, `upper(a) = upper('FOO')` becomes `upper(a) = 'FOO'`.
+
+**Adaptive Conjunct Reordering.** For `AND`/`OR` expressions, the engine dynamically tracks per-conjunct performance and evaluates the most effective conjunct first — the one that drops the most values in the least time. Adjacent `AND`/`OR` nodes are flattened during compilation (e.g., `AND(AND(AND(a, b), c), AND(d, e))` becomes `AND(a, b, c, d, e)`) to maximize reordering flexibility.
+
+### Evaluation
+
+Evaluation performs a recursive descent of the compiled expression tree, passing down a row mask of active elements. Computation is skipped in two cases: the node is a common subexpression whose result was already computed, or the expression propagates nulls and any input is null (implemented efficiently by combining nullability bitmasks with SIMD).
+
+### Peeling (Dictionary Optimization)
+
+When inputs are dictionary-encoded, deterministic expressions can be evaluated on just the **distinct values**. Velox validates that all input columns share the same dictionary wrappings, peels them off to extract the inner vectors, evaluates the expression on these (much smaller) vectors, and wraps the results back using the original indices.
+
+For example, a 1,000-row color column encoded as a dictionary with 3 values (red, green, blue) evaluates `upper(color)` on only 3 values instead of 1,000, then wraps the result with the original indices.
+
+### Memoization
+
+When processing multiple batches from a TableScan, dictionary-encoded columns often reference the same base vector across batches (same distinct values, different indices). Velox remembers computed results over the underlying inner vector and reuses them for subsequent batches — only the index remapping changes.
+
+### Code Generation
+
+Velox also provides experimental support for code generation. At execution time, the entire expression tree is rewritten as a C++ function, compiled into a shared library using gcc/clang, and dynamically linked. Compilation times are high (up to 10s), so this path targets large ETL queries (hours to days) or fixed expression trees, not interactive workloads.
+
+---
+
+## Functions
+
+### Scalar Functions: Vectorized and Simple APIs
+
+Scalar functions take values from a single row and produce a single output row. The **vectorized API** operates batch-by-batch over Vectors, enabling functions to leverage the columnar layout directly. For example, `is_null()` can return the internal nullability buffer in constant time, `cardinality()` reads the internal lengths buffer, and `map_keys()` returns the keys buffer of a MapVector.
+
+However, the vectorized API requires manual iteration, null handling, encoding awareness, and buffer management — too cumbersome and error-prone for the growing number of function authors. Velox therefore also provides a **simple function API** that hides engine internals while preserving performance:
+
+```cpp
+class MultiplyFunction {
+    void call(
+        int64_t& result,
+        const int64_t& a,
+        const int64_t& b) {
+        result = a * b;
+    }
+};
+```
+
+The framework uses C++ template metaprogramming to apply the row-level function across batches without per-row dispatch overhead. Logic within the execution loop is inlined, allowing compilers to auto-vectorize — major compilers (clang, gcc) generate SIMD code for arithmetic functions like the one above automatically.
+
+Non-primitive types (strings, arrays, maps, structs) use **proxy objects** that operate directly over the underlying Vectors without materializing or copying into temporary objects like `std::string` or `std::vector`.
+
+**ASCII specialization.** String functions often incur overhead for UTF-8 handling. The simple function API allows developers to provide a `callAscii()` variant that is automatically invoked when all string inputs are ASCII-only — a common case in Meta's data warehouse. Functions can also declare their ASCII behavior, letting the evaluation engine skip ASCII detection on their outputs.
+
+### Aggregate Functions
+
+Aggregates summarize multiple rows per group into a single output row. Velox supports four aggregation steps:
+
+1. **Partial** — raw input → intermediate results
+2. **Final** — intermediate results → final result
+3. **Single** — used when data is already partitioned on grouping keys (no shuffle needed)
+4. **Intermediate** — combines partial results (e.g., from parallel threads) before final aggregation
+
+Accumulators are classified as fixed-size (e.g., `count()` — stored inline in the row) or variable-size (e.g., `distinct()` — stored in a separate buffer with a pointer in the row).
+
+---
+
+## Operators and Execution Model
+
+### Task, Pipeline, Driver
+
+Velox query plans are trees of PlanNodes. To execute, plan nodes are converted into Operators (mostly one-to-one, with exceptions: Filter + Project merge into a single FilterProject operator, and multi-child nodes like HashJoin split into HashProbe and HashBuild).
+
+The execution hierarchy:
+
+* **Task** — the unit of distributed function shipping. Corresponds to a query plan fragment, starting with a TableScan or Exchange and ending with another Exchange.
+* **Pipeline** — a Task's operator tree is decomposed into linear sub-trees (e.g., HashProbe and HashBuild each get their own Pipeline).
+* **Driver** — each Pipeline has one or more Drivers (threads of execution), each with its own state. Drivers can go on/off-thread depending on whether they have work: a consumer hasn't consumed data yet, a source exchange hasn't produced data, or a scan is waiting for files.
+
+This model is more convenient than the traditional Volcano iterator tree for going on/off-thread, since state is resumable without constructing control flow on the stack. Tasks can be canceled or paused at any time for priority enforcement, checkpointing, spill coordination, or other activities.
+
+### Table Scan, Filter, and Project
+
+Table scans process data column-by-column with filter pushdown. Columns containing filters are processed first, producing row numbers for hits. Filters are adaptively reordered at runtime — the filter that drops the most values in the least time is evaluated first.
+
+Simple filters are evaluated multiple values at a time using SIMD, processing roughly one integer hit per CPU clock on AVX2. For dictionary-encoded data, filter results are cached, and SIMD is used for cache-hit checks (gather + compare + mask lookup + permute), achieving more than one hit per clock on average. Large IN filters (used for hash join pushdown) trigger 4 cache misses at a time to maximize memory parallelism.
+
+The FilterProject operator uses a single expression evaluation context for all filter and project expressions. For each input batch, the filter is evaluated first on all rows; project expressions run only on surviving rows. If no rows pass, project evaluation is skipped entirely.
+
+### Aggregation and Hash Joins
+
+Velox provides a unified hash table implementation for both aggregation and hash joins, sharing the same adaptivity logic. Hashing keys are processed column-by-column via **VectorHasher**, which recognizes key ranges and cardinality:
+
+1. If all keys map to a small number of integers → direct flat array lookup
+2. If multiple keys can be combined into a single 64-bit normalized key → use as a single hash table key or flat array index depending on range
+3. A multipart hash key is only used if neither optimization applies
+
+The optimal layout is decided adaptively and can change as new batches arrive. Since VectorHashers form a digest of distinct values per key, they can also be pushed down to TableScans as efficient IN filters when scans and joins are co-located.
+
+---
+
+## Memory Management
+
+### Hierarchical Memory Pools
+
+Velox Tasks track memory via hierarchical memory pools. Small objects (query plans, expression trees) use the C++ heap directly. Larger objects (cache entries, hash tables, buffers) use a custom allocator offering zero fragmentation for large objects via `mmap`/`madvise`. All pool allocations are tracked hierarchically and subject to limit enforcement. Consumers can reserve memory to guarantee budget for completing a specific operation.
+
+### Spilling and Recovery
+
+When allocations fail, consumers can provide recovery mechanisms such as spilling. To support this, consumers may be **asynchronously paused**: the consumer goes off-thread and returns a continuation future that the engine uses to resume execution later. While paused, a task may be instructed to spill to secondary storage or be canceled to make space, depending on prioritization policies.
+
+The default behavior for exceeding memory limits invokes a process-wide **memory arbiter** with visibility over all running tasks, their usage, and reclaimable memory. The spill/cancel decision logic is pluggable — engine developers can implement their own policies. Operators that support spilling implement an interface communicating how much memory could be released; operators without this interface must either proceed without the additional allocation or fail. Operators can also monitor overall memory pressure and react adaptively (e.g., the Exchange operator reduces its buffer size when memory is scarce).
+
+### Caching
+
+For disaggregated storage architectures, Velox provides both memory and SSD caching. Memory cache acts as a special user that can consume all otherwise-unallocated memory. Unlike OS page caches, Velox cache allocations have arbitrary sizes matching the underlying columnar layout, mixed without fragmentation via `mmap`/`madvise`.
+
+Cached columns are first read from remote storage (S3, HDFS), held in RAM, and eventually persisted to local SSD. I/O reads for nearby columns are coalesced if the gap is small enough (~20KB for SSD, ~500KB for remote storage), exploiting temporal locality so correlated columns are cached together.
+
+Velox tracks per-query column access frequencies and **adaptively schedules prefetches** for hot columns, interleaving I/O stalls with CPU processing. The combination of memory caching and smart prefetching makes many interactive SQL workloads effectively served from memory, since I/O stalls are taken off the critical path.
+
+---
+
+## Closing Thoughts
+
+Velox represents a bet that the execution layer of data systems is a **commodity** — that the differences between engines live in the control plane (language, optimization, scheduling), not the data plane (type systems, expression evaluation, operators, memory management).
+This bet is increasingly validated by the broader industry trajectory. Customers are moving their data into open formats like Apache Iceberg and demanding engines that execute *on top of* their data rather than ingesting it into proprietary storage.
+The storage layer is becoming a shared, vendor-neutral substrate, and the execution layer is following: projects like Velox on the engine side and Iceberg/Delta Lake on the storage side are commoditizing the data plane, making it interchangeable across systems.
+In this world, the lasting differentiators shift to the control plane — data governance, access control, lineage, cross-engine sharing, catalog services, and the quality of the optimizer.
+The system that wins is not necessarily the one with the fastest hash join, but the one that makes it easiest to discover, trust, and share data across an organization.
