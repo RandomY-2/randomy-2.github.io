@@ -1,0 +1,168 @@
+---
+slug: lance-columnar-storage-random-access
+title: "Lance: Columnar Storage for Random Access"
+date: "2026-04-18"
+description: "Lance is a columnar storage format designed for workloads that demand both high-throughput sequential scans and low-latency random access. By rethinking how a column's structural information is encoded on disk, Lance achieves consistent random access performance on NVMe storage regardless of data type complexity."
+tags: [lance, columnar-storage, random-access, nvme, parquet, arrow, structural-encoding, search, vector-embeddings, iops]
+category: [system-papers, ai]
+---
+
+## The Problem: Random Access on Columnar Storage
+
+Columnar storage systems were built for full-scan analytics: read every row in a column, compress aggressively, and push data through vectorized pipelines. This model works well for training ML models, computing features, and running OLAP queries. But  fetching small, scattered subsets of rows that are not aligned along any clustered index isn't performant historically on columnar storage.
+
+Cloud object stores like S3 make the problem worse. S3 is generally limited to tens of thousands of IOPS and does not benefit from reads smaller than roughly 100KB. NVMe-based storage, by contrast, can sustain hundreds of thousands of IOPS at a granularity of 4KiB disk sectors. This gap has driven the adoption of NVMe caching layers (WekaFS, JuiceFS) and low-latency cloud storage (S3 Express) in front of data lakes.
+
+The question then becomes: can we design a columnar format that actually saturates an NVMe device on random access workloads, while still delivering competitive full-scan performance? The Lance paper argues that the answer is yes — and the key insight is that the bottleneck lies in how a column's *structural* information (repetition levels, validity bitmaps, offsets) is encoded and laid out on disk.
+
+---
+
+## Columnar Storage Anatomy
+
+### File-Level Organization
+
+<div align="center">
+![Figure 1: Columnar File Formats](/figures/lance-file-format.png)
+</div>
+
+A columnar file is organized into a few nested layers:
+
+* **Row group** — a horizontal slice of the table. In Parquet, data is first partitioned by rows into large row groups. Within a row group, every column must have exactly the same number of rows. This design makes parallel full scans straightforward: each row group can be processed independently. Arrow's equivalent is the *record batch*. Lance abandons the row group concept entirely. Instead, it treats each column as an independent data stream. The unit of partitioning is a physically-sized *page*: as data is written to a column, a new page is flushed to disk whenever the accumulated data reaches this threshold. Because pages are sized by bytes rather than row counts, different columns in the same file can have different numbers of pages, and each page can have different number of rows for different data type of columns.
+
+* **Column chunk** — the contiguous on-disk storage for a single column within a row group. Row groups and column chunks matter for full-scan throughput (sequential I/O) but are not the primary lever for random access. In Parquet, each column has one chunk per row group. In Lance, the concept is a *page*.
+
+* **Page** — a smaller division within a column chunk. In Parquet, pages improve compression effectiveness and carry per-page metadata (statistics, bloom filters). Arrow IPC has no equivalent. Pages are a crucial factor in random access because they control *read amplification*: the amount of extra data you must read to retrieve a single value.
+
+### Compression Taxonomy
+
+Compression techniques divide into two categories that have direct consequences for random access:
+
+* **Transparent** encodings compress values without creating dependencies between them. A single value can be extracted if you know its location and length. Examples: bit packing, FSST, dictionary encoding.
+
+* **Opaque** encodings introduce inter-value dependencies, meaning you must decompress a neighborhood to access a single value. Examples: Snappy, Parquet's delta-length byte array encoding. An opaque encoding can sometimes be applied transparently — for instance, applying LZ4 on a per-value basis so each value is an independent frame.
+
+A related distinction is **sparse** versus **dense** encoding of nulls. Sparse encoding omits null values entirely, relying on a separate validity structure to restore them. Dense encoding uses filler bytes for nulls, preserving fixed-width random access at the cost of space.
+
+---
+
+## Columnar Encoding Strategies
+
+The paper identifies two stages of columnar encoding. **Structural encoding** (also called *shredding*) converts a potentially nested array into one or more leaf nodes, each containing primitive buffers. **Compressive encoding** then compresses each buffer individually. Structural encoding determines the number of I/O operations, the scheduling dependencies between them, and the overall read amplification. It is where the design space has the most impact on random access.
+
+### Parquet's Approach
+
+<div align="center">
+![Figure 2: Parquet Encoding](/figures/lance-parquet-encoding.png)
+</div>
+
+Parquet converts a nested array into flattened leaf columns, each containing a list of values (nulls removed), a buffer of repetition levels, and a buffer of definition levels. These are divided into opaque pages. A **page offset index** maps each page to the first row it contains, enabling binary search to find the right page for a given row.
+
+This scheme requires only a single IOP per page per value, and read amplification is bounded by page size. The approach is effective — when pages are small, Parquet can do efficient random access. But there are two problems:
+
+1. **CPU cost of decompression.** Parquet's aggressive compression (often opaque) keeps the CPU busy, which makes it difficult to keep the NVMe disk queue full. Random access throughput depends on maintaining a deep queue of outstanding I/O requests.
+
+2. **Search cache size for large data types.** Each page in the offset index costs roughly 20 bytes in memory. For large values like vector embeddings where each page holds a single value, a billion-row column would need 20 GiB of search cache just for the index.
+
+### Arrow's Approach
+
+<div align="center">
+![Figure 3: Arrow Encoding](/figures/lance-arrow-encoding.png)
+</div>
+
+Arrow also flattens nested data into leaf columns, but takes a fundamentally different path. Null values are stored as dense *garbage bytes* (preserving fixed-width layout). Repetition and definition levels are replaced by explicit offset arrays for each list layer and validity bitmaps for each nullable layer. There are no pages and no chunking — compression, if any, covers the entire column chunk.
+
+This is ideal for in-memory random access: no read amplification, no CPU decode cost, no search cache needed. However, on disk, the multiple buffers per column become a serious liability. Consider a `List<String>` column with nulls at each layer:
+
+1. Read the list validity bitmap and list offsets.
+2. Read the string validity bitmap and string offsets.
+3. Read the string data.
+
+That is **5 IOPS in 3 sequential phases** for a single value. These IOPS target different buffer locations and are unlikely to coalesce unless the row group is tiny — but tiny row groups destroy full-scan performance. The fundamental issue is that Arrow's structural encoding scatters related information across too many buffers.
+
+---
+
+## Lance's Structural Encoding
+
+Lance's encoding was designed to achieve the following goals:
+
+* At most **1 IOP** for random access to a fixed-width column.
+* At most **2 IOPS** for random access to a variable-width column.
+* Performance must be **consistent** regardless of nesting depth, data type size, or compression used.
+* Full-scan performance should remain **comparable to Parquet**.
+
+The core idea is to *zip* the various buffers that constitute a column into a unified layout, eliminating the multi-phase I/O scheduling that plagues Arrow. Lance provides two structural encodings: **full zip** for large data types and **miniblock** for small data types. Both use repetition and definition levels (constructed similarly to Parquet) but lay them out differently on disk.
+
+### Full Zip Encoding
+
+<div align="center">
+![Figure 4: Full Zip Encoding](/figures/lance-full-zip.png)
+</div>
+
+In the full zip encoding, the repetition levels, definition levels, and all data buffers for a leaf column are interleaved into a single contiguous buffer. Every value is preceded by a **control word** — a 1–4 byte bit-packed combination of its repetition and definition levels.
+
+**Control words.** Repetition and definition levels are bit-packed into a fixed-width control word. The width is consistent throughout the column chunk (no chunking or run-length encoding at this level). For example, a `Struct<List<String>>` needs 3 bits for definition and 1 bit for repetition, yielding a 1-byte control word. It is rare for a control word to exceed 1 byte. Control words are not bit-packed below byte boundaries — the marginal compression (less than 1.01x for data types of at least 128 bytes) is not worth introducing non-byte-aligned values.
+
+**Data layout.** For variable-width types, offset buffers are converted into length prefixes placed before each value. Lengths are bit-packed to the nearest byte boundary (at most 8 bytes). For fixed-width types, zipping is trivial since the data is already a single buffer — the control word is simply prepended.
+
+<div align="center">
+![Figure 5: Full Zip Example](/figures/lance-full-zip-example.png)
+</div>
+
+Figure 6 illustrates this with a concrete example encoding a `Struct<List<String>>` column. The control word must capture both *where we are* in the repetition structure and *what happened* at each level of nesting.
+
+The definition level needs to distinguish five states: valid string (`000`), null string (`001`), empty list (`010`), null list (`011`), and null struct (`100`). Five states require 3 bits. The repetition level has only one repeated layer (the `List`), so a single bit suffices: 1 for "start a new list," 0 for "continue the current list." The resulting control word is 1 byte, with the low 3 bits carrying definition and the next bit carrying repetition.
+
+Reading the encoded stream top to bottom, the first byte `0b....1000` signals a new list with a valid string. The next bytes give the length (2) and the data (`AB`), beginning the first list as `["AB"`. The second control word `0b....0000` continues the same list with another valid string of length 1 (`C`), completing `["AB", "C"]`. The third control word `0b....1011` starts a new list position but its definition level says the list itself is null — no data follows. Similarly, `0b....1100` encodes a null struct, `0b....1001` encodes a singleton list containing a null element (`[NULL]`), and `0b....1010` encodes an empty list (`[]`). In each case, the control word alone determines how many (if any) subsequent data bytes belong to the value.
+
+**Compression.** Values are compressed *before* zipping. This preserves the benefits of columnar compression: for instance, strings can be FSST-compressed and their lengths bit-packed, with the FSST symbol table stored in page metadata. The requirement is that all compressive encodings must be **transparent** — each value must be independently locatable and decompressible.
+
+**Null handling.** For fixed-width types, nulls cannot be sparsely encoded. A null value still occupies a full-width slot (filled with garbage) after its control word, which preserves the ability to compute a byte offset from a row index. For variable-width types, nulls are just a control word with no following data, so they're essentially free.
+
+<div align="center">
+![Figure 6: Repetition Index](/figures/lance-repetition-index.png)
+</div>
+
+**Repetition index.** Variable-width zipped data cannot be randomly accessed by row index alone, since values have different sizes. The **repetition index** solves this: a single bit-packed array of buffer offsets, stored *before* the zipped buffer. To read a single value, we look up its byte offset in the repetition index and then read the value — **2 IOPS**, issued in sequence. To read a range, we can either read a contiguous slice of the repetition index (1 IOP) or read the start and end positions in parallel (2 IOPS). The repetition index is **never read during a full scan**, so it has zero impact on sequential throughput — it only costs marginal storage.
+
+**Run-length encoding.** Full zip data can also use RLE. In this case, the repetition index stores three numbers per value: buffer offset, size, and run offset. This still allows 2-IOP random access to RLE-compressed columns.
+
+### Miniblock Encoding
+
+<div align="center">
+![Figure 7: Miniblock Encoding](/figures/lance-miniblock.png)
+</div>
+
+The miniblock encoding is designed for **small data types** where the overhead of zipping is not justified. Instead of interleaving, the array is divided into small chunks (miniblocks) targeting 1–2 disk sectors (4–8 KiB) of compressed data. Each chunk contains its own buffers of repetition levels, definition levels, and data — similar to Parquet's pages.
+
+Because the buffers within a miniblock are not transposed, encoding and decoding are vectorized and more efficient. Nulls can be sparsely encoded, and opaque compression algorithms are permitted. The trade-off is read amplification: retrieving a single value requires decoding an entire miniblock.
+
+**Chunk sizing.** Each chunk must have a power-of-two number of items, padded to be 8-byte aligned. The metadata for a chunk is just 2 bytes: 12 bits for the chunk size in 8-byte words, 4 bits for log2 of the value count. Chunks are capped at 4096 values, keeping the search cache small and read amplification bounded (at most 32 KiB, usually closer to 4–8 KiB).
+
+**Chunk structure.** Each chunk has a brief header recording the number of buffers and their sizes, followed by 8-byte-aligned buffer data. This minimal metadata avoids wasting space on per-chunk overhead.
+
+**Repetition index for miniblocks.** When the column contains variable-size list arrays, a per-chunk repetition index records N+1 integers (where N is the maximum nesting depth for random access). These track how many lists at each nesting level are completed within and across chunk boundaries, handling the complexity of rows splitting across chunks.
+
+In the above example, the header records that there are `3` buffers in this block, where buffer b0 is `31` bytes, b1 is `248` bytes, and b2 is `4957` bytes. Then, the actual buffers are stored with definition levels, string offsets, and string data. The `XX` boxes are padding bytes added so the next buffer starts at an 8-byte-aligned address
+
+### Search Cache Comparison
+
+The search cache — the in-memory metadata needed to locate data for a random access request — is a critical resource, especially for billion-row tables.
+
+* **Parquet** (page offset index) — ~20 bytes per page. For large data types like vector embeddings where each page holds a single value, a billion-row column requires up to 20 GiB of search cache.
+* **Lance full zip** — 0 bytes. The repetition index is read on-demand from disk, so there is no in-memory search cache at all.
+* **Lance miniblock (no repetition index)** — ~24 bytes per chunk, with at least 32 values per chunk. A billion-row column requires at most 750 MiB.
+* **Lance miniblock (with repetition index)** — ~41 bytes per chunk. A billion-row column requires at most 1.28 GiB.
+
+The full zip encoding's zero search cache is its primary advantage for large data types — exactly where Parquet's offset index becomes prohibitively expensive.
+
+---
+
+## Struct Packing
+
+Lance introduces **struct packing** as an optional technique to further reduce IOPS for struct types. Normally, each field in a struct is stored as its own leaf column, meaning a random access to a struct requires one (or more) IOPS per field. Struct packing stores the entire struct as a single column, allowing the full struct to be retrieved in the same number of IOPS as a single field.
+
+The trade-off is the loss of column projection: you must fetch the entire struct and discard unwanted fields. For workloads that always read the full struct (such as fetching a vector embedding along with its metadata), this is a net win.
+
+An important detail is that compression is still applied per-field *before* packing. This preserves vectorized columnar compression efficiency. For the packed struct to have fixed width, every field must be fixed width; if any field is variable width, the entire struct is treated as variable width.
+
+In the extreme case, the entire record can be packed, effectively converting Lance into a row-based format. This could be useful for out-of-core sorting and hash-join algorithms — use cases where Arrow-native engines like DataFusion currently resort to ad-hoc row formats.
