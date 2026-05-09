@@ -1,0 +1,140 @@
+---
+slug: bullion-columnar-storage-ml
+title: "Bullion: Columnar Storage for Machine Learning"
+date: "2026-04-21"
+description: "Bullion is a next-generation columnar storage system built at ByteDance for machine learning workloads. It tackles deletion compliance, sparse feature encoding, wide-table projection, storage quantization, multimodal data organization, and cascading encoding — problems that legacy formats like Parquet were never designed to handle."
+tags: [bullion, columnar-storage, machine-learning, parquet, sparse-features, quantization, deletion-compliance, wide-table, multimodal, encoding, bytedance]
+category: [system-papers, ai]
+---
+
+## Why a New Columnar Format?
+
+Columnar storage formats like Parquet and ORC were designed over a decade ago for SQL analytics — full scans, aggregations, and predicate pushdown over well-structured tabular data. Machine learning workloads have inherited these formats, but the fit has grown increasingly awkward. The Bullion paper, from ByteDance, identifies six areas where legacy columnar formats fall short when applied to production ML at scale:
+
+1. **Deletion compliance.** Privacy regulations require timely physical deletion of user data. In columnar storage, deleting a single row is expensive for two structural reasons. First, each column stores its values separately, so one logical delete becomes many physical updates with one modification per column in the schema. Second, data is usually compressed in large blocks, so oen entry cannot be removed without decompressing its block, editing, and recompressing the whole block (and often the surrounding file layout). At TikTok, compliant deletion therefore drives hundreds of petabytes of file rewrites per month, even though only ~5% of rows in each file are affected.
+
+2. **Sparse features and wide tables.** Production recommendation datasets at ByteDance routinely have ~20,000 columns, with hundreds of features added or deprecated monthly. Training jobs typically read only ~10% of these columns. The metadata overhead alone — parsing thousands of column descriptors — can double the cost of reading the actual data.
+
+3. **Long sequence patterns.** Sparse features like user click histories (`list<int64>` with 256 elements per row) exhibit sliding window patterns when sorted by user and timestamp: adjacent rows for the same user differ by only a few elements. Standard delta encoding in Parquet and ORC only supports scalar primitives, leaving these patterns unexploited.
+
+4. **Floating-point precision.** Many embedding and feature columns are stored as FP32 when FP16 or BF16 would suffice for training. Current formats and processing frameworks lack native support for reduced-precision types, forcing expensive padding and conversion at read time.
+
+5. **Multimodal training data.** LLM pre-training requires text, images, audio, and video in context. The conventional approach splits metadata into columnar storage and media into row-oriented formats, creating fragmented I/O during training.
+
+6. **Encoding rigidity.** Parquet and ORC tightly couple their encoding schemes (RLE, varint, bit-packing) without composable interfaces, making it impossible to cascade encodings adaptively at runtime.
+
+Bullion addresses each of these with a targeted mechanism.
+
+---
+
+## Deletion Compliance
+
+Without optimization, deleting a single row in a columnar file requires rewriting the entire file: each column's data must be decompressed, modified, and recompressed. The standard mitigation is an out-of-place approach — Databricks' Delta Lake, for example, uses *deletion vectors* (bitmaps marking rows as logically deleted) so that files are never physically modified. Reads merge the deletion vector at query time to skip deleted rows.
+
+The problem is that deletion vectors do not physically remove data. The bits are still on disk, which conflicts with privacy regulations that mandate timely erasure. Organizations that must comply end up rewriting files immediately, at enormous cost.
+
+Bullion takes a hybrid approach: it performs **in-place updates** to physically erase data from encoded pages, while also recording a deletion vector in the file footer to indicate which rows have been modified. This ensures regulatory-compliant data removal without requiring full file reads/rewrites.
+
+The key constraint is that an updated page must not exceed its original size — otherwise the in-place write would corrupt adjacent data. Bullion achieves this by exploiting the structure of each encoding:
+
+* **Bit-packed encoding.** Values have a fixed bit width, so the mapping from a deletion bitmap to encoded positions is trivial. Deleted values are masked to zero in-place.
+
+* **Varint encoding (LEB128).** Each byte holds 7 data bits plus a continuation bit. To erase a value, Bullion zeroes the 7 data bits of each byte while preserving the continuation bits, maintaining the byte-level structure.
+
+* **RLE encoding.** Run-length encoding stores each run as a pair `(value, count)`: consecutive identical elements collapse into one value and its occurrence count. Naively masking a deleted element in place can cause re-encoding and the page can grow the representation. Take the sequence `222666663`: three `2`s, five `6`s, one `3`, which encodes compactly as `236531` (read as `2×3`, `6×5`, `3×1`). Suppose the third `6` must be deleted. If we mask that position as `0`, the logical sequence becomes `222660663`, which is no longer two clean runs of `2` and `6`; re-encoding yields `23620162311`, which is longer than the original `236531`. Bullion removes the element from the decoded stream, shortens the affected run, and rewrites the page body to the smaller encoding `236431` (`2×3`, `6×4`, `3×1`) for the same data without the deleted `6`. The missing logical position is recorded in a deletion vector in the file footer. In this example, a bitmap like `000001000` marking the offset of the hole. On read, the decoder expands `236431` plus the deletion vector back to the full logical view `22266X663` (with `X` denoting the deleted slot), keeping the on-disk RLE compact and aligned while still exposing the correct row semantics to the query layer.
+
+* **Dictionary encoding.** The dictionary itself (stored in the footer) is not modified. Bullion adds a special mask entry to the dictionary and overwrites deleted values' codes to point to it.
+
+* **FOR-delta encoding.** Values are stored as deltas from a base or predecessor, often combined with bit-packing. Bullion's masking approach works through the nesting since the outer encoding (bit-packing or RLE) can be updated in-place.
+
+<div align="center">
+![Figure 1: Data Deletion Checksum](/figures/bullion-deletion.png)
+</div>
+
+To maintain data integrity without recomputing file-level checksums from scratch, Bullion organizes checksums as a **Merkle tree**: each page has its own hash, pages roll up into row-group hashes, and row groups roll up into the file hash. After an in-place page update, only the hashes along the path from that page to the root need recomputation — the same logarithmic update cost as any Merkle structure.
+
+---
+
+## Sparse Feature Encoding
+
+<div align="center">
+![Figure 2: Sparse Encoding](/figures/bullion-sparse-encoding.png)
+</div>
+
+A representative production file from ByteDance's ads table contains over 16,000 columns of type `list<int64>`, each representing a sparse feature such as a user's click history. These are fixed-length vectors (e.g., 256 int64 elements) that, when sorted by user ID and timestamp, exhibit **sliding window patterns**: consecutive rows for the same user differ by only a handful of elements at the head or tail of the vector.
+
+<div align="center">
+![Figure 3: Delta Encoding](/figures/bullion-delta-encoding.png)
+</div>
+
+Standard delta encoding in Parquet and ORC operates on scalar columns — it can encode the difference between successive integers, but has no concept of vector-level deltas. Bullion extends delta encoding to long sequence vectors with a compact representation:
+
+1. The first vector in a page is stored in full as the **base vector**, flagged with a delta bit of 0.
+
+2. Each subsequent vector is encoded as: `<delta bit> <delta range> <len(head), data> <len(tail), data>`. The delta range identifies which portion of the vector changed relative to its predecessor. The head and tail fields carry only the new elements that were shifted in. If a vector is identical to its predecessor, both head and tail lengths are zero.
+
+The resulting on-disk layout puts feature metadata and indices (small values, encoded with bit-packing or varint) at the beginning of the page, followed by the bulk data (compressible with zstd). This structure aligns well with ML training's access pattern: mini-batch reads with infrequent filtering.
+
+---
+
+## Wide Table Projection
+
+Production ML datasets at ByteDance approach 20,000 columns, but any given training job reads only about 10% of them. In Parquet, reading a file begins with deserializing the footer's Thrift-encoded metadata to discover column locations. At 20,000 columns, this metadata parsing takes roughly as long as reading the 10% of columns the job actually needs — effectively doubling the I/O cost.
+
+Bullion replaces the serialized metadata with a **compact binary layout** inspired by Cap'n Proto and FlatBuffers. Column metadata is stored in a fixed-format binary structure that supports direct access without deserialization. Reading a column proceeds in three steps:
+
+1. `pread()` the footer.
+2. Scan a binary map to find the target column's index.
+3. Look up the column's byte range in an offsets array and issue a targeted `pread()` for the data.
+
+There is no parsing of a schema tree, no allocation of intermediate objects, and no scanning of irrelevant column descriptors. The trade-off is flexibility: the binary format is fixed and lacks some extensibility options. But ML training jobs have simple access patterns — batch reads of all data within a time window, without complex indexing or ad-hoc filtering — so the loss of flexibility is negligible relative to the metadata speedup.
+
+---
+
+## Storage Quantization
+
+<div align="center">
+![Figure 4: Storage Quantization](/figures/bullion-quantization.png)
+</div>
+
+Model quantization — reducing weight precision from FP32 to FP16, BF16, or FP8 — is well established for training and inference. Bullion applies the same principle to features and embeddings at the storage layer: **storage quantization**.
+
+The insight is that different features have different precision requirements, and a blanket FP32 representation wastes storage, network bandwidth, and decode CPU for features that would train just as well at half or quarter precision. Bullion supports a **mixed-precision strategy** tunable at the granularity of individual columns:
+
+* **Integer features** benefit from lossless quantization by rehashing the input space into a smaller range (INT8, INT16, INT32). For low-cardinality columns, further compression via bit-packing and RLE is possible. Since sparse features (integers) often dominate the storage footprint in recommender systems, this yields significant savings.
+
+* **Floating-point features and embeddings** can be stored in FP16, BF16, or FP8, cutting per-value storage from 4 bytes to 1–2 bytes. This reduction propagates through the entire pipeline: halved disk I/O, halved network bandwidth, reduced decompression cost, and lower compute overhead during training and inference.
+
+* **Precision-sensitive features** that cannot tolerate FP16 quantization can use a **dual-column strategy**: decompose each FP32 value into two FP16 representations. Business-critical models reconstruct FP32 via a 1:1 join at read time, while other models consume the FP16 column directly. This does not reduce storage, but it does reduce bandwidth and upstream compute.
+
+The paper notes several open opportunities: native FP16/BF16/FP8 support in processing frameworks like Spark, Arrow, and Velox (currently, pipelines must pad BF16 back to FP32); specialized encoding for BF16 values normalized to (-1, 1); and further research into adaptive per-feature precision selection.
+
+---
+
+## Multimodal Storage
+
+<div align="center">
+![Figure 5: Multimodal Storage](/figures/bullion-multimodal-storage.png)
+</div>
+
+LLM pre-training increasingly requires text, images, audio, and video in their original context (e.g., a web page with all its media). The conventional architecture uses a **dual-table** approach: a *meta table* in columnar format for structured metadata, quality scores, and embeddings, and a *media table* in a row-oriented format (e.g., Avro) for large binary objects like video. Training must bounce between the two tables — filtering by quality scores in the meta table, then fetching corresponding media from the media table — creating fragmented random I/O that bottlenecks training throughput.
+
+Bullion's solution has two parts.
+
+**Embedding critical frames into columnar storage.** General-purpose LLM pre-training does not need full-resolution video — it can operate on a strategic subset of key frames at reduced resolution. Bullion stores these critical frames directly in the columnar format alongside text and audio, so that the training system can access all modalities from a single file with sequential I/O. When full-resolution video is genuinely needed (e.g., for diffusion transformer training), the system falls back to external lookups via video indices stored in the meta table.
+
+**Quality-aware data organization.** Training pipelines filter by quality score, selecting only high-quality samples. If data is stored in insertion order, the selected rows are scattered throughout the file, creating random I/O. Bullion pre-sorts rows by quality score in descending order before writing. This ensures that high-quality samples — the ones that will actually be read during training — are stored contiguously, turning random I/O into sequential reads.
+
+---
+
+## Cascading Encoding
+
+ML workloads are dominated by integer and floating-point columns, each with different value distributions. A single encoding scheme rarely achieves optimal compression across all columns. Bullion implements a **cascading encoding framework** with modular, composable interfaces: each encoding (RLE, varint, bit-packing, FOR-delta, dictionary, zstd) is an independent module that can be stacked recursively.
+
+For example, a column might first be dictionary-encoded, then the integer codes RLE-encoded, and finally the RLE output bit-packed. The composable interfaces mean that adding a new encoding scheme does not require modifying existing ones — it simply plugs into the cascade.
+
+This composability contrasts with Parquet and ORC, which tightly couple their encoding methods without unified interfaces. Adding a new encoding to Parquet requires understanding and modifying the interactions between existing encodings — a significant barrier to experimentation.
+
+The search space for optimal encoding combinations grows combinatorially as the catalog expands. Bullion uses sampling-based distribution analysis and heuristics (similar to BtrBlocks and Procella) to select encodings at runtime. Current implementations limit recursion to one or two levels; the paper notes that determining the ideal recursion depth remains an open question.
+
+One pragmatic observation: despite recent arguments that columnar formats should avoid general-purpose block compression by default, zstd and similar compressors remain highly effective in specific ML scenarios — particularly for time-series data with rarely accessed columns and for recommendation systems where only ~10% of thousands of features are queried. Block compression shines when entire pages are read sequentially, which is exactly the access pattern of mini-batch ML training.
