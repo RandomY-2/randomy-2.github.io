@@ -1,0 +1,150 @@
+---
+slug: scaling-memcache-at-facebook
+title: "Scaling Memcache at Facebook"
+date: "2026-05-10"
+description: "Facebook extended open-source memcached into a planet-scale distributed cache serving the largest social network in the world. The system combines look-aside query caching, UDP-based reads, leases for thundering herds, Gutter for failure isolation, regional invalidation via SQL-embedded deletes, and remote markers for multi-region consistency."
+tags: [memcache, memcached, facebook, distributed-cache, consistent-hashing, leases, mcrouter, udp, incast, gutter, replication, mcsqueal, cold-cluster-warmup, remote-markers]
+category: system-papers
+---
+
+## Why Distributed Caching?
+
+A social network at Facebook's scale must satisfy four infrastructure demands: near-real-time communication, on-the-fly content aggregation from many sources, fast reads and writes to shared popular objects, and the ability to process millions of user requests per second.
+
+Two properties of the workload shaped every design decision that followed.
+* First, users reads roughly an order of magnitude more content than they create, so reads dominate writes — a workload ideal for caching.
+* Second, reads are heterogeneous: data comes from MySQL databases, HDFS installations, and various backend services. The caching layer therefore must be a generic key-value store that can cache data from any source.
+
+Facebook chose memcached — an open-source, in-memory key-value store with a small API (`get`, `set`, `delete`) — as the building block for this caching layer. The paper uses "memcached" to refer to the open-source binary and "memcache" to refer to the full distributed system built on top of it.
+
+---
+
+## Memcache as a Building Block
+
+### Demand-Filled Look-Aside Cache
+
+<div align="center">
+![Figure 1: Look-aside Cache](/figures/memcache-look-aside-cache.png)
+</div>
+
+The primary use of memcache is as a demand-filled look-aside cache: when a web server needs data, it first issues a `get` to memcache with a string key. On a cache hit, the value is returned directly. On a miss, the web server fetches the data from the database or another backend service and populates the cache with the key-value pair.
+
+For write requests, the web server issues SQL statements to the database and then sends a `delete` to memcache to invalidate any stale cached data. The choice of `delete` over `set` is deliberate — deletes are idempotent, so they tolerate reordering without producing inconsistent state. Since memcache is not the authoritative source of data, evicting cached entries is always safe.
+
+### General-Purpose Key-Value Store
+
+Beyond database query caching, engineers use memcache as a general-purpose store for pre-computed results from machine learning algorithms, derived blobs, and other intermediate data. New services can piggyback on the existing infrastructure — routing, provisioning, monitoring — without the burden of deploying and maintaining a separate cache fleet.
+
+---
+
+## Inside a Cluster: Latency and Load
+
+A single user-facing page request can trigger hundreds of individual memcache `get` operations. The latency of each operation directly affects the user's response time, making per-request efficiency critical.
+
+### Client-Side Complexity
+
+Items are distributed across hundreds of memcached servers via **consistent hashing**. Every web server must therefore communicate with many memcached servers to satisfy a single user request. This all-to-all communication pattern creates two risks: incast congestion, where many responses arrive simultaneously and overwhelm network switches, and hot-shard bottlenecks, where a single popular key concentrates load on one server. Replicating data across servers can fix hot keys but wastes memory in the common case.
+
+Rather than adding complexity to the memcached servers themselves, Facebook pushes it into a stateless client that runs on each web server. The client handles serialization, compression, request routing, error handling, and batching. Clients maintain a map of all available servers, updated through an auxiliary configuration system. Client logic is provided either as a library embedded into applications or as a standalone proxy called mcrouter that presents a memcached server interface and routes requests to the appropriate backend servers.
+
+### Parallel Requests and Batching
+
+The web application code is structured to minimize network round trips. Data dependencies are represented as a directed acyclic graph (DAG), and the client uses this DAG to maximize the number of items that can be fetched concurrently. On average, batches consist of about 24 keys per request.
+
+### UDP for Reads, TCP for Writes
+
+Clients use UDP for `get` requests to reduce latency and connection overhead. Since UDP is connectionless, each thread in the web server can communicate with memcached servers directly — bypassing mcrouter — without establishing and maintaining persistent connections. The UDP implementation uses sequence numbers to detect dropped or out-of-order packets and treats these as errors on the client side. When a UDP `get` fails, the client treats it as a cache miss but does not attempt to repopulate the cache afterward, to avoid putting additional load on a network or server that may already be overloaded.
+
+For `set` and `delete` operations, where confirming a state change is necessary, clients use TCP through a local mcrouter instance running on the same machine. TCP provides the reliability guarantees needed for mutations without requiring a custom retry mechanism on top of UDP.
+
+### Incast Congestion Control
+
+When a client requests a large number of keys, the responses can overwhelm rack and cluster switches if they all arrive at once. To control this, clients implement a sliding window mechanism over outstanding requests: the window grows slowly on successful responses and shrinks when a request goes unanswered. This is similar in spirit to TCP congestion control, but with an important difference — the window applies globally across all memcache destinations, not per-connection as in TCP.
+
+### Leases
+
+Two classic caching problems arise under concurrent load. A **stale set** occurs when concurrent updates to memcache get reordered, causing a client to set a value that no longer reflects the latest state. A **thundering herd** happens when a frequently written key is repeatedly invalidated, causing a flood of readers to all miss the cache simultaneously and hammer the database.
+
+Facebook introduces leases to address both problems. When a client experiences a cache miss, the memcached server returns a 64-bit lease token bound to the requested key. The client must present this token when setting the value back into the cache. If the server has received a `delete` for that key in the meantime (indicating that the data has been updated), it invalidates the lease token and rejects the `set`. This mechanism is analogous to a load-link / store-conditional operation — it prevents stale data from overwriting fresher data.
+
+A slight modification to leases also mitigates thundering herds. Each memcached server rate-limits token issuance to one token per key every 10 seconds by default. When a client requests a key within 10 seconds of a token being issued, the server returns a special notification telling the client to wait briefly and retry. Since the client holding the lease typically repopulates the cache within a few milliseconds, waiters usually find the data present on their next attempt.
+
+For workloads that can tolerate slightly out-of-date data, Facebook offers a further optimization. When a key is deleted, its value is transferred to a short-lived data structure holding recently deleted items. A `get` request can return this stale data (marked as such) instead of a lease, allowing the application to make forward progress without waiting for a fresh database read.
+
+### Memcache Pools
+
+Sharing a single memcache infrastructure across all workloads can cause negative interference: different access patterns, memory footprints, and quality-of-service requirements compete for the same resources, degrading hit rates for everyone.
+
+To accommodate these differences, Facebook partitions a cluster's memcached servers into separate pools. A default pool (named "wildcard") handles most traffic, while dedicated pools are provisioned for problematic key classes. For example, a small pool might hold keys that are accessed frequently but where cache misses are cheap, while a large pool might hold infrequently accessed keys where cache misses are expensive and must be avoided.
+
+### Replication Within Pools
+
+For certain pools, Facebook uses replication to improve latency and throughput. Replication is favored over further partitioning of the key space when: the application routinely fetches many keys simultaneously, the entire dataset fits in one or two memcached servers, and the request rate exceeds what a single server can handle.
+
+To understand why replication wins here, consider a memcached server holding 100 items and capable of 500k requests per second, where each request asks for all 100 keys. Splitting the key space across two servers does not help — each server still sees 1M requests per second because every request must touch both halves. Replicating all 100 keys to both servers, however, lets each client send its request to a single replica (chosen deterministically from the client's IP address), cutting per-server load to 500k requests per second. The cost is that invalidations must be broadcast to all replicas.
+
+### Handling Failures
+
+When memcache becomes unavailable, the resulting cache misses can cascade into excessive load on backend services, potentially causing further failures. Facebook handles failures at two scales. If an entire cluster must be taken offline, user traffic is diverted to other clusters, which effectively removes all load from the failed cluster's memcache.
+
+For smaller outages — a few hosts lost to a network or server failure — automated remediation can take several minutes, long enough for cascading failures to begin. To bridge this gap, Facebook dedicates a small set of machines, accounting for roughly 1% of memcached capacity in a cluster, as a **Gutter** pool. When a client receives no response to a `get` request, it retries against Gutter. If the Gutter also misses, the client queries the database and inserts the result into the Gutter machine. Gutter entries expire quickly to avoid the need for invalidations; data may be slightly stale, but backend services stay alive.
+
+An alternative approach would be to rehash failed keys onto the remaining healthy memcached servers. Facebook avoids this because key access frequency is highly skewed — a single key can account for 20% of a server's requests. Rehashing could concentrate this hot key onto another already-busy server, triggering a new failure. Gutter absorbs the load using otherwise idle capacity.
+
+In production, Gutter reduces client-visible failures by approximately 99% and converts 10–25% of daily failures into cache hits. When a memcached server fails entirely, Gutter pool hit rates generally exceed 35% within four minutes and often approach 50%.
+
+---
+
+## Within a Region: Replication and Invalidation
+
+Scaling a cluster by simply adding more web and memcached servers does not solve all problems. Highly requested items only become more popular as more web servers are added, and incast congestion worsens as the number of memcached servers increases. Facebook therefore splits web and memcached servers into multiple frontend clusters within a region. These clusters, along with a storage cluster containing the databases, form a region. This architecture provides smaller failure domains and more tractable network configuration, at the cost of replicating cached data across clusters.
+
+<div align="center">
+![Figure 2: Overall Architecture](/figures/memcache-architecture.png)
+</div>
+
+### Regional Invalidation
+
+The storage cluster holds the authoritative copy of all data. When data is modified, the storage cluster is responsible for invalidating cached copies in every frontend cluster to maintain consistency. As an optimization, a web server that modifies data also sends invalidations to its own cluster to provide read-after-write semantics for individual user requests and reduce the window during which stale data is present.
+
+SQL statements that modify authoritative state are amended to include the memcache keys that need to be invalidated once the transaction commits. Facebook deploys invalidation daemons called **mcsqueal** on every database server. Each daemon inspects the SQL statements that its database commits, extracts the delete operations, and broadcasts them to the memcache deployment in every frontend cluster in the region.
+
+Having mcsqueal contact memcached servers directly would produce an unacceptably high packet rate across cluster boundaries — a consequence of many databases and many memcached servers communicating across a network boundary. Instead, mcsqueal batches deletes into fewer packets and sends them to dedicated mcrouter instances in each frontend cluster. These mcrouters unpack the individual deletes and route them to the appropriate memcached servers within the cluster. This batching achieves an 18x improvement in the median number of deletes per packet.
+
+<div align="center">
+![Figure 3: Regional Invalidation](/figures/memcache-regional-invalidation.png)
+</div>
+
+An alternative design would have web servers broadcast invalidations directly to all frontend clusters. This approach suffers from two problems. First, web servers are less effective at batching invalidations than the mcsqueal pipeline, resulting in higher packet overhead. Second, it provides little recourse when a systemic invalidation problem arises, such as misrouting of deletes due to a configuration error — historically, this required a rolling restart of the entire memcache infrastructure. In contrast, embedding invalidations in SQL statements, which databases commit and store in reliable logs, allows mcsqueal to simply replay invalidations that may have been lost or misrouted.
+
+### Regional Pools
+
+If user requests are randomly routed to all available frontend clusters, the cached data across clusters will be roughly the same. This natural replication is useful for taking a cluster offline for maintenance without suffering reduced hit rates. However, it can be memory-inefficient, especially for large, rarely accessed items. Facebook uses **regional pools** — memcached servers shared across multiple frontend clusters — to reduce replication for such items. The trade-off is higher cross-cluster latency (roughly 40% less available bandwidth than within a single cluster) and reduced fault isolation.
+
+### Cold Cluster Warmup
+
+When a new frontend cluster is brought online, or when an existing one recovers from a failure or maintenance, its caches are empty. Poor hit rates during this warmup period can last for days, during which backend services absorb a significantly higher load.
+
+A system called **Cold Cluster Warmup** mitigates this by allowing clients in the cold cluster to retrieve data from a warm cluster's memcache rather than going directly to the database. This takes advantage of the natural data replication across frontend clusters.
+
+Care must be taken to avoid inconsistencies from race conditions. If a client in the cold cluster performs a database update, and another client subsequently retrieves the stale value from the warm cluster before the warm cluster has received the invalidation, that stale item will be cached indefinitely in the cold cluster. To prevent this, all deletes to the cold cluster carry a two-second hold-off that rejects `add` operations. When a miss in the cold cluster is followed by a read from the warm cluster and an `add` to the cold cluster, a failed `add` indicates that newer data is available in the database, and the client refetches from the authoritative source. While there is a theoretical possibility that deletes are delayed beyond two seconds, this is rare in practice. Cold cluster warmup is disabled once the cluster's hit rate stabilizes.
+
+---
+
+## Across Regions: Consistency
+
+Deploying to multiple geographic regions reduces user latency, improves resilience against natural disasters and power failures, and provides access to cheaper operating locations. Each region consists of a storage cluster and several frontend clusters. One region is designated as the master and holds the primary databases; other regions contain read-only replicas kept up-to-date via MySQL's replication mechanism.
+
+The primary technical challenge in this architecture is maintaining consistency between memcache and the persistent storage when replica databases may lag behind the master.
+
+### Writes from the Master Region
+
+Invalidations originating in the master region are safe once the transaction commits locally. However, having the web server in the master region immediately invalidate caches in replica regions is dangerous: the invalidation can arrive before the database replication stream has delivered the corresponding write to the replica. If a reader in the replica region then refills the cache from its local (still-stale) replica database, the stale data becomes "cemented" in the cache. For this reason, invalidations to non-master regions are delivered through the database replication stream via mcsqueal daemons, ensuring that cache invalidations and data updates arrive in the correct order.
+
+### Writes from a Non-Master Region
+
+When a user in a non-master region updates data, their subsequent requests could return stale results if the local replica database has not yet received the write via replication. Cache refills from the local replica should only be allowed after the replication stream has caught up for that specific write.
+
+Facebook addresses this with a **remote marker** mechanism. When a web server in a non-master region wishes to update key `k`, it follows a three-step protocol: (1) set a remote marker `r_k` in a regional pool, (2) perform the write to the master database, embedding both `k` and `r_k` as keys to be invalidated in the SQL statement on commit, and (3) delete `k` in the local cluster. On a subsequent cache miss for `k`, the web server checks whether `r_k` exists. If it does, the read is directed to the master region; otherwise, the local replica is used. This trades additional latency on some cache misses for a lower probability of reading stale data.
+
+Unlike ordinary cache keys, evicting a remote marker is not semantically neutral — it can make a lagging replica appear up-to-date. In practice, both marker eviction and concurrent modifications to the same key are rare. Facebook also aligns invalidation traffic with the database replication channel to conserve inter-region bandwidth.
