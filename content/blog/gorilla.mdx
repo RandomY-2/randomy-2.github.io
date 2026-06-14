@@ -1,0 +1,185 @@
+---
+slug: gorilla-in-memory-tsdb
+title: "Gorilla: Facebook's In-Memory Time Series Database"
+date: "2026-05-26"
+description: "Gorilla is Facebook's in-memory time series database, designed to ingest tens of millions of data points per second and serve queries in milliseconds. It achieves a 12x compression ratio through delta-of-delta timestamps and XOR'd floating point values, and remains highly available across datacenter failures through independent regional replicas with no consistency guarantees."
+tags: [gorilla, time-series, tsdb, compression, xor, delta-encoding, in-memory, facebook, monitoring, high-availability, paxos, fault-tolerance]
+category: system-papers
+---
+
+## Why a New Time Series Database?
+
+Large-scale internet services depend on monitoring infrastructure to detect and diagnose problems before they become widespread. At Facebook's scale, this means ingesting tens of millions of measurements per second from hundreds of systems and making the data queryable in near-real-time. A time series database (TSDB) is the natural storage layer for this workload, but designing one that balances efficiency, scalability, and reliability at this scale is a significant challenge.
+
+---
+
+## Background: The Operational Data Store
+
+<div align="center">
+![Figure 1: ODS Architecture](/figures/gorilla-ods.png)
+</div>
+
+The Operational Data Store (ODS) was the existing monitoring system at Facebook before Gorilla. ODS comprised a TSDB built on HBase, a query service, and a detection and alerting system. Time series data from services running across Facebook's hosts was collected by the ODS write service and written to HBase. Two consumers relied on this data: engineers using a charting system that generated graphs and other visual representations for interactive analysis, and an automated alerting system that read counters from ODS, compared them against preset thresholds for health, performance, and diagnostic metrics, and fired alarms to on-call engineers and automated remediation systems.
+
+While ODS was functional, the disk-based HBase backend imposed query latencies that were too high for the real-time detection and diagnosis workflows that operations engineers needed most. Analysis of ODS revealed that at least 85% of all queries targeted data collected in the past 26 hours. This suggested that an in-memory system covering just the most recent data could serve the vast majority of production queries, while the persistent HBase store continued to handle long-term historical analysis.
+
+### Design Requirements
+
+By the time Gorilla was designed, the scale of Facebook's monitoring infrastructure imposed concrete requirements on the system: 2 billion unique time series identified by string keys, 700 million data points (timestamp and value) added per minute, 26 hours of data retention, more than 40,000 queries per second at peak, sub-millisecond read latency, support for time series with 15-second granularity (4 points per minute per time series), two in-memory replicas in separate geographic locations for disaster recovery, uninterrupted read availability even when a single server crashes, the ability to quickly scan over all in-memory data, and support for at least 2x growth per year.
+
+The key insight behind Gorilla is that monitoring users do not place much emphasis on individual data points — they care about aggregate analysis and state transitions. Recent data is far more valuable than old data, because knowing a system is broken *right now* matters more than knowing it was broken an hour ago. Since monitoring data is not user data, traditional ACID guarantees are not a core requirement. Gorilla optimizes for remaining highly available for writes and reads, even in the face of failures, at the expense of possibly dropping small amounts of data on the write path. By treating the in-memory store as a write-through cache of the persistent HBase backend, Gorilla achieves the insertion speed and query latency of an in-memory system while retaining the durability of a disk-based one.
+
+Four properties shaped the design:
+
+1. **Writes dominate.** The write rate can exceed tens of millions of data points per second. Reads are a couple of orders of magnitude lower, driven primarily by automated monitoring systems and human dashboards. The TSDB must always be available for writes.
+
+2. **State transitions matter.** The system must support fine-grained aggregations over short time windows so that state transitions (from a new release, a configuration change, a network cut) can be detected within tens of seconds.
+
+3. **High availability.** Even during a network partition or datacenter disconnection, systems within any given datacenter must be able to write to and read from local Gorilla machines.
+
+4. **Fault tolerance.** All writes must be replicated to multiple regions to survive the loss of any single datacenter or geographic region.
+
+---
+
+## Architecture Overview
+
+Gorilla is an in-memory TSDB that functions as a write-through cache for monitoring data written to an HBase data store. Each data point is a simple 3-tuple: a string key that uniquely identifies a time series, a 64-bit integer timestamp, and a double-precision floating point value. Gorilla's design rests on three pillars: aggressive compression to make in-memory storage feasible, data structures that support both fast individual lookups and efficient full scans, and dual-region replication for fault tolerance.
+
+The string key is used to shard monitoring data across Gorilla hosts — each time series maps to exactly one host. This share-nothing architecture makes horizontal scaling straightforward: adding capacity means adding hosts and adjusting the sharding function. When Gorilla launched to production, the past 26 hours of data fit into 1.3TB of RAM distributed evenly across 20 machines. Over the following 18 months, the cluster was doubled in size twice to accommodate data growth, reaching 80 machines per Gorilla cluster — a process made simple by the share-nothing design.
+
+Gorilla tolerates single-node failures, network cuts, and entire datacenter failures by writing each data point to two hosts in separate geographic regions. On detecting a failure, all read queries are failed over to the alternate region, ensuring that users do not experience any disruption. The remainder of this post walks through each of these pillars in detail.
+
+---
+
+## Time Series Compression
+
+As of Spring 2015, Facebook's monitoring systems generated over 2 billion unique time series, with about 12 million data points added per second — over 1 trillion points per day. At 16 bytes per point (a 64-bit timestamp plus a 64-bit double), the most recent 26 hours of data would require roughly 16TB of RAM. Gorilla's compression scheme, inspired by earlier work on XOR-based floating point compression in scientific computing, reduces the average size to 1.37 bytes per point — a 12x reduction that makes the in-memory approach feasible.
+
+Gorilla compresses data points within a single time series with no compression across time series. Each data point is a pair of 64-bit values representing the timestamp and the value at that time. Timestamps and values are compressed separately, each exploiting a different regularity in the data.
+
+<div align="center">
+![Figure 2: Time Series Compression](/figures/gorilla-ts_compression.png)
+</div>
+
+Figure 2 illustrates the compression pipeline. Figure 2.a shows the raw time series data as a stream of timestamp-value pairs. Gorilla compresses this stream into blocks partitioned by time. Each block begins with a header containing an aligned timestamp (e.g., starting at 2:00 AM) and stores the first value in a less compressed format.
+Figure 2.b shows how subsequent timestamps are compressed using delta-of-delta encoding. The first time series pair records time delta from header timestamp (02:01:02 - 02:00:00 = 62 seconds) + raw value (12). Subsequently, timestamps are recorded using delta-of-delta. In this example, the delta-of-delta is -2 (02:02:02-02:01:02 = 60, 60-62 = -2), which is stored with a two-bit header (`10`) and the value in seven bits, for a total of just 9 bits. Figure 2.c shows how floating-point values are compressed using XOR encoding — XORing the current value with the previous one produces a result with only a single meaningful bit, which is stored with a two-bit header (`11`), the leading zero count, the meaningful bit length, and the actual value, totaling just 14 bits.
+
+### Timestamp Compression
+
+Analysis of ODS data revealed that the vast majority of data points arrive at fixed intervals — a time series might log one point every 60 seconds, occasionally arriving 1 second early or late. Rather than storing full timestamps, Gorilla stores delta-of-deltas. If successive timestamps produce deltas of 60, 60, 59, and 61, the delta-of-deltas are 0, -1, and 2 — small values that compress well with variable-length encoding.
+
+The block header stores a starting timestamp $t_{-1}$ aligned to a two-hour window. The first timestamp $t_0$ is stored as a 14-bit delta from $t_{-1}$. For each subsequent timestamp $t_n$, the delta of delta $D = (t_n - t_{n-1}) - (t_{n-1} - t_{n-2})$ is computed and encoded:
+
+* If $D = 0$, store a single `0` bit.
+* If $D \in [-63, 64]$, store `10` followed by the value in 7 bits.
+* If $D \in [-255, 256]$, store `110` followed by the value in 9 bits.
+* If $D \in [-2047, 2048]$, store `1110` followed by the value in 12 bits.
+* Otherwise, store `1111` followed by $D$ in 32 bits.
+
+The range boundaries were selected by sampling production time series and choosing the values that yielded the best compression ratio. The scheme handles missing data points gracefully. If one point is missing, the deltas might be 60, 60, 121, and 59, producing delta-of-deltas of 0, 61, and -62 — both of which fit in the smallest non-zero range (7 bits). The next range ([-255, 256]) is sized to handle four-minute intervals with a single missing point.
+
+<div align="center">
+![Figure 3: Time Series Bits](/figures/gorilla-ts_bits.png)
+</div>
+
+Figure 3 show the results of time stamp compression in Gorilla. About 96% of all time stamps can be compressed to a single bit.
+
+### Value Compression
+
+<div align="center">
+![Figure 4: Value Compress](/figures/gorilla-value_xor.png)
+</div>
+
+For values, Gorilla exploits the observation that consecutive measurements in a time series typically do not change significantly. Many data sources store integers, and even for floating point data, the sign, exponent, and leading mantissa bits are often identical between adjacent points. Rather than delta encoding (which would require handling floating point subtraction), Gorilla XORs the current value with the previous one. XOR naturally produces zero bits wherever the two values agree in their binary representation — and for values that are close together, the sign, exponent, and high-order mantissa bits will all be zero in the XOR result.
+
+The XOR'd values are encoded with a variable-length scheme:
+
+1. The first value in a block is stored uncompressed.
+2. If the XOR with the previous value is zero (identical value), store a single `0` bit.
+3. When the XOR is non-zero, compute the number of leading and trailing zeros in the XOR, then store bit `1` followed by one of two cases:
+    * Control bit `0`: if the block of meaningful bits falls within the same position as the previous XOR's meaningful bits (at least as many leading zeros and at least as many trailing zeros), reuse the previous block position and store only the meaningful XOR'd bits.
+    * Control bit `1`: store the number of leading zeros in 5 bits, the length of the meaningful block in 6 bits, and then the meaningful bits themselves.
+
+The `10` case is particularly effective for time series where the magnitude and sign change slowly — successive XOR values tend to have their meaningful bits in the same position, so the position metadata can be elided entirely.
+
+<div align="center">
+![Figure 5: Value Buckets](/figures/gorilla-value_buckets.png)
+</div>
+
+Figure 5 shows the distribution of actual values in Gorilla. Roughly 51% of all values are compressed to a single bit since the current and previous values are identical.
+
+### Block Size Trade-off
+
+Compression operates over contiguous blocks of data. Larger blocks yield better compression ratios because there are more opportunities for delta-of-delta timestamps to be zero and for XOR'd values to reuse previous bit positions. However, queries over short time ranges must decode the entire block. Gorilla uses two-hour blocks, which provide diminishing returns beyond that point while keeping decode cost reasonable. At this block size, the average compression ratio is 1.37 bytes per data point.
+
+---
+
+## In-Memory Data Structures
+
+<div align="center">
+![Figure 6: In-memory Data Structures](/figures/gorilla-in_mem_ds.png)
+</div>
+
+Gorilla stores all data in a simple 3-tuple: a string key that uniquely identifies a time series, a 64-bit integer timestamp, and a double-precision floating point value. The data is sharded across Gorilla hosts by hashing the string key, making the architecture share-nothing and horizontally scalable.
+
+### Timeseries Map
+
+The primary data structure is the **Timeseries Map** (TSmap). A TSmap consists of two components: a vector of C++ shared pointers to time series objects, and a case-insensitive map from time series names to the same objects. The vector enables efficient paged scans through all data, while the map provides constant-time lookups of individual time series.
+
+The use of shared pointers allows scans to copy the vector (or pages of it) in microseconds, avoiding lengthy critical sections that would block incoming writes. When a time series is deleted, its vector entry is tombstoned and the index is placed in a free pool for reuse. Concurrency is managed with a single read-write spin lock protecting the map and vector, plus a 1-byte spin lock on each individual time series. Since each time series has relatively low write throughput, contention is minimal.
+
+The mapping from shard identifiers to TSmaps is maintained in a **ShardMap** — a vector of pointers indexed by shard ID. Since the total number of shards is constant and in the low thousands, the overhead of null pointers for unassigned shards is negligible.
+
+### Time Series Storage
+
+Each time series consists of a sequence of closed blocks (for data older than two hours) and a single open block holding the most recent data. The open block is an append-only string to which new compressed timestamp-value pairs are appended. When the two-hour window ends, the open block is closed and copied to memory allocated from large slabs to reduce fragmentation. Closed blocks are never modified until they are deleted from memory.
+
+For reads, Gorilla copies the relevant data blocks directly into the output RPC structure and returns the entire compressed block to the client. Decompression is performed client-side, outside of Gorilla, keeping the server's CPU budget focused on writes.
+
+---
+
+## On-Disk Persistence
+
+Gorilla achieves persistence by writing data to GlusterFS, a POSIX-compliant distributed file system with 3x replication. Each Gorilla host owns multiple shards, and each shard has its own directory containing four types of files:
+
+* **Key lists** — a map from time series string keys to integer identifiers (the index into the in-memory vector). New keys are appended to the current list, and Gorilla periodically rewrites the file by scanning all keys for each shard.
+
+* **Append-only logs** — as data points stream in, they are compressed (using the same timestamp and value encoding) and written to a per-shard log file. Because the log interleaves values from all time series within a shard, each compressed pair includes a 32-bit integer ID, adding storage overhead relative to the in-memory representation. Data is buffered up to 64KB (typically one or two seconds of data) before being flushed. On a clean shutdown the buffer is flushed; on a crash, the buffer may be lost. This trade-off accepts small data loss in exchange for higher write throughput and write availability.
+
+* **Complete block files** — every two hours, Gorilla copies the compressed block data to disk in a format much smaller than the log files. Each block file has two sections: consecutive 64KB slabs of data blocks (copied directly as they appear in memory) and a list of key-to-offset pairs.
+
+* **Checkpoint files** — created after a complete block file is successfully flushed to disk. On process restart, the absence of a checkpoint file signals that the corresponding block file is untrustworthy, and Gorilla falls back to reading from the log file.
+
+Gorilla does not offer ACID guarantees. The log file is not a write-ahead log — it is written after the in-memory state is updated. This is a deliberate trade-off: the monitoring data stored in Gorilla is not user data, so traditional durability guarantees are less important than write availability and throughput.
+
+---
+
+## Handling Failures
+
+Gorilla's failure handling prioritizes two scenarios: single-node temporary failures (which are frequent) and large-scale localized failures such as a network cut to an entire region (which are rare but must be survivable at Facebook's scale). Single-node failure tolerance has the added benefit that rolling software upgrades can be modeled as controlled single-node failures, enabling frequent, hassle-free code pushes.
+
+### Cross-Region Replication
+
+Gorilla maintains two completely independent instances in separate datacenter regions. Every data point is streamed to both instances with no attempt to guarantee consistency. This makes large-scale failures straightforward to handle: when an entire region fails, queries are redirected to the other region. Read failures from one region are transparently retried against the other. If the outage lasts longer than one minute, data destined for the failed region is dropped, and reads are not retried to that region until it has been healthy for at least 26 hours (the full data retention window).
+
+This design leverages the core observation that individual data points can be lost without compromising aggregate analysis, as long as both Gorilla instances are not significantly divergent.
+
+### Intra-Region Shard Management
+
+Within each region, a Paxos-based system called **ShardManager** assigns shards to Gorilla nodes. When a node fails, ShardManager redistributes its shards among the remaining healthy nodes.
+
+During shard movement, write clients buffer incoming data locally. The buffers are sized to hold one minute of data; points older than one minute are discarded to make room for newer points, reflecting the priority of recent data over old data. In practice, shard reassignment completes in thirty seconds or less when the rest of the cluster is healthy, resulting in no data loss. For extended outages, the one-minute buffer ensures that the most recent data — which is the most valuable for driving automated detection — is preserved.
+
+When shards are assigned to a new host, the host reads all data from GlusterFS. A host can become fully functional in about five minutes. While reading, it accepts incoming writes into a queue and processes them as soon as possible. When shards are reassigned, clients immediately drain their buffers to the new node, so no in-flight data is lost.
+
+### Partial Results and Read Failover
+
+After a node failure, the shards it owned are temporarily unavailable for reads until the new host finishes loading data from disk. During this window, queries return partial results — blocks are read most recent to least recent — and the results are marked as partial.
+
+When the client library receives a partial result from one region, it retries the affected time series against the other region and keeps the non-partial result. If both regions return partial results, both are returned to the caller with a flag indicating incomplete data. The caller (typically an automated level-change detection system) then decides whether it has enough information to proceed. Since these systems can function well with partial data as long as the most recent data is present, this trade-off is effective in practice.
+
+### Graceful Operations
+
+Automatic read failover from an unhealthy host to a healthy one means that users are protected from restarts and software upgrades with zero manual intervention and zero data drops. For controlled shutdowns, the host flushes all data to disk before exiting, ensuring no data loss. For crashes, the loss is typically limited to a few seconds of buffered log data. Facebook's HBase TSDB remains available for long-term historical queries if all in-memory copies are lost, and Gorilla can resume driving real-time detection as soon as it restarts and begins accepting new writes.
+
+When Gorilla launched to production, the dataset for the past 26 hours fit into 1.3TB of RAM distributed across 20 machines. Over the following 18 months, the cluster was doubled in size twice (to 80 machines) to accommodate data growth — a process made simple by the share-nothing architecture and horizontal scalability.
