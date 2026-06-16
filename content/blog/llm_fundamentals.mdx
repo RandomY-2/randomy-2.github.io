@@ -1,6 +1,6 @@
 ---
 slug: llm-fundamentals
-title: "From N-grams to Transformers and Beyond"
+title: "Language Models: From N-grams to Transformers and Beyond"
 date: "2026-03-16"
 description: "A comprehensive guide to the foundations of large language models, covering statistical language models, word embeddings, RNNs, the Transformer architecture, prompt engineering, tokenization, scaling laws, and model limitations."
 tags: [llm, transformer, attention, nlp, deep-learning, gpt, tokenization, prompt-engineering]
@@ -58,12 +58,12 @@ $$
 P(w_t \mid w_{t-n+1}, \ldots, w_{t-1}) = \text{softmax}\!\Big(W_2 \cdot \tanh\!\big(W_1 \cdot [C(w_{t-n+1});\; \ldots;\; C(w_{t-1})] + b_1\big) + b_2\Big)
 $$
 
-Where $C(w)$ is the embedding lookup that maps word $w$ to its vector, the semicolons denote concatenation of the $n{-}1$ context embeddings, and $W_1, W_2, b_1, b_2$ are learnable parameters.
+Where $C(w)$ is the **embedding lookup** that maps word $w$ to its vector, the semicolons denote concatenation of the $n{-}1$ context embeddings, and $W_1, W_2, b_1, b_2$ are learnable parameters.
 
 Its core idea can be divided into two steps:
 
 1. **Build a semantic space**: Map each word in the vocabulary to a point in a high-dimensional continuous vector space. This point is called a **Word Embedding**. Semantically similar words tend to have vectors that are close together.
-2. **Learn the mapping from context to the next token**: Use a neural network to map the vectors of the previous $n-1$ words to a probability distribution over the vocabulary for the next token.
+2. **Learn the mapping from context to the next token**: Use a neural network to map the vectors of the previous $n-1$ words to a probability distribution over the vocabulary for the next token. In this case, $n-1$ would be the **context window** of the model.
 
 In this architecture, word embeddings are learned jointly with the language modeling objective. As training progresses, the model adjusts each word's vector so that it helps predict the next token more effectively.
 
@@ -145,139 +145,92 @@ The cell state acts as a relatively stable path for information, allowing signal
 
 ---
 
-### Transformer Architecture Analysis
+### The Transformer
 
-RNNs and LSTMs process sequences **step by step**: time step $t$ depends on step $t-1$. This limits parallelism, especially during training. The **Transformer** architecture replaced recurrence with **attention**, allowing much more parallel computation across sequence positions during training.
-
-#### Overall Encoder-Decoder Structure
-
-The original Transformer follows a classic **Encoder-Decoder** architecture:
+Even with LSTMs, recurrent models remain inherently sequential — each hidden state $h_t$ depends on $h_{t-1}$, preventing parallelization within a training example. The Transformer eliminates recurrence entirely, relying solely on **self-attention** to model dependencies between positions. Every position can directly attend to every other position in a single layer, reducing the path length between any two tokens to $O(1)$ (compared to $O(n)$ for RNNs). This enables full parallelization and makes learning long-range dependencies far easier.
 
 <div align="center">
 ![Figure 3: Transformer Architecture](/figures/llm-fundamental-transformer-architecture.png)
 </div>
 
-1. **Encoder**: Processes the full input sequence and produces a contextual representation for each token.
-2. **Decoder**: Generates the target sequence token by token, using both its previous outputs and the encoder's representations.
+The Transformer uses an encoder-decoder structure. The encoder maps an input sequence $(x_1, \ldots, x_n)$ into continuous representations $z = (z_1, \ldots, z_n)$. The decoder generates an output sequence $(y_1, \ldots, y_m)$ auto-regressively, one token at a time.
 
-**Encoder Layer** — each layer applies self-attention followed by a feed-forward network, with residual connections and layer normalization around each sublayer:
+The **encoder** is a stack of $N = 6$ identical layers. Each layer has two sub-layers: (1) a multi-head self-attention mechanism and (2) a position-wise fully connected feed-forward network. A residual connection wraps each sub-layer, followed by layer normalization — the output of each sub-layer is $\text{LayerNorm}(x + \text{Sublayer}(x))$. To facilitate these residual connections, all sub-layers and embedding layers produce outputs of dimension $d_{\text{model}} = 512$.
 
-$$
-Z = \text{LayerNorm}(X + \text{MultiHeadAttn}(Q{=}X,\; K{=}X,\; V{=}X))
-$$
+The **decoder** is also a stack of $N = 6$ identical layers, but each decoder layer has a third sub-layer inserted between the self-attention and the feed-forward network: a multi-head attention layer that attends over the encoder's output (cross-attention). This is what allows the decoder to incorporate information from the input sequence. Additionally, the self-attention sub-layer in the decoder is **masked** — positions are prevented from attending to subsequent positions by setting those scores to $-\infty$ before softmax. This masking, combined with the fact that output embeddings are offset by one position, ensures that predictions for position $i$ can depend only on known outputs at positions less than $i$, preserving the auto-regressive property.
 
-$$
-\text{EncoderOut} = \text{LayerNorm}(Z + \text{FFN}(Z))
-$$
+**Scaled Dot-Product Attention.** The fundamental building block maps a set of **queries**, **keys**, and **values** to an output. Each token's hidden representation is linearly projected three times to produce a query vector $q$ (what this token is looking for), a key vector $k$ (what this token advertises to others), and a value vector $v$ (the information this token provides when attended to). Stacking these across all tokens in the sequence gives matrices $Q$, $K$ (both of dimension $n \times d_k$), and $V$ (of dimension $n \times d_v$). The attention output is a weighted sum of the value vectors, where the weight on each value is determined by the dot-product compatibility between the corresponding query and key:
 
-**Decoder Layer** — each layer has three sublayers: masked self-attention over the decoder's own prefix, cross-attention over the encoder output, and a feed-forward network:
+<div align="center">
+![Figure 4: Attention](/figures/llm-fundamental-attention.png)
+</div>
 
 $$
-Z_1 = \text{LayerNorm}(X + \text{MaskedMultiHeadAttn}(Q{=}X,\; K{=}X,\; V{=}X))
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
 $$
 
-$$
-Z_2 = \text{LayerNorm}(Z_1 + \text{MultiHeadAttn}(Q{=}Z_1,\; K{=}\text{EncoderOut},\; V{=}\text{EncoderOut}))
-$$
+<div align="center">
+![Figure 5: Self Attention](/figures/llm-fundamental-self-attention.png)
+</div>
+
+<div align="center">
+![Figure 6: Self Attention Walkthrough](/figures/llm-fundamental-self-attention-walkthrough.png)
+</div>
+
+The scaling factor $1/\sqrt{d_k}$ prevents dot products from growing large in magnitude. If the components of $q$ and $k$ are independent with mean 0 and variance 1, their dot product has variance $d_k$ — without scaling, large $d_k$ pushes softmax into saturated regions with vanishingly small gradients.
+
+**Multi-Head Attention.** A single attention head averages over all positions, which can prevent the model from jointly attending to information in different representation subspaces. To address this, the Transformer projects $Q$, $K$, $V$ into $h$ different subspaces and runs attention in parallel:
 
 $$
-\text{DecoderOut} = \text{LayerNorm}(Z_2 + \text{FFN}(Z_2))
-$$
-
-#### From Self-Attention to Multi-Head Attention
-
-Consider the sentence: "The agent learns because **it** is intelligent." When interpreting the word "it," we may pay more attention to "agent" to resolve the reference. **Self-attention** provides a mechanism for a model to compare each token with all other tokens in the sequence and weight them differently.
-
-Self-attention introduces three learned projections for each input token:
-
-- **Query (Q)**: Represents what the current token is looking for.
-- **Key (K)**: Represents how each token can be matched.
-- **Value (V)**: Represents the information carried by each token.
-
-These vectors are obtained by multiplying the input representation by three learned matrices ($W^Q, W^K, W^V$). The computation proceeds as:
-
-1. **Generate Q, K, V**: Produce projected representations for each token.
-2. **Calculate relevance scores**: Compute dot products between a token's query and all keys.
-3. **Scale and normalize**: Divide by $\sqrt{d_k}$ so that large dot products do not push the softmax too deeply into saturated regions, then apply softmax to obtain attention weights.
-4. **Weighted sum**: Form a weighted sum of the value vectors.
-
-If attention is performed only once, the model may focus on only one type of relationship. **Multi-head attention** addresses this by using multiple learned projections in parallel, allowing different heads to capture different patterns.
-
-**Scaled Dot-Product Attention** — the core operation that computes a weighted sum of values based on query-key similarity:
-
-$$
-\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right) V
-$$
-
-**Multi-Head Attention** — each head $i$ independently projects Q, K, and V with its own learned matrices and performs attention. The $h$ outputs are concatenated and projected again:
-
-$$
-Q_i = X W_i^Q, \quad K_i = X W_i^K, \quad V_i = X W_i^V
+\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h) W^O
 $$
 
 $$
-\text{head}_i = \text{Attention}(Q_i,\; K_i,\; V_i)
+\text{where } \text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)
 $$
 
-$$
-\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h) \; W^O
-$$
+<div align="center">
+![Figure 7: MultiHead Attention](/figures/llm-fundamental-multihead-attention.png)
+</div>
 
-Where $W_i^Q, W_i^K, W_i^V \in \mathbb{R}^{d_{\text{model}} \times d_k}$ are per-head projections with $d_k = d_{\text{model}} / h$, and $W^O \in \mathbb{R}^{d_{\text{model}} \times d_{\text{model}}}$ is the final output projection.
+<div align="center">
+![Figure 8: MultiHead Attention Walkthrough](/figures/llm-fundamental-multihead-attention-example.png)
+</div>
 
-#### Feed-Forward Neural Network
+With $h = 8$ heads and $d_k = d_v = d_{\text{model}} / h = 64$, the total computational cost is similar to single-head full-dimensionality attention — we simply trade width for breadth. Different heads can learn complementary attention patterns: one might capture syntactic dependencies, another semantic similarity, another local positional proximity.
 
-In each encoder and decoder layer, the attention sublayer is followed by a **position-wise feed-forward network (FFN)**. If the attention mechanism aggregates information across the sequence, the FFN then transforms each token representation independently.
+It helps to track the tensor shapes. Start with token embeddings $X \in \mathbb{R}^{N \times D}$, where $N$ is the sequence length and $D = d_{\text{model}}$ is the embedding dimension. Linear projections produce $Q = XW^Q$, $K = XW^K$, and $V = XW^V$, each initially of shape $N \times (H \cdot D_H)$ where $H$ is the number of heads and $D_H = D / H$ is the dimension per head. Reshaping splits these into separate heads: $Q, K, V \in \mathbb{R}^{H \times N \times D_H}$.
 
-The key word is "position-wise": the same FFN is applied to every position separately. In the original Transformer, it consists of two linear transformations with a ReLU activation in between:
-
-$$
-\text{FFN}(x) = \text{ReLU}(xW_1 + b_1)W_2 + b_2
-$$
-
-#### Residual Connections and Layer Normalization
-
-In each encoder and decoder layer, all submodules are wrapped by an **Add & Norm** operation:
-
-- **Residual Connection (Add)**: Adds the submodule's input $x$ to its output $\text{Sublayer}(x)$. This improves gradient flow and makes deep networks easier to optimize. Formula: $\text{Output} = x + \text{Sublayer}(x)$.
-- **Layer Normalization (Norm)**: Normalizes each token representation across its feature dimensions, followed by learned scale and bias parameters. This helps stabilize optimization and improve training dynamics.
-
-#### Positional Encoding
-
-Self-attention by itself does not encode token order. Without positional information, a model cannot distinguish between sequences that contain the same tokens in different orders. **Positional information** solves this by injecting order information into the token representations.
-
-In the **original Transformer paper**, the authors used a fixed sinusoidal positional encoding added to the token embeddings:
+For a single head $h$, $Q_h$ and $K_h$ have shape $N \times D_H$, so the attention score matrix is:
 
 $$
-PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)
+E_h = Q_h K_h^T \in \mathbb{R}^{N \times N}
 $$
 
+because $(N \times D_H)(D_H \times N) = N \times N$. Entry $E_h[i, j]$ is the compatibility between token $i$ as query and token $j$ as key — row $i$ answers how much token $i$ should attend to every other token. The $D_H$ dimension disappears because the dot product sums over the feature dimension; what remains is a pairwise token-to-token similarity matrix. With $H$ heads, we get $H$ such matrices stacked as $E \in \mathbb{R}^{H \times N \times N}$. For example, with $H = 8$, $N = 10$, and $D_H = 64$, each head produces a $10 \times 10$ score matrix, and the full tensor has shape $8 \times 10 \times 10$. Softmax is applied over the key dimension (the last axis) so that each query token's weights over all keys sum to 1.
+
+The Transformer uses multi-head attention in three ways: (1) **encoder self-attention** where all of $Q$, $K$, $V$ come from the previous encoder layer; (2) **masked decoder self-attention** where future positions are masked by setting their scores to $-\infty$ before softmax; and (3) **encoder-decoder cross-attention** where queries come from the decoder and keys/values come from the encoder output.
+
+**Position-Wise Feed-Forward Network.** Each layer also contains a two-layer FFN applied independently to each position:
+
 $$
-PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{\text{model}}}}\right)
+\text{FFN}(x) = \max(0, \; xW_1 + b_1) W_2 + b_2
 $$
 
-Where $pos$ is the position in the sequence and $i$ is the dimension index.
+The inner dimension is $d_{ff} = 2048$ while the input/output dimension is $d_{\text{model}} = 512$.
 
-These encodings are not learned in the original formulation above, although many later Transformer variants use learned positional embeddings or other positional schemes.
+**Positional Encoding.** Self-attention is a set operation — it computes pairwise dot products between vectors and produces weighted sums, but nothing in the computation depends on the *order* of those vectors. If you permute the input tokens, the output is permuted in exactly the same way; the model cannot distinguish "The cat sat" from "sat cat The." This is fundamentally different from RNNs and convolutions, where position is implicit in the sequential or sliding-window structure. To break this permutation equivariance, the Transformer adds a **positional encoding** to each token's embedding before it enters the attention layers — a deterministic signal that is a function of the token's index, so that permuted variants are no longer identical inputs to the model. The original paper uses sinusoidal encodings:
 
----
+$$
+PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i / d_{\text{model}}}}\right), \quad PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i / d_{\text{model}}}}\right)
+$$
 
-### Decoder-Only Architecture
+The wavelengths form a geometric progression from $2\pi$ to $10000 \cdot 2\pi$. The key property is that for any fixed offset $k$, $PE_{pos+k}$ can be represented as a linear function of $PE_{pos}$, allowing the model to learn relative-position attention patterns.
 
-The original Transformer was an encoder-decoder model. Later, many influential language models kept only the decoder stack, producing the **decoder-only** architecture.
+**Why Self-Attention?** Compared to recurrence and convolution, self-attention offers:
 
-Its working mode is **autoregressive generation**:
+* $O(1)$ maximum path length between any two positions (vs. $O(n)$ for RNNs, $O(n/k)$ for convolutions), making long-range dependencies easier to learn;
+* full parallelizability with $O(1)$ sequential operations (vs. $O(n)$ for RNNs);
+* $O(n^2 \cdot d)$ computational complexity per layer, which is faster than the $O(n \cdot d^2)$ of recurrent layers when $n < d$ — the common case with subword tokenization.
 
-1. Give the model a starting text prompt (for example, "Agent is").
-2. The model predicts the next most likely **token**.
-3. Append that token to the input.
-4. Predict the next token again.
-5. Repeat until a stop condition is reached.
-
-Decoder-only architectures prevent looking into the future through **masked self-attention**. After computing the attention score matrix but before softmax, the model applies a causal mask that replaces scores for future positions with a very large negative number. After softmax, those positions receive probability approximately 0, which prevents the model from attending to information to the right of the current position.
-
-**Advantages of Decoder-Only Architecture:**
-
-- **Unified Training Objective**: The model is trained to predict the next token, which makes it well suited for large-scale self-supervised pretraining on unlabeled text.
-- **Simple Structure, Easy to Scale**: Removing the encoder simplifies the architecture. Many modern generative LLMs, including GPT-style and Llama-family models, use decoder-only Transformers.
-- **Naturally Suited for Generation**: Autoregressive decoding aligns directly with text generation tasks such as dialogue, writing, and code generation.
+The trade-off is that the $O(n^2)$ term becomes expensive for very long sequences, motivating later work on sparse and linear attention variants.
