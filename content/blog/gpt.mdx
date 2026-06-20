@@ -1,0 +1,195 @@
+---
+slug: gpt-series
+title: "GPT-1, GPT-2, GPT-3: The Evolution of Generative Pre-Training"
+date: "2026-06-20"
+description: "The GPT series established that a single architectural recipe — unsupervised pre-training of a large Transformer language model followed by minimal task adaptation — could achieve state-of-the-art results across NLP. GPT-1 introduced pre-train then fine-tune, GPT-2 showed that fine-tuning could be eliminated entirely with sufficient scale, and GPT-3 demonstrated that in-context learning improves predictably with model size."
+tags: [gpt, gpt-1, gpt-2, gpt-3, transformer, language-model, pre-training, fine-tuning, few-shot, zero-shot, in-context-learning, scaling-laws, openai]
+category: ai
+---
+
+## The Core Idea
+
+The GPT series is built on a single hypothesis: a sufficiently large language model, pre-trained on diverse text, will learn representations so general that it can perform downstream NLP tasks with minimal — or even zero — task-specific adaptation. Each successive paper pushes this hypothesis further by scaling the model and reducing the amount of supervision required.
+
+All three GPT models share the same base architecture: a decoder-only Transformer trained with a causal language modeling objective. The model predicts the next token given all previous tokens:
+
+$$
+L(\mathcal{U}) = \sum_i \log P(u_i \mid u_{i-k}, \ldots, u_{i-1}; \Theta)
+$$
+
+where $\mathcal{U} = \{u_1, u_2, \ldots, u_n\}$ is the input sequence in the unsupervised corpus, $u_i$ is the $i$-th token being predicted, $k$ is the context window size, and $\Theta$ are the model parameters. This is a strictly left-to-right objective: the probability of each token depends only on the tokens that precede it, never on future tokens. A decoder-only Transformer is a natural fit because its masked self-attention enforces exactly this constraint — position $i$ can attend to positions $\leq i$ but is blocked from attending to anything beyond $i$, making the architecture causally consistent with the training objective by construction.
+
+The evolution from GPT-1 to GPT-3 is not primarily architectural — it is about how much task-specific supervision is needed after pre-training.
+
+---
+
+## GPT-1: Pre-Train Then Fine-Tune
+
+GPT-1 demonstrates that generative pre-training on unlabeled text, followed by discriminative fine-tuning on labeled data, produces a universal representation that transfers across a wide range of NLP tasks.
+
+### Pre-Training
+
+The model is a 12-layer Transformer decoder with 768-dimensional states, 12 attention heads, and 3072-dimensional feed-forward layers — roughly 117M parameters. It is trained on the BooksCorpus (about 7,000 unpublished books) using a standard language modeling objective. Key implementation details include: a context window of 512 tokens, BPE tokenization with 40,000 merges, GELU activations, learned positional embeddings (not sinusoidal), and a cosine learning rate schedule with linear warmup.
+
+The pre-training objective is:
+
+$$
+h_0 = UW_e + W_p
+$$
+
+$$
+h_l = \text{transformer\_block}(h_{l-1}) \quad \forall \, l \in [1, n]
+$$
+
+$$
+P(u) = \text{softmax}(h_n W_e^T)
+$$
+
+where $U$ is the context vector of tokens, $W_e$ is the token embedding matrix (shared with the output projection), and $W_p$ is the position embedding matrix.
+
+### Fine-Tuning
+
+For each downstream task, GPT-1 takes the final Transformer block's activation $h_l^m$ for the last token and feeds it through a single linear layer with parameters $W_y$:
+
+$$
+P(y \mid x^1, \ldots, x^m) = \text{softmax}(h_l^m \cdot W_y)
+$$
+
+The fine-tuning objective combines the task loss with an auxiliary language modeling loss (weighted by $\lambda$) to improve generalization and accelerate convergence:
+
+$$
+L_3(\mathcal{C}) = L_2(\mathcal{C}) + \lambda \cdot L_1(\mathcal{C})
+$$
+
+The only new parameters introduced during fine-tuning are $W_y$ and delimiter token embeddings — the entire pre-trained Transformer is reused. Fine-tuning typically takes only 3 epochs.
+
+### Task-Specific Input Transformations
+
+<div align="center">
+![Figure 1: Task-Specific Input Transformations](/figures/gpt-finetuning.png)
+</div>
+
+Structured inputs (pairs or triplets of text) are reformulated as single contiguous token sequences using delimiter tokens, avoiding task-specific architectural changes:
+
+* **Classification**: `[Start] text [Extract]` - project to the n classes to show classification probabilities
+* **Entailment**: `[Start] premise [Delimiter] hypothesis [Extract]` - a single numeric output quantifying the probability of entailment
+* **Similarity**: `[Start] text1 [Delimiter] text2 [Extract]` - process both orderings and add representations element-wise to show a single numeric output quantifying similarity score
+* **Multiple choice**: `[Start] context [Delimiter] answer_k [Extract]` — score each answer independently
+
+This traversal-style approach means the same model architecture handles text classification, textual entailment, semantic similarity, and question answering with no structural modifications.
+
+### Zero-Shot Behaviors
+
+<div align="center">
+![Figure 2: GPT-1 Zero Shot Behaviors](/figures/gpt1-zero-shot.png)
+</div>
+
+Even in GPT-1, the authors observed that the pre-trained model already exhibits useful zero-shot behavior — a finding that foreshadows the entire direction of GPT-2 and GPT-3. They designed heuristic evaluation schemes that use the generative model directly (no fine-tuning): for CoLA, score each example by its average token log-probability and threshold; for SST-2, append "very" and restrict the output distribution to "positive"/"negative"; for RACE, pick the answer choice the model assigns the highest average log-probability conditioned on the document and question; for Winograd schemas, substitute each candidate referent and compare the log-probability the model assigns to the continuation.
+
+These heuristics improve steadily over the course of pre-training, suggesting that the language modeling objective forces the model to learn task-relevant capabilities as a byproduct. The authors also observed that the Transformer exhibits lower variance in zero-shot performance than an LSTM baseline, suggesting that structured self-attention assists in transfer — an early empirical signal that the Transformer's inductive bias is particularly well-suited to learning general-purpose representations.
+
+---
+
+## GPT-2: Zero-Shot Transfer
+
+Following the zero-shot behavior observed in GPT-1, GPT-2 asks: if we scale up the model and training data, can we eliminate fine-tuning entirely? GPT-2 achieves competitive results on many tasks in a zero-shot setting, with no gradient updates or parameter modifications at all.
+
+### The Multitask Hypothesis
+
+GPT-1's fine-tuning relied on special delimiter tokens (`[Start]`, `[Delimiter]`, `[Extract]`) to structure task inputs. But without fine-tuning, the model has no reason to understand these tokens — they never appeared in the pre-training corpus, so a non-fine-tuned model is likely confused by them. A natural hypothesis follows: if we want the model to perform tasks without fine-tuning, the input should be formatted as natural language phrases that resemble what the model already saw during pre-training.
+
+This is exactly the conceptual shift in GPT-2. Rather than inventing an artificial input format and teaching the model to parse it, GPT-2 frames all NLP tasks as language modeling. A general system should model $P(\text{output} \mid \text{input}, \text{task})$, and natural language provides a flexible way to specify all three components as a single sequence. A translation example becomes `(translate to french, english text, french text)`. A reading comprehension example becomes `(answer the question, document, question, answer)`.
+
+If a language model is trained on sufficiently diverse data, it will encounter natural demonstrations of these tasks and learn to perform them as a byproduct of next-token prediction — unsupervised multitask learning.
+
+<div align="center">
+![Figure 3: GPT-2 Example Data](/figures/gpt2-example-data.png)
+</div>
+
+### WebText Dataset
+
+To test this hypothesis, GPT-2 needs training data that is both large and diverse. Common Crawl has scale but poor quality. Instead, OpenAI created WebText: all outbound links from Reddit posts that received at least 3 karma (a heuristic for human-curated quality). After de-duplication and cleaning, WebText contains about 40GB of text from 8 million documents, with Wikipedia excluded to avoid test-set contamination.
+
+### Input Representation
+
+GPT-2 introduces byte-level BPE — a BPE tokenizer that operates on UTF-8 byte sequences rather than Unicode code points. This requires a base vocabulary of only 256 (vs. 130,000+ for Unicode BPE) while remaining capable of encoding any string. To avoid suboptimal merges, BPE is prevented from merging across character categories (with an exception for spaces to improve compression).
+
+### Architecture
+
+<div align="center">
+![Figure 4: GPT-2 Architecture](/figures/gpt2-architecture.png)
+</div>
+
+GPT-2 follows GPT-1's decoder-only Transformer with several modifications:
+
+* Layer normalization moved to the input of each sub-block (pre-norm, similar to pre-activation ResNets)
+* An additional layer normalization added after the final self-attention block
+* Residual layer weights scaled by $1/\sqrt{N}$ at initialization (where $N$ is the number of residual layers) to account for accumulation on the residual path
+* Vocabulary expanded to 50,257 tokens
+* Context window increased from 512 to 1024 tokens
+
+The largest model has 1.5B parameters, 48 layers, and $d_{\text{model}} = 1600$.
+
+### Results
+
+GPT-2 achieves state-of-the-art results on 7 of 8 language modeling benchmarks in a zero-shot setting (no fine-tuning, no task-specific training data). On CoQA, the model reaches 55 F1 zero-shot — matching or exceeding 3 of 4 baseline systems trained on 127,000+ examples. However, GPT-2 still underfits WebText, suggesting that performance would continue improving with more compute.
+
+<div align="center">
+![Figure 5: GPT-2 Result](/figures/gpt2-result.png)
+</div>
+
+---
+
+## GPT-3: In-Context Learning at Scale
+
+GPT-3 pushes to 175 billion parameters — 10x larger than any previous non-sparse language model — and systematically studies how in-context learning scales with model size.
+
+### The Case Against Fine-Tuning
+
+By GPT-3's framing, traditional fine-tuning has fundamental problems that grow worse as models get larger. First, it requires thousands to hundreds of thousands of labeled examples per task — expensive to collect and limiting in practice. Second, and more subtly, the potential to exploit spurious correlations in training data grows with model expressiveness. Large models are designed to absorb broad information during pre-training, but fine-tuning then narrows them onto a very specific task distribution. The result is brittle: larger fine-tuned models do not necessarily generalize better out-of-distribution, and benchmark performance — even when nominally at human level — can exaggerate actual task competence because the model has overfit to surface patterns in the fine-tuning data rather than learning the underlying task.
+
+The alternative is in-context learning: rather than updating weights, provide the model with a natural-language description of the task and a few demonstrations at inference time. The model conditions on this prompt and generates — no gradient updates, no new parameters, no risk of overfitting to a narrow fine-tuning distribution. GPT-3 shows that in-context learning ability scales with model size.
+
+<div align="center">
+![Figure 6: GPT-3 In Context Learning](/figures/gpt3-few-shot.png)
+</div>
+
+### Evaluation Settings
+
+<div align="center">
+![Figure 7: GPT-3 vs Fine Tune](/figures/gpt3-vs-fine-tune.png)
+</div>
+
+GPT-3 is evaluated under four conditions that form a spectrum of task-specific supervision:
+
+* **Zero-shot**: only a natural language instruction describing the task. No examples.
+* **One-shot**: one demonstration plus an instruction.
+* **Few-shot**: $K$ demonstrations (typically 10–100, as many as fit in the 2048-token context window) plus an instruction.
+* **Fine-tuning**: updating model weights on task-specific data (explored only in principle, not in the paper).
+
+No gradient updates occur in any of the first three settings — the model simply conditions on the prompt and generates. The paper demonstrates that performance improves both with the number of demonstrations $K$ and with model size, across most tasks.
+
+### Architecture and Training
+
+GPT-3 uses the same architecture as GPT-2 with one addition: alternating dense and locally banded sparse attention patterns (from the Sparse Transformer). Eight model sizes are trained, from 125M to 175B parameters, to study scaling behavior. All models use a context window of $n_{\text{ctx}} = 2048$ tokens. The table below summarizes the key architectural parameters: $n_{\text{params}}$ is total trainable parameters, $n_{\text{layers}}$ is depth, $d_{\text{model}}$ is the bottleneck width (feed-forward is always $4 \times d_{\text{model}}$), and $d_{\text{head}}$ is the per-head dimension.
+
+<div align="center">
+![Figure 8: GPT-3 Model Size](/figures/gpt3-model-size.png)
+</div>
+
+Training data comes from a filtered version of CommonCrawl, cleaned in three steps: (1) filtering based on similarity to high-quality reference corpora, (2) fuzzy deduplication at the document level within and across datasets, and (3) mixing in known high-quality sources (books, Wikipedia) to increase diversity. The training process uses Adam ($\beta_1 = 0.9$, $\beta_2 = 0.95$, $\epsilon = 10^{-8}$) with cosine decay to 10% of peak learning rate over 260 billion tokens, linear warmup over the first 375 million tokens, gradient clipping at 1.0, and weight decay of 0.1. Batch size is increased linearly from 32k tokens to full size over the first 4–12 billion tokens depending on model size. Sequences are packed to the full 2048-token context window with a special end-of-text delimiter between documents; no cross-document masking is applied.
+
+### Evaluation Methodology
+
+For few-shot evaluation, $K$ examples are randomly drawn from the task's training set and placed in the prompt, delimited by newlines. $K$ ranges from 0 to whatever fits in the 2048-token context (typically 10–100). On multiple-choice tasks, the model scores each completion by per-token log-likelihood; on some datasets (ARC, OpenBookQA, RACE) an additional normalization by unconditional completion probability $P(\text{completion} \mid \text{"Answer:"})$ improves results. Binary classification tasks use semantically meaningful option names ("True"/"False" rather than 0/1). Free-form tasks use beam search (width 4, length penalty $\alpha = 0.6$).
+
+### Key Results
+
+GPT-3 demonstrates strong few-shot performance across a wide range of tasks:
+
+* **CoQA**: 81.5 F1 (zero-shot), 84.0 F1 (one-shot), 85.0 F1 (few-shot)
+* **TriviaQA** (closed-book): 64.3% (zero-shot), 68.0% (one-shot), 71.2% (few-shot) — state-of-the-art among closed-book models
+* **Translation**: competitive performance without any parallel training data
+* **Arithmetic**: GPT-3 can perform 2-digit addition and subtraction, with performance degrading on longer digit sequences
+
+At the same time, GPT-3 struggles on tasks like natural language inference (ANLI) and some reading comprehension benchmarks (RACE, QuAC), indicating that in-context learning has not fully closed the gap with fine-tuning.
