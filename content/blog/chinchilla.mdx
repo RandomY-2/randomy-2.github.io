@@ -1,0 +1,242 @@
+---
+slug: chinchilla-scaling-laws
+title: "Chinchilla: Training Compute-Optimal Large Language Models"
+date: "2026-06-27"
+description: "The Chinchilla paper overturns the prevailing wisdom on LLM scaling. By training over 400 models from 70M to 16B parameters, Hoffmann et al. show that model size and training tokens should be scaled equally — implying that most existing large models are significantly undertrained. A 70B model trained on 1.4T tokens outperforms the 280B Gopher on nearly every benchmark."
+tags: [chinchilla, scaling-laws, compute-optimal, training-tokens, gopher, deepmind, language-model, transformer]
+category: ai
+---
+
+## Introduction
+
+The compute and energy cost for training large language models is substantial, and rises with model size. In practice, the allocated training compute budget is often known in advance — how many accelerators are available and for how long. Since it is typically only feasible to train these large models once, accurately estimating the best model hyperparameters for a given compute budget is critical.
+
+Kaplan et al. (2020) showed that there is a power-law relationship between the number of parameters in an autoregressive language model and its performance. This led the field to train ever-larger models, expecting performance improvements. A notable conclusion from that work: given a 10x increase in computational budget, model size should increase 5.5x while the number of training tokens should only increase 1.8x. The result was a generation of models — GPT-3 (175B), Gopher (280B), MT-NLG (530B) — all trained on roughly the same 300B tokens.
+
+The Chinchilla paper revisits this question and reaches a fundamentally different answer. By training over 400 models ranging from 70M to 16B parameters on 5B to 500B tokens, it finds that model size and training tokens should be scaled in equal proportions: for every doubling of model size, the number of training tokens should also double. The immediate implication is that current large language models are significantly undertrained.
+
+The paper validates this by training Chinchilla — a 70B model on 1.4T tokens using the same compute as the 280B Gopher — and showing that it outperforms Gopher on nearly every evaluation task while being 4x cheaper to serve at inference.
+
+<div align="center">
+![Figure 1: Current LLMs](/figures/chinchilla-current-llms.png)
+</div>
+
+<div align="center">
+![Figure 2: Chinchilla Overview](/figures/chinchilla-overview.png)
+</div>
+
+---
+
+## The Optimization Problem
+
+The question is formalized as constrained optimization. Let $N$ be the number of model parameters and $D$ the number of training tokens. The computational budget $C$ is a deterministic function of $N$ and $D$. The goal is to minimize pre-training loss $L$ under the constraint $\text{FLOPs}(N, D) = C$:
+
+$$
+N_{\text{opt}}(C), D_{\text{opt}}(C) = \arg\min_{N,D \text{ s.t. } \text{FLOPs}(N,D)=C} L(N,D)
+$$
+
+The functions $N_{\text{opt}}(C)$ and $D_{\text{opt}}(C)$ describe the optimal allocation of any compute budget $C$.
+
+---
+
+## FLOPs Computation
+
+The paper uses the approximation $C \approx 6ND$ for total training FLOPs, including contributions from embedding matrices. The factor of 2 accounts for the multiply-accumulate cost of each operation. The forward pass for a single training sequence of length $S$ breaks down as follows:
+
+**Embeddings**:
+
+$$
+2 \times S \times V \times d_{\text{model}}
+$$
+
+where $V$ is vocabulary size. This is the cost of projecting token IDs into embedding space.
+
+**Attention (single layer)**:
+
+* Key, query, and value projections:
+
+$$
+2 \times 3 \times S \times d_{\text{model}} \times (d_{\text{head}} \times n_{\text{heads}})
+$$
+
+* Key @ Query logits:
+
+$$
+2 \times S \times S \times (d_{\text{head}} \times n_{\text{heads}})
+$$
+
+* Softmax (exp, sum, divide):
+
+$$
+3 \times n_{\text{heads}} \times S \times S
+$$
+
+* Softmax @ Value reductions:
+
+$$
+2 \times S \times S \times (d_{\text{head}} \times n_{\text{heads}})
+$$
+
+* Final linear (output projection):
+
+$$
+2 \times S \times (d_{\text{head}} \times n_{\text{heads}}) \times d_{\text{model}}
+$$
+
+**Dense block (single layer)**:
+
+$$
+2 \times S \times (d_{\text{model}} \times d_{\text{ff}} + d_{\text{ff}} \times d_{\text{model}})
+$$
+
+where $d_{\text{ff}} = 4 \times d_{\text{model}}$ by convention. This simplifies to $4 \times S \times d_{\text{model}} \times d_{\text{ff}}$.
+
+**Final logits**:
+
+$$
+2 \times S \times d_{\text{model}} \times V
+$$
+
+**Total forward pass**:
+
+$$
+\text{embeddings} + n_{\text{layers}} \times (\text{attention} + \text{dense}) + \text{logits}
+$$
+
+For large models, the embedding and logit terms are small relative to the per-layer terms, so the forward pass is approximately $2N$ FLOPs per token. The backward pass costs roughly $2\times$ the forward pass (computing gradients with respect to both activations and weights), giving $\approx 6N$ FLOPs per training token. Over $D$ tokens the total training compute is $C \approx 6ND$.
+
+---
+
+## Estimating the Optimal Parameter/Training Tokens Allocation
+
+The paper presents three independent approaches. All assume a power-law relationship between compute and model size. The resulting predictions are similar across methods and suggest that parameter count and training tokens should be increased equally with more compute.
+
+<div align="center">
+![Figure 3: Chinchilla Estimation](/figures/chinchilla-estimation.png)
+</div>
+
+### Approach 1: Fix Model Sizes, Vary Number of Training Tokens
+
+<div align="center">
+![Figure 4: Chinchilla Approach 1](/figures/chinchilla-option1.png)
+</div>
+
+For a fixed family of models (70M to 10B+), vary the number of training steps. For each parameter count $N$, train 4 models, decaying the learning rate by $10\times$ over a horizon (measured in tokens) that ranges by $16\times$. For each run, smooth and interpolate the training loss curve to obtain a continuous mapping from FLOP count to loss.
+
+For each FLOP count, determine which run achieves the lowest loss. This yields a mapping from any FLOP count $C$ to the most efficient choice of model size $N$ and training tokens $D$ such that $\text{FLOPs}(N, D) = C$. At 1500 logarithmically spaced FLOP values, find which model size achieves the lowest loss. Finally, fit power laws:
+
+$$
+N_{\text{opt}} \propto C^a, \quad D_{\text{opt}} \propto C^b
+$$
+
+Result: $a = 0.50$, $b = 0.50$.
+
+### Approach 2: IsoFLOP Profiles
+
+<div align="center">
+![Figure 5: Chinchilla Approach 2](/figures/chinchilla-option2.png)
+</div>
+
+Vary the model size for a fixed set of 9 different training FLOP counts ($6 \times 10^{18}$ to $3 \times 10^{21}$), and consider the final training loss for each point. This directly answers: for a given FLOP budget, what is the optimal parameter count?
+
+For each FLOP budget, plot final loss against parameter count. In all cases, ensure a diverse enough set of model sizes to see a clear minimum — the curves are U-shaped because too-small models underfit while too-large models are undertrained at the given budget. Fit a parabola to each IsoFLOP curve to estimate the loss-minimizing model size. Then fit power laws across the minima.
+
+Result: $a = 0.49$, $b = 0.51$.
+
+### Approach 3: Fitting a Parametric Loss Function
+
+<div align="center">
+![Figure 6: Chinchilla Approach 3](/figures/chinchilla-option3.png)
+</div>
+
+Model all final losses as a parametric function of $N$ and $D$. Following a classical risk decomposition:
+
+$$
+\hat{L}(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta}
+$$
+
+The first term $E$ captures the loss for an ideal generative process on the data distribution — the entropy of natural text. The second term captures the fact that a perfectly trained Transformer with $N$ parameters underperforms the ideal process (finite model capacity). The third term captures the fact that the Transformer is not trained to convergence (finite optimization steps on a finite sample).
+
+**Model fitting.** Estimate $(A, B, E, \alpha, \beta)$ by minimizing Huber loss ($\delta = 10^{-3}$) between predicted and observed log loss using L-BFGS:
+
+$$
+\min_{A,B,E,\alpha,\beta} \sum_{\text{Runs } i} \text{Huber}_\delta \left(\log \hat{L}(N_i, D_i) - \log L_i\right)
+$$
+
+A grid of initializations accounts for local minima. The Huber loss provides robustness to outliers — runs at very low compute budgets that behave irregularly — which is important for good extrapolation to larger scales.
+
+**Efficient frontier.** Minimize $\hat{L}$ under the constraint $\text{FLOPs}(N, D) \approx 6ND$. The resulting $N_{\text{opt}}$ and $D_{\text{opt}}$ balance the capacity term and the convergence term. By construction they have power-law form:
+
+$$
+N_{\text{opt}}(C) = G\left(\frac{C}{6}\right)^a, \quad D_{\text{opt}}(C) = G^{-1}\left(\frac{C}{6}\right)^b
+$$
+
+$$
+G = \left(\frac{\alpha A}{\beta B}\right)^{1/(\alpha + \beta)}, \quad a = \frac{\beta}{\alpha + \beta}, \quad b = \frac{\alpha}{\alpha + \beta}
+$$
+
+The exponents have a clean interpretation: $a$ and $b$ are determined solely by the relative rates at which loss improves with model size ($\alpha$) versus with data ($\beta$). If capacity and convergence improve at the same rate ($\alpha = \beta$), then $a = b = 0.5$ — exactly equal scaling.
+
+Result: $a = 0.46$, $b = 0.54$.
+
+### Optimal Model Scaling
+
+All three approaches, despite using different fitting methodologies and different trained models, yield comparable predictions. The first and second approaches give very similar optimal model sizes. The third approach predicts even smaller models at larger compute budgets, because the Huber loss down-weights low-FLOP outliers and the empirical frontier shows slight negative curvature in $\log(N_{\text{opt}})$ at high compute.
+
+The key observation: points at low training FLOPs ($C \leq 10^{21}$) have larger residuals $|L - \hat{L}(N,D)|$ than points at higher budgets. The fitted model automatically treats these as outliers, placing more weight on the high-compute regime where predictions matter most.
+
+Concrete predictions from Table 3: a 175B model should be trained with $4.41 \times 10^{24}$ FLOPs on over 4.2 trillion tokens. A 280B Gopher-like model requires approximately $10^{25}$ FLOPs and 6.8 trillion tokens. Unless one has a compute budget of $10^{26}$ FLOPs — over 250x what was used for Gopher — a 1 trillion parameter model is unlikely to be optimal.
+
+### Why This Differs from Kaplan et al.
+
+The Chinchilla analysis disagrees with Kaplan et al. (2020) for three key methodological reasons:
+
+* Kaplan et al. did not train models to convergence at each size, biasing estimates toward larger models that show faster early improvement
+* Kaplan et al. used a fixed learning rate schedule across model sizes, whereas Chinchilla tunes the cosine decay horizon per size (the learning rate should finish decaying roughly when training ends)
+* Chinchilla fits the loss surface over a much wider range of both $N$ and $D$, with many more data points at high token counts
+
+The result: Kaplan et al. recommend allocating 5.5x to parameters and 1.8x to tokens for a 10x compute increase. Chinchilla says both should grow $\sqrt{10} \approx 3.2\times$.
+
+---
+
+## Chinchilla
+
+Based on the analysis above, the optimal model size for the Gopher compute budget is somewhere between 40 and 70 billion parameters. The paper tests this by training a model at the larger end of this range — 70B parameters — for 1.4T tokens. Both Chinchilla and Gopher are trained for the same number of FLOPs but differ in size and training duration.
+
+### Model and Training Details
+
+Chinchilla uses the same model architecture and training setup as Gopher with the following modifications:
+
+* **Optimizer**: AdamW rather than Adam, which improves language modeling loss and downstream fine-tuning performance
+* **Tokenizer**: Modified SentencePiece that does not apply NFKC normalization. The vocabulary overlaps 94.15% with Gopher's, but the lack of normalization particularly helps representation of mathematics and chemistry (symbols that NFKC would collapse into canonical forms)
+* **Data**: Trained on MassiveText (same as Gopher) but with a slightly different subset distribution to account for the increased number of training tokens — 4x more data must be drawn without excessive repetition
+* **Precision**: Forward and backward passes in bfloat16, with a float32 copy of weights maintained in the distributed optimizer state
+
+Due to being 4x smaller than Gopher, both the memory footprint and inference cost of Chinchilla are proportionally reduced.
+
+### Results
+
+Chinchilla outperforms Gopher on nearly every measured evaluation task — language modeling, reading comprehension, common sense reasoning, question answering, and MMLU (67.5% vs. Gopher's 60.0%) — despite being 4x smaller. The reduced model size translates directly to 4x lower inference cost, 4x lower memory footprint, and greatly facilitates deployment on smaller hardware. The energy cost of a large language model is amortized through its usage for inference and fine-tuning; the benefits of a smaller, better-trained model extend well beyond the immediate performance gain.
+
+---
+
+## Discussion
+
+The trend leading up to this paper was to increase model size without increasing training tokens. MT-NLG 530B is over 3x larger than GPT-3's 175B parameters, yet was trained on a comparable number of tokens (~300B). While the engineering effort required to train these models drove substantial infrastructure innovation, the Chinchilla analysis shows that this race to scale parameters resulted in models substantially underperforming what could have been achieved with the same compute.
+
+### Limitations
+
+* Only two comparable runs exist at truly large scale (Chinchilla and Gopher). There are no additional validation points at intermediate scales.
+* The analysis assumes the efficient frontier is a power law. However, some concavity in $\log(N_{\text{opt}})$ at high compute suggests the paper may still overestimate optimal model size for the very largest budgets.
+* All training runs use less than one epoch of data. The multiple-epoch regime — where tokens are repeated — may follow different scaling laws.
+* The $6ND$ approximation ignores communication overhead, activation recomputation, and other systems costs that affect wall-clock time differently from theoretical FLOPs.
+
+Despite these limitations, the head-to-head comparison validates the prediction: a model trained according to the estimated frontier outperforms a model 4x its size trained with the same compute.
+
+### Broader Implications
+
+The analysis suggests an increased focus on dataset scaling is needed. Compute-optimal training of a 175B model requires over 4T tokens — far beyond what most datasets provide. Scaling to trillions of tokens is only beneficial when data is high-quality, which calls for responsible collection, careful deduplication, and thorough train-test overlap auditing at both the language modeling and downstream task level.
+
+Training for trillions of tokens also introduces ethical and privacy concerns. Large datasets scraped from the web contain toxic language, biases, and private information. With larger datasets, the absolute quantity of such content increases, making dataset introspection even more important. Interestingly, Chinchilla appears less affected by toxicity than Gopher despite seeing more data — understanding this interaction between training duration, model size, and harmful outputs remains open.
+
+While the paper applies its methodology to autoregressive language models, the authors expect a similar trade-off between model size and data quantity in other modalities. Since training large models is expensive and typically done once, choosing the optimal allocation beforehand is essential. The three methods proposed are straightforward to reproduce in new settings.
