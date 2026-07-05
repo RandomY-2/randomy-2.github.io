@@ -1,0 +1,299 @@
+---
+slug: scaling-laws-neural-language-models
+title: "Scaling Laws for Neural Language Models"
+date: "2026-07-05"
+description: "Kaplan et al. (2020) establish that language model loss follows clean power laws in model size, dataset size, and compute — spanning over seven orders of magnitude. These scaling laws predict optimal compute allocation: larger models are more sample-efficient, and compute-efficient training means training very large models on relatively modest data and stopping well before convergence."
+tags: [scaling-laws, power-laws, compute-optimal, transformer, language-model, openai, sample-efficiency, overfitting]
+category: ai
+---
+
+## Introduction
+
+This paper establishes that the cross-entropy loss of Transformer language models obeys simple power-law relationships with three scale factors:
+* the number of non-embedding parameters $N$
+* the dataset size $D$ in tokens
+* the amount of training compute $C$
+
+<div align="center">
+![Figure 1: Scaling Factors](/figures/scaling-three_factors.png)
+</div>
+
+These trends span more than seven orders of magnitude with no sign of deviation. Other architectural details — depth, width, number of attention heads — have minimal effect within a wide range, once the total parameter count is held fixed.
+
+<div align="center">
+![Figure 2: Scaling Size Trend](/figures/scaling-size_trend.png)
+</div>
+
+The scaling laws allow prediction of optimal compute allocation: given a fixed budget, how large should the model be, how much data should it see, and how many steps should it train? The surprising answer is that compute-efficient training means training very large models on relatively modest amounts of data and stopping significantly before convergence. Larger models are dramatically more sample-efficient.
+
+<div align="center">
+![Figure 3: Scaling Compute](/figures/scaling-more_compute.png)
+</div>
+
+---
+
+## Background and Methods
+
+All models are decoder-only Transformers trained on WebText2 (an extended version of WebText), tokenized with BPE (vocabulary size 50,257). The loss is cross-entropy averaged over a 1024-token context. Models are trained with Adam (or Adafactor for the largest) for $2.5 \times 10^5$ steps at batch size 512 sequences, with linear warmup over 3000 steps followed by cosine decay to zero.
+
+### Parameter and Compute Counting
+
+The paper defines model size $N$ as the number of non-embedding parameters:
+
+$$
+N \approx 2 \, d_{\text{model}} \, n_{\text{layer}} (2 \, d_{\text{attn}} + d_{\text{ff}}) = 12 \, n_{\text{layer}} \, d_{\text{model}}^2
+$$
+
+under the standard setting $d_{\text{attn}} = d_{\text{ff}}/4 = d_{\text{model}}$. Embedding parameters ($n_{\text{vocab}} \cdot d_{\text{model}}$ for token embeddings, $n_{\text{ctx}} \cdot d_{\text{model}}$ for positional embeddings) are excluded — this produces significantly cleaner scaling laws.
+
+The forward pass costs approximately:
+
+$$
+C_{\text{forward}} \approx 2N + 2 \, n_{\text{layer}} \, n_{\text{ctx}} \, d_{\text{model}}
+$$
+
+multiply-accumulate operations per token. For large models, the first term dominates (the second is the attention logits cost, which is sub-leading when $d_{\text{model}} \gg n_{\text{ctx}}$). Total non-embedding training compute is estimated as:
+
+$$
+C \approx 6NBS
+$$
+
+where $B$ is batch size in tokens and $S$ is the number of parameter updates. The factor of 6 accounts for the forward pass ($\approx 2N$) plus a backward pass at roughly $2\times$ that cost.
+
+Compute is quoted in PF-days, where one PF-day equals $10^{15} \times 24 \times 3600 = 8.64 \times 10^{19}$ floating point operations.
+
+---
+
+## Empirical Results and Basic Power Laws
+
+### Performance depends strongly on scale, weakly on model shape
+
+<div align="center">
+![Figure 4: Shape Performance](/figures/scaling-shape_performance.png)
+</div>
+
+Transformer performance depends very weakly on shape parameters ($n_{\text{layer}}$, $n_{\text{heads}}$, $d_{\text{ff}}$) when total non-embedding parameter count $N$ is held fixed. The authors verify this by varying one hyperparameter at a time while adjusting others to maintain constant $N$. For example, varying $n_{\text{layer}}$ requires simultaneously varying $d_{\text{model}}$ to keep $N \approx 12 \, n_{\text{layer}} \, d_{\text{model}}^2$ fixed.
+
+This independence would follow if deeper Transformers effectively behave as ensembles of shallower models (as has been suggested for ResNets). The practical implication is that performance is governed by scale, not shape — justifying the focus on $N$, $D$, and $C$ as the three relevant axes.
+
+### Performance with Non-Embedding Parameter Count $N$
+
+<div align="center">
+![Figure 5: Non-embedding Parameter Count](/figures/scaling-embedding_parameter.png)
+</div>
+
+Models ranging from $(n_{\text{layer}}, d_{\text{model}}) = (2, 128)$ through billion-parameter configurations trained to near convergence on full WebText2 follow a clean power law:
+
+$$
+L(N) = \left(\frac{N_c}{N}\right)^{\alpha_N}
+$$
+
+with $\alpha_N \approx 0.076$ and $N_c \approx 8.8 \times 10^{13}$. Crucially, this trend only emerges clearly when plotting against non-embedding parameters. Using total parameter count (including embeddings) obscures the relationship, suggesting the embedding matrix can be made smaller without impacting performance.
+
+<div align="center">
+![Figure 6: Non-embedding Parameter Count Other Datasets](/figures/scaling-other_datasets.png)
+</div>
+
+The same power law holds when evaluating on other text distributions (not just WebText2), with nearly identical exponents but different offsets — transfer to a different distribution incurs a roughly constant penalty but otherwise improves in parallel with in-distribution performance.
+
+### Comparison to LSTMs
+
+<div align="center">
+![Figure 7: Transformer vs. LSTM](/figures/scaling-vs_lstm.png)
+</div>
+
+LSTMs follow the same power-law trend as Transformers for tokens appearing early in the context, but cannot match Transformer performance for later tokens. The Transformer's advantage grows with context length, suggesting that its structured attention mechanism is particularly effective at learning long-range dependencies. The gap between architectures is not a matter of parameter efficiency for simple patterns, but of the ability to exploit long-range context.
+
+### Performance with Dataset Size $D$
+
+A model with $(n_{\text{layer}}, d_{\text{model}}) = (36, 1280)$ trained on fixed subsets of WebText2 (with early stopping when test loss plateaus) follows:
+
+$$
+L(D) = \left(\frac{D_c}{D}\right)^{\alpha_D}
+$$
+
+with $\alpha_D \approx 0.095$ and $D_c \approx 5.4 \times 10^{13}$ tokens.
+
+### Performance with Compute $C$
+
+For a given compute budget, scanning over model sizes to find the one achieving the lowest loss at step $S = C/(6BN)$ yields:
+
+$$
+L(C_{\min}) = \left(\frac{C_c^{\min}}{C_{\min}}\right)^{\alpha_C^{\min}}
+$$
+
+with $\alpha_C^{\min} \approx 0.050$ and $C_c^{\min} \approx 3.1 \times 10^8$ PF-days.
+
+---
+
+## Charting the Infinite Data Limit and Overfitting
+
+### The $L(N, D)$ Equation
+
+When both $N$ and $D$ are varied simultaneously, the loss follows a single equation governing overfitting:
+
+$$
+L(N, D) = \left[\left(\frac{N_c}{N}\right)^{\alpha_N / \alpha_D} + \frac{D_c}{D}\right]^{\alpha_D}
+$$
+
+This functional form is motivated by three principles:
+
+1. Changes in vocabulary/tokenization should rescale the loss by an overall factor (satisfied by allowing $N_c$ and $D_c$ to shift)
+2. Fixing $D \to \infty$ must recover $L(N)$; fixing $N \to \infty$ must recover $L(D)$
+3. $L(N,D)$ should be analytic at $D = \infty$, admitting a series expansion in $1/D$ with integer powers
+
+The ratio $N^{\alpha_N/\alpha_D}/D$ governs the degree of overfitting. This exponent comes directly from the $L(N,D)$ equation: inside the brackets, the two terms are $(N_c/N)^{\alpha_N/\alpha_D}$ and $D_c/D$. For the data term not to dominate (i.e., for overfitting not to degrade performance), we need $D$ to scale at least as fast as $N^{\alpha_N/\alpha_D}$. Plugging in the measured exponents gives $\alpha_N/\alpha_D \approx 0.076/0.095$, so the data requirement grows sub-linearly with model size. Empirically, to avoid overfitting to within the noise level (~0.02 nats) of different random seeds:
+
+$$
+D \gtrsim (5 \times 10^3) \, N^{0.74}
+$$
+
+This means that every time model size increases by $8\times$, data only needs to increase by roughly $5\times$ to keep overfitting under control. Models smaller than $10^9$ parameters can be trained on the 22B-token WebText2 dataset with minimal overfitting. However, this sub-linear data scaling does not typically represent maximally compute-efficient training — it represents the threshold at which overfitting becomes problematic.
+
+---
+
+## Scaling Laws with Model Size and Training Time
+
+### Critical Batch Size
+
+<div align="center">
+![Figure 8: Critical Batch Size](/figures/scaling-batch_size.png)
+</div>
+
+The critical batch size $B_{\text{crit}}$ — the point at which doubling the batch size begins to yield diminishing returns in terms of compute efficiency — depends only on the loss, not on model size:
+
+$$
+B_{\text{crit}}(L) = \frac{B_*}{L^{1/\alpha_B}}
+$$
+
+with $B_* \approx 2 \times 10^8$ tokens and $\alpha_B \approx 0.21$.
+
+This is used to define two adjusted quantities: the minimum steps $S_{\min}$ (the effective number of steps if training at $B \gg B_{\text{crit}}$) and the minimum compute $C_{\min}$ (the compute if training at $B \ll B_{\text{crit}}$):
+
+$$
+S_{\min}(S) = \frac{S}{1 + B_{\text{crit}}(L)/B}, \quad C_{\min}(C) = \frac{C}{1 + B/B_{\text{crit}}(L)}
+$$
+
+These adjustments decouple the effects of batch size from the intrinsic scaling relationships.
+
+### Learning Curves: $L(N, S_{\min})$
+
+In the infinite-data limit, after an initial transient, training curves follow:
+
+$$
+L(N, S_{\min}) = \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{S_c}{S_{\min}}\right)^{\alpha_S}
+$$
+
+with $S_c \approx 2.1 \times 10^3$ and $\alpha_S \approx 0.76$.
+
+The first term is the irreducible loss for a model of size $N$ (the capacity limit). The second term is the convergence contribution — how far the model is from fully trained. The loss is additive in these two sources of sub-optimality.
+
+### Early Stopping
+
+The $L(N, S_{\min})$ fit provides a lower bound on the optimal early-stopping step for data-limited training:
+
+$$
+S_{\text{stop}}(N, D) \gtrsim \frac{S_c}{[L(N,D) - L(N, \infty)]^{1/\alpha_S}}
+$$
+
+The finite-data learning curve tracks the infinite-data curve until approximately $S_{\text{stop}}$, after which overfitting causes the test loss to rise. Training longer is wasteful.
+
+---
+
+## Optimal Allocation of the Compute Budget
+
+### Optimal Performance and Allocations
+
+<div align="center">
+![Figure 9: Optimal Compute Budget](/figures/scaling-optimal_compute.png)
+</div>
+
+Given the scaling laws above, the optimal allocation of a fixed compute budget $C_{\min}$ can be derived. The optimal model size, batch size, number of steps, and dataset size should grow as:
+
+$$
+N \propto C_{\min}^{\alpha_C^{\min}/\alpha_N}, \quad B \propto C_{\min}^{\alpha_C^{\min}/\alpha_B}, \quad S \propto C_{\min}^{\alpha_C^{\min}/\alpha_S}, \quad D = B \cdot S
+$$
+
+where:
+
+$$
+\alpha_C^{\min} = \frac{1}{1/\alpha_S + 1/\alpha_B + 1/\alpha_N} \approx 0.054
+$$
+
+Plugging in the empirical exponents:
+
+$$
+N \propto C_{\min}^{0.73}, \quad B \propto C_{\min}^{0.24}, \quad S \propto C_{\min}^{0.03}
+$$
+
+The critical finding: as compute increases, it should be spent primarily on larger models. The number of serial training steps grows negligibly (exponent ~0.03, possibly consistent with zero). Batch size grows slowly. Model size absorbs most of the budget.
+
+This is the opposite of the naive strategy of training a fixed-size model for longer. Compute-efficient training means training a very large model for relatively few steps on a relatively modest amount of data.
+
+### Predictions from $L(N, S_{\min})$
+
+The $L(N, S_{\min})$ equation independently predicts the compute-optimal scaling. Substituting $S_{\min} = C_{\min}/(6NB)$ and minimizing over $N$ at fixed $C_{\min}$ yields:
+
+$$
+L(C_{\min}) = \left(\frac{C_c^{\min}}{C_{\min}}\right)^{\alpha_C^{\min}}
+$$
+
+with $\alpha_C^{\min} = 1/(1/\alpha_S + 1/\alpha_B + 1/\alpha_N) \approx 0.054$, in excellent agreement with the empirically measured exponent. The predicted $N(C_{\min}) \propto C_{\min}^{0.71}$ also matches the empirical 0.73 to within a few percent.
+
+---
+
+## Contradictions and a Conjecture
+
+The scaling laws contain an internal tension that reveals their eventual breakdown. Compute-efficient training grows the dataset very slowly with compute:
+
+$$
+D(C_{\min}) \approx (4 \times 10^{10} \text{ tokens}) \cdot (C_{\min}/\text{PF-day})^{0.26}
+$$
+
+But avoiding overfitting (from Section 4) requires data to grow as:
+
+$$
+D \propto N^{0.74} \propto C_{\min}^{0.54}
+$$
+
+The data-efficiency growth (exponent 0.26) is slower than the overfitting-avoidance requirement (exponent 0.54). Eventually these two constraints intersect, implying that compute-efficient training will hit a data bottleneck — even if training data is never reused.
+
+At the intersection, the loss scaling transitions from:
+
+$$
+L(C_{\min}) \propto C_{\min}^{-0.050}
+$$
+
+to the slower data-limited regime:
+
+$$
+L(D(C_{\min})) \propto C_{\min}^{-0.03}
+$$
+
+The estimated intersection point — with large uncertainty — is:
+
+$$
+C^* \sim 10^4 \text{ PF-days}, \quad N^* \sim 10^{12} \text{ parameters}, \quad D^* \sim 10^{12} \text{ tokens}, \quad L^* \sim 1.7 \text{ nats/token}
+$$
+
+The paper conjectures this intersection has deeper meaning: it may represent the point at which Transformer language models have extracted all reliable information available in natural language data. In this interpretation, $L^*$ provides a rough estimate for the entropy-per-token of natural language — the irreducible loss floor.
+
+---
+
+## Key Takeaways
+
+The scaling laws paint a coherent picture of language model training:
+
+* **Scale dominates shape**: Performance depends on total non-embedding parameters, not on how they are distributed across layers, heads, or feed-forward width. This holds across a wide range of aspect ratios.
+
+* **Three clean power laws**: $L(N) \propto N^{-0.076}$, $L(D) \propto D^{-0.095}$, $L(C_{\min}) \propto C_{\min}^{-0.050}$, each spanning many orders of magnitude with no deviation.
+
+* **Sample efficiency of large models**: Larger models reach a given loss level with fewer optimization steps and less data than smaller models. This is why compute-efficient training favors very large models trained briefly.
+
+* **Compute allocation**: Given a fixed budget, almost all additional compute should go to model size. Training steps grow negligibly ($\propto C^{0.03}$). The optimal strategy is dramatically different from training a fixed model to convergence.
+
+* **Overfitting scales sub-linearly**: Data requirements grow as $D \propto N^{0.74}$, meaning data need not keep pace linearly with model size.
+
+* **Transfer is universal**: Performance on out-of-distribution text tracks in-distribution performance with a constant offset, regardless of model size or training duration.
+
+* **An eventual ceiling**: The internal logic of the scaling laws predicts their own breakdown at $\sim 10^{12}$ parameters and $\sim 10^{12}$ tokens, potentially indicating the entropy floor of natural language.
