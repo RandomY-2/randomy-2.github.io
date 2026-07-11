@@ -1,0 +1,299 @@
+---
+slug: query-optimization-relational-systems
+title: "An Overview of Query Optimization in Relational Systems"
+date: "2026-07-05"
+description: "Chatterji's survey lays out the fundamental architecture of relational query optimizers: the search space of equivalent plans, cost estimation via statistics and histograms, and enumeration algorithms from System-R's dynamic programming through extensible frameworks like Starburst and Volcano/Cascades."
+tags: [query-optimization, system-r, dynamic-programming, cost-estimation, histograms, join-ordering, volcano, cascades, starburst, sql]
+category: system-papers
+---
+
+## Introduction
+
+A SQL database's query evaluation component has two key pieces:
+* the **query optimizer**
+* the **query execution engine**
+
+The execution engine implements physical operators — sequential scan, index scan, nested-loop join, sort-merge join, external sort — that can be composed into operator trees (execution plans). The optimizer's job is to choose a good plan from the enormous space of possibilities.
+
+<div align="center">
+![Figure 1: Operator Tree](/figures/optimizer-operator_tree.png)
+</div>
+
+The problem is hard because even a simple query admits a combinatorial number of valid plans. The algebraic representation can be transformed into many logically equivalent forms (join reordering, predicate pushdown, view unfolding), and each algebraic form can be implemented with different physical operators. The throughput difference between a good plan and a bad plan can be orders of magnitude.
+
+Query optimization reduces to three sub-problems:
+
+* **Search space**: what set of plans are considered?
+* **Cost estimation**: how is each plan scored?
+* **Enumeration algorithm**: how do we search the space efficiently?
+
+A good optimizer needs all three: a search space that includes low-cost plans, accurate costing, and efficient enumeration.
+
+---
+
+## The System-R Optimizer
+
+The System-R project introduced the ideas that still form the backbone of most production optimizers. Consider a Select-Project-Join (SPJ) query — the class closely related to conjunctive queries in database theory.
+
+### Search Space
+
+<div align="center">
+![Figure 2: Linear vs. Bushy Join](/figures/optimizer-linear_bushy.png)
+</div>
+
+System-R restricts the search space to linear join sequences: `Join(Join(Join(A,B),C),D)`. Each join can be implemented with nested-loop or sort-merge. Each base table scan can use a sequential scan or an index scan (clustered or non-clustered). Predicates are evaluated as early as possible (pushed down).
+
+### Cost Model
+
+The cost model assigns an estimated cost to any partial or complete plan. It relies on:
+
+* Statistics on relations and indexes (number of data pages, number of index pages, number of distinct values per column)
+* Selectivity estimation formulas that project the output size of each operator (e.g., join output size = product of input sizes times joint selectivity of applicable predicates)
+* CPU and I/O cost formulas that account for the statistical properties of input streams, available access methods, and any ordering of the data stream
+
+For each operator in a plan, the cost model computes bottom-up: (1) the output data stream size, (2) any ordering of tuples created or sustained, and (3) the estimated execution cost (cumulative).
+
+### Enumeration: Dynamic Programming
+
+The enumeration algorithm exploits the **principle of optimality**: to obtain the optimal plan for $k$ joins, it suffices to consider only optimal plans for $(k-1)$-join subexpressions and extend them. Sub-optimal partial plans are pruned.
+
+The algorithm proceeds bottom-up. At step $j$, it produces optimal plans for all subqueries of size $j$. To get the optimal plan for $\{R_1, R_2, R_3, R_4\}$, it considers:
+
+* `Join({R_1, R_2, R_3}, R_4)`
+* `Join({R_1, R_2, R_4}, R_3)`
+* `Join({R_1, R_3, R_4}, R_2)`
+* `Join({R_2, R_3, R_4}, R_1)`
+
+and picks the cheapest. This reduces the enumeration from $O(n!)$ to $O(n \cdot 2^{n-1})$ plans.
+
+### Interesting Orders
+
+Pure dynamic programming can be sub-optimal when physical properties of intermediate results matter. Consider joining $\{R_1, R_2, R_3\}$ on predicate $R_1.a = R_2.a = R_3.a$. Suppose the nested-loop join of $R_1$ and $R_2$ costs $x$ and the sort-merge join costs $y > x$. Pruning the sort-merge plan is locally correct, but the sort-merge produces output sorted on $a$, which can dramatically reduce the cost of the subsequent join with $R_3$.
+
+System-R's solution: identify orderings of tuples that are potentially consequential to later operations — called interesting orders. Two plans are only compared if they represent the same logical expression and have the same interesting order. This prevents premature pruning of plans whose physical properties may pay off downstream.
+
+The concept was later generalized to physical properties: any characteristic of a plan that is not shared by all plans for the same logical expression but can impact subsequent operation costs. This provides a general mechanism to handle violations of the principle of optimality.
+
+---
+
+## Search Space
+
+### Representations
+
+<div align="center">
+![Figure 3: Query Graph](/figures/optimizer-query_tree.png)
+</div>
+
+The optimizer uses several representations during optimization:
+
+* **Parse tree**: the initial representation
+* **Query tree** (logical operator tree): captures the algebraic expression, often annotated
+* **Query graph**: nodes are relations, labeled edges are join predicates — useful for analyzing structure but limited (cannot represent unions, asymmetric operators, or nesting)
+* **Operator tree**: the final physical plan
+
+The QGM (Query Graph Model) used in Starburst generalizes the query graph: each "box" represents a query block, arcs represent cross-block references, and the structure handles nesting.
+
+### Linear vs. Bushy Join Trees
+
+System-R only considers linear join sequences. But since join is commutative and associative, bushy trees like `Join(Join(A,B), Join(C,D))` are also valid. Bushy trees require materializing intermediate results but can yield cheaper plans. The tradeoff: exploring bushy trees expands the enumeration cost considerably. Most production systems still focus on linear sequences with restricted subsets of bushy trees.
+
+Similarly, deferring Cartesian products (as System-R does) can hurt performance in star-schema queries where a Cartesian product among dimension tables significantly reduces the cost of subsequent joins.
+
+### Outer Joins and Commutativity
+
+A one-sided (left) outer join is an asymmetric operator: $(R \text{ LOJ } S)$ preserves all tuples of $R$. The result contains every tuple from the natural join of $R$ and $S$, plus all remaining tuples in $R$ that fail to match any tuple in $S$, padded with NULLs for the $S$ attributes. A symmetric (full) outer join preserves both operands. Because of this asymmetry, a sequence of outer joins and inner joins does not freely commute — reordering can change which tuples are preserved and which are padded with NULLs.
+
+However, when the inner join predicate is between $(R, S)$ and the outer join predicate is between $(S, T)$, the following associative identity holds:
+
+$$
+\text{Join}(R, S \text{ LOJ } T) = \text{Join}(R, S) \text{ LOJ } T
+$$
+
+Intuitively this works because the inner join with $R$ only filters on $S$ attributes (not on whether $T$ matched), so it doesn't matter whether the outer join with $T$ happens before or after. If this rule can be applied repeatedly, we obtain an equivalent expression where the "block of inner joins" precedes the "block of outer joins." Once separated, the inner joins can be freely reordered among themselves using standard commutativity and associativity. As with all transformations, application of this identity must be cost-based — it is not always beneficial to push outer joins to the end.
+
+### Pushing Down Group-By
+
+<div align="center">
+![Figure 4: Group By](/figures/optimizer-group_by.png)
+</div>
+
+Traditionally, group-by is evaluated after the SPJ component. But group-by can reduce tuple count dramatically (one tuple per partition), so pushing it below a join can be profitable. This is safe when:
+
+* The join is a foreign-key join
+* The aggregated columns come from one side of the join
+* The group-by columns are a superset of the foreign key columns
+
+More generally, group-by can be computed in stages: an early group-by reduces data volume before the join, and a final group-by merges partitions that the early aggregation may have split. This staged approach requires the aggregation function to be decomposable: $\text{Agg}(S \cup S') $ must be computable from $\text{Agg}(S)$ and $\text{Agg}(S')$.
+
+### Reducing Multi-Block Queries to Single-Block
+
+**View unfolding**: If a view $V = \text{Join}(S,T)$ appears in a query $Q = \text{Join}(R,V)$, unfold to $\text{Join}(R, \text{Join}(S,T))$ and freely reorder. This works for SPJ views but breaks when views contain `DISTINCT` or `GROUP BY` (unfolding requires pulling up the group-by operator first).
+
+**Subquery unnesting**: Correlated nested queries can often be flattened into single-block queries. Consider:
+
+```sql
+SELECT Emp.Name
+FROM Emp
+WHERE Emp.Dept# IN
+      (SELECT Dept.Dept# FROM Dept
+       WHERE Dept.Loc = 'Denver'
+       AND Emp.Emp# = Dept.Mgr)
+```
+
+Under tuple-iteration semantics, the inner query is re-evaluated for each tuple of `Emp`. When the inner block references a variable from the outer block (`Emp.Emp#` here), the blocks are correlated. If the inner block were uncorrelated (no outer variables), it would only need to be evaluated once — but correlation forces repeated evaluation.
+
+The key insight (Dayal): the tuple-iteration semantics of a correlated `IN` subquery correspond to a semijoin. The above query is equivalent to $\text{Semijoin}(\text{Emp}, \text{Dept}, \text{Emp.Dept\#} = \text{Dept.Dept\#})$, which can be rewritten as:
+
+$$
+\text{Semijoin}(R, S, p) = \text{Project}(\text{Join}(R, S, p), R.*)
+$$
+
+Once viewed this way, the nested query flattens to a single-block join:
+
+```sql
+SELECT E.Name
+FROM Emp E, Dept D
+WHERE E.Dept# = D.Dept#
+AND D.Loc = 'Denver' AND E.Emp# = D.Mgr
+```
+
+The flattened form is now subject to standard join reordering — a major optimization win compared to the correlated re-evaluation.
+
+**The difficulty with aggregation and nulls**: The simple semijoin-to-join rewrite breaks when the subquery contains aggregation. Suppose the outer block is `Dept` and the correlated subquery aggregates over `Emp`. If for some department $d$ no employees match the join predicate, the original query still produces an output tuple for $d$ (the aggregate evaluates over an empty set). But a plain inner join would drop $d$ entirely since the join predicate fails. To preserve correctness, the flattened form must use a left outer join — ensuring all tuples of the outer block survive — followed by `GROUP BY` / `HAVING`:
+
+```sql
+SELECT Dept.name FROM Dept LEFT OUTER JOIN Emp
+ON (Dept.name = Emp.dept_name)
+GROUP BY Dept.name
+HAVING Dept.num_of_machines < COUNT(Emp.*)
+```
+
+For linearly nested query blocks, this approach produces a single-block query consisting of a linear sequence of inner joins and outer joins. The associative rule from the outer join section then applies: all inner joins can be computed first, followed by all outer joins in sequence.
+
+### Semijoin-Like Techniques Across Blocks
+
+When full unnesting is impractical (recursive views, complex nesting), an alternative is to pass filtering information across query blocks — conceptually similar to semijoins in distributed databases. In distributed settings, a semijoin from site A to site B sends relevant key values so that B transmits no unnecessary tuples. In multi-block queries, A and B are different query blocks within the same query; transmission cost is not an issue, but the goal is the same: reduce computation in B by ensuring it only processes tuples relevant to A.
+
+Consider a query that joins `Emp` and `Dept`, then compares against a view computing average salary per department:
+
+```sql
+CREATE VIEW DepAvgSal AS (
+    SELECT E.did, AVG(E.Sal) AS avgsal
+    FROM Emp E GROUP BY E.did
+)
+
+SELECT E.eid, E.sal
+FROM Emp E, Dept D, DepAvgSal V
+WHERE E.did = D.did AND E.did = V.did
+AND E.age < 30 AND D.budget > 100k
+AND E.sal > V.avgsal
+```
+
+The technique recognizes that the join between `Emp` and `Dept` (with the local predicates `E.age < 30` and `D.budget > 100k`) produces a restricted set of `did` values. This set can be passed to the view `DepAvgSal` as a filter, avoiding the expensive aggregation over departments that will ultimately be discarded. The reformulation introduces intermediate views:
+
+1. `PartialResult`: compute the Emp-Dept join with local predicates
+2. `Filter`: project the distinct `did` values from `PartialResult`
+3. `LimitedDepAvgSal`: compute the average salary only for departments in `Filter`
+
+The final query joins `PartialResult` with `LimitedDepAvgSal` — computing aggregations only over the relevant subset of data. The tradeoff is the cost of materializing the intermediate views versus the savings from restricted computation. A degenerate case of this technique simply passes predicates (rather than materialized results) across blocks.
+
+---
+
+## Statistics and Cost Estimation
+
+Optimization is only as good as its cost estimates. The framework (from System-R): collect statistical summaries of stored data, then for each operator, derive
+
+* the statistical summary of its output stream
+* its estimated cost.
+
+Apply iteratively bottom-up through the operator tree.
+
+An important distinction: the statistical properties of a plan's output are a logical property (the same for all plans producing the same result), while the cost is a physical property (depends on which operators are used).
+
+### Histograms
+
+Most systems use histograms to represent data distribution on a column. A histogram divides column values into $k$ buckets. Common types:
+
+* **Equi-depth (equi-height)**: each bucket contains $n/k$ values. Within a bucket, values are assumed uniformly spread.
+* **Compressed histograms**: frequently occurring values get singleton buckets, with remaining values distributed across the rest.
+
+Histograms capture single-column distributions but not correlations among columns. Joint distributions would require multi-dimensional histograms, which are expensive. In practice, systems use summary information (e.g., number of distinct pairs from multi-column indexes) or assume independence between columns.
+
+### Propagation Through Operators
+
+Statistics must be propagated through operators:
+
+* **Selection**: modify the histogram on the selected column. Inaccuracy arises from within-bucket uniformity assumptions and inability to capture correlation with other columns.
+* **Multiple predicates**: assume independence (multiply selectivities). Some systems use only the most selective predicate and attempt to detect correlation.
+* **Joins**: histograms on join columns can be "joined," but this requires aligning bucket boundaries.
+* **No histogram available**: fall back to ad-hoc constants for selectivity estimation.
+
+### Challenges
+
+Accurate cost estimation remains one of the most difficult open problems:
+
+* Buffer pool hit ratios vary by access pattern (different for index levels vs. data pages, different for nested-loop vs. sort-merge joins)
+* Correlations between columns cause independence assumptions to produce wildly inaccurate estimates
+* Estimating the number of distinct values is provably error-prone — for any estimation scheme, there exists a database where the error is significant
+* Sampling can build accurate histograms for a specific query but building one accurate for a large class of queries requires more sophisticated techniques
+
+---
+
+## Enumeration Architectures
+
+System-R's join enumerator was purpose-built for linear join orders. Modern systems need extensibility: graceful adaptation to new transformations, new physical operators, and changes in cost estimation. Two representative extensible architectures are Starburst and Volcano/Cascades.
+
+### Starburst
+
+Optimization proceeds in two phases:
+
+**Phase 1 — Query rewrite**: Rules transform the QGM (Query Graph Model) into equivalent QGMs. Rules are pairs of functions: one checks applicability, one performs the transformation. A forward-chaining rule engine governs evaluation order, with rules grouped into classes whose ordering can be tuned. Since any rule application produces a valid QGM, correctness is guaranteed. However, this phase has no cost information — it must either retain all alternatives or apply rules heuristically (risking sub-optimality).
+
+**Phase 2 — Plan optimization**: Given a QGM, choose a physical operator tree. Physical operators (LOLEPOPs) are combined via grammar-production-like rules to implement higher-level operations. Plans carry a relational description (the algebraic expression), estimated cost, and physical properties (e.g., output order). Comparable plans with the same logical and physical properties but higher cost are pruned. The join enumerator uses bottom-up dynamic programming similar to System-R.
+
+### Volcano/Cascades
+
+Rules are used universally to represent search space knowledge:
+
+* **Transformation rules**: map an algebraic expression to an equivalent algebraic expression
+* **Implementation rules**: map an algebraic expression to a physical operator tree
+
+Both rule types may have applicability conditions. The system uses top-down dynamic programming (memoization): when presented with an optimization sub-goal, it first checks whether that goal has already been solved (matching logical and physical properties in a memo table). If not, it applies a logical transformation, an implementation rule, or an enforcer (an operator that modifies physical properties, e.g., inserting a sort to produce an ordered stream).
+
+At every stage, a programmable promise parameter determines which action to try next, reflecting cost heuristics.
+
+Key differences from Starburst:
+
+* No separation between rewrite and plan optimization — all transformations are algebraic and cost-based
+* Algebraic-to-physical mapping happens in a single step (not a grammar derivation)
+* Goal-driven (top-down) rule application rather than forward-chaining
+
+---
+
+## Beyond the Fundamentals
+
+### Parallel and Distributed Databases
+
+Distribution introduces communication costs and an expanded search space (choice of sites for intermediate operations, data repartitioning). Early work focused exclusively on reducing communication (e.g., semijoins), but System-R* showed that local processing costs dominate.
+
+Parallel databases exploit multiple processors to reduce response time. The optimizer must account for:
+
+* Physical data distribution (partitioning/replication across nodes)
+* Pipelined execution (producer/consumer on different processors)
+* Communication overhead from data repartitioning
+* Scheduling of operators across processors
+
+The XPRS approach separates optimization into two phases: (1) determine join order and access methods (treating partition attributes as physical properties), (2) schedule operators on processors accounting for communication costs and precedence constraints.
+
+### User-Defined Functions
+
+When stored procedures appear as predicates in SQL queries, the standard heuristic of evaluating predicates as early as possible breaks down — UDF predicates can be expensive (e.g., image analysis on BLOBs). The optimization problem becomes: given expensive predicates with known selectivity and per-tuple cost, in what order should they be applied?
+
+Without joins, expensive predicates can be ordered by their rank (a function of selectivity and cost). With joins, the problem is harder — the solution is to represent the application of user-defined predicates as a physical property so that dynamic-programming enumeration guarantees optimality. Under realistic cost model assumptions, the problem is polynomial in the number of UDF predicates.
+
+### Materialized Views
+
+Given a set of cached view results and a query, the optimizer must determine whether (and how) the query can be answered using materialized views instead of base tables. Two challenges:
+
+* **Reformulation**: determining whether a materialized view can answer part of a query is undecidable in general. Even effective sufficient conditions are complex due to SQL's richness. Current solutions address only single-block SPJ queries.
+* **Integration with enumeration**: a naive two-phase approach (generate all equivalent expressions, then optimize each) fails to prune subexpressions in a cost-based way. Overlapping the enumeration of equivalent expressions with view matching avoids this explosion.
