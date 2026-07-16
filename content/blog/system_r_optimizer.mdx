@@ -1,0 +1,260 @@
+---
+slug: system-r-access-path-selection
+title: "Access Path Selection in a Relational Database Management System"
+date: "2026-07-14"
+description: "Selinger et al.'s System R paper introduced cost-based query optimization: selectivity estimation from catalog statistics, single-relation access path costing, nested-loop and merge-join methods, and dynamic-programming join enumeration with interesting orders — ideas that still define relational optimizers today."
+tags: [system-r, query-optimization, access-path, join-ordering, dynamic-programming, interesting-orders, nested-loop, merge-join, selectivity, sql]
+category: system-papers
+---
+
+## Introduction
+
+SQL is a nonprocedural language: the user describes the desired result without specifying access paths or the order in which joins should be performed. A central property of SQL is **physical data independence** — users need not know how tuples are stored or which indexes exist. That freedom places the burden of choosing a good plan on the system.
+
+In System R, the optimizer is responsible for selecting an access path for every relation, a join method for every join, and an ordering of the relations in a multi-relation join. It chooses among alternatives by minimizing **total access cost**.
+
+---
+
+## Processing of an SQL Statement
+
+A SQL statement passes through four phases, which may be separated by arbitrary intervals of time depending on whether the statement originates from a terminal or a compiled application program:
+
+1. **Parsing**
+2. **Optimization**
+3. **Code generation**
+4. **Execution**
+
+### Parsing and Semantic Analysis
+
+Every statement first goes to the parser, which checks SQL syntax and represents the query as one or more **query blocks** consisting of `SELECT`, `FROM`, and `WHERE`. Nested predicates produce nested query blocks — a single SQL statement may contain many.
+
+After parsing, the optimizer looks up referenced objects in the System R catalogs. The catalog supplies physical and statistical information: relation cardinalities, page counts, available indexes, and index cardinalities. With column types known, the optimizer checks expression type compatibility, predicate comparison compatibility, and other semantic constraints.
+
+### Access-Path Selection and Code Generation
+
+Once validated, the optimizer decides the order in which query blocks should be evaluated, then for each block selects access paths and join methods that minimize total cost. The access paths that minimize total cost for the block are chosen from a tree of
+alternate path choices. The chosen plan is represented by a structural modification of the parse tree in the Access Specification Language (ASL).
+
+The code generator then translates ASL into executable machine code using a small number of templates — one per join method (including the no-join case). Nested query blocks become subroutines that return values to the predicates in which they occur. At execution time, the generated code calls the Research Storage System (RSS) through the Research Storage Interface (RSI) to scan each physically stored relation along the access paths chosen by the optimizer.
+
+---
+
+## The Research Storage System
+
+The RSS is System R's physical storage subsystem. It maintains relation storage, indexes, locking, logging, and recovery, and exposes a tuple-oriented interface (the RSI).
+
+Relations are collections of tuples whose columns are physically contiguous. Tuples live on 4 KB pages and cannot span pages. Pages are grouped into **segments**. A segment may hold tuples from multiple relations, but a relation cannot span segments. Each tuple therefore carries a relation identifier so that a scan can filter by relation.
+
+### Scans
+
+The principal retrieval mechanism is an RSS scan (`OPEN`, `NEXT`, `CLOSE`), which returns one tuple at a time. Two scan types are exposed to generated SQL code:
+
+* **Segment scan**: examines every nonempty page in the segment and returns only tuples tagged as belonging to the target relation. Pages containing no tuples of that relation may still be inspected, so cost depends on the number of nonempty segment pages and the fraction that hold the target relation.
+
+* **Index scan**: System R indexes are B-trees stored separately from data pages. Leaf pages contain key values and tuple identifiers, and are chained so that sequential leaf traversal need not re-reference upper levels. The caller may supply a starting and stopping key, restricting the scan to a key range. Leaf traversal yields tuple identifiers in key order, which are then used to fetch data tuples.
+
+### Clustering
+
+In a segment scan, all the non-empty pages of a segment will be touched, regardless of whether there are any tuples from the desired relation on them. However, each page is touched only once. When an entire relation is examined via an index scan, each page of the index is touched only once, but a data page may be examined more than once if it has two tuples on it which are not “close” in the index ordering.
+
+When tuples are inserted (and maintained) in index-key order, the index is **clustered**: each index page and each data page is touched only once during a full scan on that index.
+
+### Search Arguments
+
+Both scan types can receive **search arguments (SARGS)** — predicates evaluated inside the RSS before a tuple is returned through the RSI. Failed tuples are rejected internally, avoiding the CPU cost of an RSI call. A predicate is **sargable** when it has the form `column comparison-operator value`.
+
+---
+
+## Costs for Single-Relation Access Paths
+
+The optimizer first solves the simplest problem: choose an access path for one relation. The same statistics and cost formulas later become building blocks for joins and nested queries.
+
+### Cost Formula
+
+For each candidate plan:
+
+$$
+\text{COST} = \text{PAGE FETCHES} + W \times \text{RSI CALLS}
+$$
+
+Page fetches approximate physical I/O. RSI calls — the predicted number of tuples returned through the storage interface — serve as a proxy for CPU consumption, since much of System R's processing occurs within or around the RSS. $W$ is an adjustable weight that converts RSI-call estimates into units comparable with page-fetch cost.
+
+### Boolean Factors and Matching Indexes
+
+The `WHERE` predicate tree is treated as conjunctive normal form. Each top-level conjunct is a **boolean factor**: every output tuple must satisfy every factor. An index matches a boolean factor when the factor is sargable and the referenced columns form an initial substring of the index key. For a single-column index on `SALARY`, `SALARY = 20000` matches. For a composite index on `(NAME, LOCATION)`, both `NAME = 'SMITH'` and `LOCATION = 'SAN JOSE'` together match. Matching factors can restrict the index range and avoid examining unrelated keys.
+
+### Catalog Statistics
+
+During catalog lookup the optimizer retrieves:
+
+* For each relation $T$:
+  * `NCARD(T)` (cardinality)
+  * `TCARD(T)` (pages holding tuples of $T$)
+  * $P(T) = \text{TCARD}(T) / \text{(nonempty pages in the segment)}$
+* For each index $I$:
+  * `ICARD(I)` (distinct keys)
+  * `NINDX(I)` (index pages)
+
+Statistics are established when a relation is loaded or an index is created, and refreshed by an explicit `UPDATE STATISTICS` command. They are not updated on every `INSERT`/`DELETE`/`UPDATE` — doing so would serialize catalog access and create a locking bottleneck.
+
+### Selectivity Factors
+
+Using these statistics, each boolean factor is assigned a selectivity factor $F$ — the estimated fraction of tuples expected to satisfy the predicate. Query cardinality (`QCARD`) is then the product of relation cardinalities in the `FROM` list times the product of all selectivity factors in the block. Lack of statistics is treated as implying a small relation, and an arbitrary default factor is chosen.
+
+<div align="center">
+![Figure 1: Selectivity Factor](/figures/system_r-selectivity_factor.png)
+</div>
+
+### Interesting Orders
+
+An access path (or a sort) produces tuples in some order. That order is **interesting** if it is specified by the query's `GROUP BY` or `ORDER BY` clause. For a single-relation query, the optimizer evaluates every available path (each index plus a segment scan), recording cost and produced order. It retains the cheapest unordered path and the cheapest path for each interesting order. If no interesting order exists, the cheapest path wins. If `GROUP BY` or `ORDER BY` is present, the cost of a path that already produces the desired order is compared against the cheapest unordered path plus the cost of sorting `QCARD` tuples — and the cheaper alternative is chosen.
+
+Cost formulas combine index pages fetched, data pages fetched, and $W$ times RSI calls. For clustered indexes, a page is assumed to remain in the buffer long enough for every tuple on it to be retrieved. For non-clustered indexes on relations that do not fit in the buffer, a page fetch is assumed per tuple retrieval.
+
+<div align="center">
+![Figure 2: Cost Formula](/figures/system_r-cost_formula.png)
+</div>
+
+---
+
+## Access Path Selection for Joins
+
+### Nested-Loop and Merge Joins
+
+For two relations, the **outer** is scanned first; for each qualifying outer tuple (or outer key group), matching **inner** tuples are retrieved. System R primarily chooses between:
+
+**Nested-loop join**:
+
+```
+open scan on outer relation
+for each qualifying outer tuple:
+    open or reposition scan on inner relation
+    retrieve inner tuples satisfying the join predicate
+    emit each matching outer-inner composite
+```
+
+**Merge-scan join**: both inputs must be ordered on the join columns. One equijoin predicate is chosen as the merge predicate; other join predicates become ordinary filters. If either side lacks an index on the join column, it is sorted into a temporary list ordered by that column. The scans advance in synchronized fashion — compare current keys, advance the smaller side, match equal-key groups — so the entire inner relation need not be rescanned for every outer tuple. Clustering on the join column further reduces page fetches because matching keys are physically contiguous.
+
+These two methods were chosen based on prior empirical and analytical work suggesting that one of them is usually near-optimal for nontrivial relation sizes. Nested-loop and merge joins may be mixed within one query — e.g., merge `R1` with `R2`, then nested-loop the result with `R3`. Intermediate composites are not physically stored unless a later step requires a sort; otherwise each composite tuple is materialized one-at-a-time and fed to the next join.
+
+### Dynamic-Programming Enumeration
+
+An $n$-way join can be visualized as a sequence of two-way joins: the composite so far is the outer, and one additional base relation enters as the inner. There are $n!$ relation permutations, so independently optimizing every permutation is expensive. System R observes that after a particular subset of $k$ relations has been joined, the predicates and join methods available when adding relation $k+1$ depend on the subset (and its physical properties), not on every detail of the order that produced it.
+
+The optimizer therefore builds optimal plans for progressively larger subsets. For each subset and each interesting output order, only the cheapest plan is retained. This is the core of System R's dynamic-programming join enumerator.
+
+### Join-Connectivity Heuristic
+
+To further reduce the search space, System R prefers adding an inner relation that has a join predicate connecting it to a relation already in the outer subset. Cartesian products are delayed until no predicate-connected relation remains. Given a join graph `T1 -- T2 -- T3`, orders such as `T1 → T3 → T2` (which begin with a Cartesian product of `T1` and `T3`) are initially skipped in favor of `T1 → T2 → T3` or `T3 → T2 → T1`. This heuristic dramatically cuts enumeration work and plans with large Cartesian intermediates, though it can miss rare cases where an early Cartesian product would win.
+
+### Interesting Orders for Joins
+
+Interesting orders include those from `GROUP BY` / `ORDER BY` and every join column. Equivalence classes collapse redundant orders: if `E.DNO = D.DNO` and `D.DNO = F.DNO`, all three columns belong to the same class, and only the best solution for that class is saved.
+
+### Search Rounds
+
+* **Round 1 (single relations)**: enumerate segment and index scans, apply local predicates, estimate cost and cardinality; retain the cheapest unordered path and the cheapest path per interesting order.
+* **Round 2 (pairs)**: for each retained single-relation plan, consider adding each predicate-connected second relation via nested-loop and merge alternatives (including required sorts); keep the cheapest unordered and cheapest ordered plans per two-relation subset.
+* **Round 3+**: for each retained $k$-relation plan, add one eligible relation, evaluate applicable predicates, consider both join methods, propagate output order, and prune against cheaper equivalent plans (same subset, same relevant order).
+* **Final selection**: among plans covering all relations, choose the cheapest unordered plan, or compare the cheapest ordered plan against the cheapest unordered plan plus a final sort — the ordered plan wins only if its total cost is lower.
+
+The number of relation subsets is $2^n$; System R stores at most roughly $2^n$ times the number of interesting result orders. The connectivity heuristic substantially reduces this in practice.
+
+### Join Cost Formulas
+
+Let $C_{\text{outer}}(\text{path}_1)$ be the cost of the outer input, $N$ the estimated number of outer composite tuples after applicable predicates, and $C_{\text{inner}}(\text{path}_2)$ the cost of retrieving applicable inner tuples for one outer tuple (or key group). Nested-loop cost is:
+
+$$
+C_{\text{nested-loop}}(\text{path}_1, \text{path}_2) = C_{\text{outer}}(\text{path}_1) + N \times C_{\text{inner}}(\text{path}_2)
+$$
+
+Merge-join cost has the same outer structure — outer once, plus $N$ times the per-outer-group inner cost — plus any sort costs for outer or inner. When the inner is a sorted temporary list:
+
+$$
+C_{\text{inner}}(\text{sorted list}) = \frac{\text{TEMPPAGES}}{N} + W \times \text{RSICARD}
+$$
+
+* `TEMPPAGES` is the number of pages occupied by the sorted inner result.
+* Multiplying by $N$ in the join formula yields approximately one complete pass over the temporary pages.
+
+The formulas for nested-loop and merge look essentially the same; merge wins when the inner scan is much cheaper — after sorting, the inner is clustered on the join column, and the entire inner need not be scanned for each outer tuple.
+
+Sort cost includes reading through the specified path, sorting, writing the temporary, and producing the sorted list. Before sorting an inner base relation, only local predicates apply. If a composite must be sorted, it must first be fully materialized, and that write cost is included.
+
+### Example Search Tree
+
+<div align="center">
+![Figure 3: Example Table](/figures/system_r-example_table.png)
+</div>
+
+To make the enumeration concrete, consider a three-relation join among `EMP`, `DEPT`, and `JOB` (the paper's running example). Interesting orders include the join columns `DNO` and `JOB`, as well as any `GROUP BY` / `ORDER BY` columns. Notation: `C(EMP.DNO)` is the cost of scanning `EMP` via the `DNO` index with all currently applicable predicates; `Ni` denotes the cardinality of a partial result.
+
+**Round 1 — single relations.** For each base table, enumerate reasonable access paths with only local predicates applied:
+
+<div align="center">
+![Figure 4: Single-Relation Access Paths](/figures/system_r-single_access_path.png)
+</div>
+
+* `EMP` has three paths: index on `DNO`, index on `JOB`, and a segment scan. The `DNO` and `JOB` indexes produce those interesting orders; the segment scan is unordered. Assume the `JOB` index is cheapest, so the segment scan is pruned. Both index paths are retained (cheapest for their respective orders).
+* `DEPT` has an index on `DNO` and a segment scan. Assume the `DNO` index is cheaper, so the segment scan is pruned.
+* `JOB` has an index on `JOB` and a segment scan. Assume the segment scan is cheaper overall, but both paths are saved — the index may still be useful for merge joins that need `JOB` order.
+
+These retained single-relation plans form the first level of the search tree.
+
+<div align="center">
+![Figure 5: Single-Relation Search Tree](/figures/system_r-single_search_tree.png)
+</div>
+
+**Round 2 — pairs via nested loops.** For each retained single-relation plan, add each second relation that has a connecting predicate, and choose the cheapest inner access path:
+
+* Joining `EMP` to `JOB`: assume accessing `JOB` via the `JOB` index is cheapest — the join key can fetch matching tuples directly without scanning the entire relation.
+* Joining `EMP` to `DEPT`: assume the `DNO` index on `DEPT` is cheapest.
+
+Each best second-level path is combined with each Round-1 plan to form nested-loop solutions for the two-relation subsets.
+
+<div align="center">
+![Figure 5: Two-Relation Search Tree](/figures/system_r-second_search_tree.png)
+</div>
+
+**Round 2 — pairs via merge scans.** Merge alternatives are generated next:
+
+* `EMP` already has a scan in `DNO` order, so it can merge with `DEPT` via the `DNO` index with no sorting. Alternatively, it may be cheaper to scan `EMP` via the `JOB` index, sort on `DNO`, then merge. Sorting `DEPT` is never considered, because its cheapest scan is already in `DNO` order.
+* Merging `JOB` with `EMP`: only the `JOB` index on `EMP` is considered (cheapest for `EMP` regardless of order). Using the `JOB` index on `JOB` allows a merge with no sort; alternatively, sorting `JOB` from a segment-scan input and then merging may be cheaper.
+* After accessing `DEPT` via `DNO`, merge with `EMP` via the `DNO` index (no sort), or sort `EMP` first using the `JOB` index as sort input and then merge.
+
+As each nested-loop and merge cost is computed, it is compared against the cheapest equivalent solution found so far — same tables, same result order — and only the cheapest is kept.
+
+<div align="center">
+![Figure 6: Two-Relation Search Tree with Merge](/figures/system_r-second_search_tree_sort.png)
+</div>
+
+**Round 3 — all three relations.** For each retained two-relation plan, add the remaining third relation, again considering nested loops and merge scans (including sorts of the composite or the new inner). In some plans both the composite and the table being added (e.g., `JOB`) are sorted; in others no sorts occur at all, and the composite is materialized one tuple at a time without ever being stored. Costs are again pruned against cheaper equivalent solutions. The surviving three-relation plans are the candidates for final selection: cheapest unordered versus cheapest ordered (or unordered plus a final sort).
+
+<div align="center">
+![Figure 7: Three-Relation Search Tree with Merge](/figures/system_r-final_tree.png)
+</div>
+
+---
+
+## Nested Queries
+
+A query may appear as an operand of a predicate (`expression operator query`). System R distinguishes subqueries by whether they return one value or many, whether they reference an outer block, and which outer block they reference.
+
+### Uncorrelated Subqueries
+
+When a subquery uses a scalar comparison (`=`, `<>`, `>`, etc.), it must return a single value — e.g., `SALARY = (SELECT AVG(SALARY) FROM EMPLOYEE)`. Such a subquery is evaluated once before the parent query; its result is substituted into the predicate as if it had been a constant. If the subquery can return a set of values, they are returned in a temporary list that can only be accessed sequentially. Nesting may be arbitrarily deep; when no block references an outer block, evaluation proceeds from the deepest block outward.
+
+### Correlated Subqueries
+
+A subquery is **correlated** when it refers to a value from a candidate tuple in an outer block. In principle it must be re-evaluated for each relevant outer tuple, before the parent predicate can accept or reject that tuple:
+
+```sql
+SELECT NAME
+FROM EMPLOYEE X
+WHERE SALARY >
+      (SELECT SALARY
+       FROM EMPLOYEE
+       WHERE EMPLOYEE_NUMBER = X.MANAGER);
+```
+
+If a correlated subquery is separated from the block it references by intermediate blocks, it is evaluated once per candidate of the highest referencing block — not for every tuple of every intermediate level. When the referenced column values are not unique, re-evaluation can still be made conditional: if the outer relation is ordered on the referenced column and the current value equals the previous one, the prior result can be reused. In some cases it even pays to sort the outer relation on that column. Uniqueness can be inferred from catalog clues such as `NCARD > ICARD` for an index on the referenced column.
