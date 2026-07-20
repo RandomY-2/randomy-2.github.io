@@ -1,0 +1,301 @@
+---
+slug: starburst-extensible-query-processing
+title: "Extensible Query Processing in Starburst"
+date: "2026-07-19"
+description: "Starburst extends relational query processing at every layer: an orthogonal SQL-like language, the Query Graph Model as a shared semantic representation, rule-based query rewrite, grammar-driven physical plan generation, and a lazy stream-based execution engine."
+tags: [starburst, query-optimization, query-rewrite, qgm, extensible-database, hydrogen, corona, rule-engine, execution-engine, ibm]
+category: system-papers
+---
+
+## Introduction
+
+Traditional relational systems provide valuable common services — declarative queries, automatic optimization, concurrency control, and recovery — but were designed around a fixed set of data types, functions, access methods, and physical operators. Applications such as geographic systems, engineering tools, and knowledge bases need richer data and specialized processing. Without DBMS support, each application must encode its types using built-in representations, evaluate custom predicates outside the database, and retrieve large amounts of irrelevant data for application-side processing.
+
+Starburst aims to preserve the shared relational foundation while allowing knowledgeable database implementers, called database customizers (DBCs), to extend it. The supported extensions include:
+
+* Language features: new data types, scalar and aggregate functions, set predicates, and table operations
+* Data management: new storage managers, access methods, and integrity constraints
+* Internal processing: new transformations, join methods, cost formulas, and execution operators
+
+This makes extensibility an end-to-end requirement. Adding an R-tree, for example, is not enough by itself: the query processor must represent predicates that can use it, recognize when it applies, estimate its cost, generate a plan containing it, and invoke it at runtime.
+
+Starburst has two major components:
+* **Corona**, the query language processor, parses and validates queries, rewrites them, chooses an execution strategy, builds a Query Evaluation Plan (QEP), and drives execution.
+* **Core**, the data manager, supplies record and buffer management, access paths, concurrency control, and recovery. They roughly correspond to System R's RDS and RSS.
+
+---
+
+## Hydrogen: An Extensible Query Language
+
+Starburst's language, Hydrogen, is based on SQL and retains its `SELECT ... FROM ... WHERE ...` style, aggregation, set operations, and nested subqueries. It extends SQL in two directions: greater orthogonality and user-defined functionality.
+
+### Orthogonality and Table Expressions
+
+SQL traditionally restricts where some constructs may appear. An aggregating view, for example, may not be usable everywhere a base table is accepted. Hydrogen's goal is that any operation producing a table can appear wherever a table is allowed.
+
+The key construct is the **table expression**: an expression, usually a query, whose output is a table. Its result can be named and referenced later in the same query. Table expressions resemble views but may refer to host-language variables or be correlated with other query parts. They let users factor common subexpressions and compose complex operations without first creating persistent views.
+
+Cyclic references among named table expressions express recursion. Because recursive definitions may also contain relational operators, aggregation, and external functions, Hydrogen can integrate logic programming with database access. The optimizer can then consider rules and data access together rather than optimizing each in isolation.
+
+### User-Defined Functions and Types
+
+DBCs can add four broad kinds of functions:
+
+* **Scalar functions**, such as `Area(width, length)`, consume fields from one tuple and return one value. They can appear wherever a column reference is valid.
+* **Aggregate functions**, such as `StandardDeviation(salary)`, consume values from multiple tuples and return one value.
+* **Set predicate functions** consume a set and a predicate. SQL's `ANY` and `ALL` are built-in examples; a custom `MAJORITY` predicate could return true when its predicate holds for most set members.
+* **Table functions** consume tables and possibly scalar parameters, then produce a table. `SAMPLE(table, n)` could return $n$ rows; other functions could implement outer join, relational division, or domain-specific operations.
+
+Starburst can invoke scalar and aggregate functions inside the system rather than returning data to the application. A custom predicate evaluated near the scan, for example, can reject irrelevant tuples before they cross higher-level interfaces.
+
+New column types can appear wherever built-in types appear, and functions can be defined over them. This gives applications stronger semantic type checking and avoids awkward encodings into primitive SQL types.
+
+---
+
+## Query Processing Pipeline
+
+<div align="center">
+![Figure 1: Query Processing Pipeline](/figures/starbust-query_process_phase.png)
+</div>
+
+As in System R, query processing separates compilation from execution, and the compiled result may be stored for reuse. Compilation proceeds through:
+
+1. Tokenization and parsing
+2. Semantic analysis
+3. Construction of the Query Graph Model (QGM)
+4. Rule-based query rewrite
+5. Cost-based plan optimization
+6. Plan refinement
+
+Parsing and semantic analysis produce a valid QGM. Query rewrite transforms it into an equivalent QGM with potentially better execution opportunities. This phase may be bypassed to reduce compilation time at the risk of a slower plan. The plan optimizer converts the rewritten QGM into a QEP, and plan refinement prepares that plan for efficient interpretation by the Query Evaluation System (QES).
+
+QGM is the shared representation between phases. This is crucial for extensibility: an extension can reuse standard parsing, catalog access, name resolution, and semantic checks while supplying only the behavior that differs.
+
+---
+
+## The Query Graph Model
+
+QGM can be viewed as the schema of an in-memory database describing a query. It is both the internal semantic representation passed between Corona's compilation phases and the interface through which DBC extensions participate in query processing.
+
+Consider:
+
+```sql
+SELECT partno, price, order_qty
+FROM quotations Q1
+WHERE Q1.partno IN
+      (SELECT partno
+       FROM inventory Q3
+       WHERE Q3.onhand_qty < Q1.order_qty
+       AND Q3.type = 'cpu')
+```
+
+The query returns quotations for CPU parts whose inventory is low relative to the requested order quantity. Its QGM contains two `SELECT` operation boxes, one for each query block, as shown in Figure 2(a).
+
+<div align="center">
+![Figure 2: Query Graph Model](/figures/starbust-qgm.png)
+</div>
+
+### Boxes, Vertices, and Edges
+
+The main QGM constructs are:
+
+* **Boxes** represent high-level table operations such as `SELECT`, `GROUP BY`, `INSERT`, `UPDATE`, `DELETE`, `UNION`, and `INTERSECTION`. A box has a head describing its output columns and types, and a body describing its inputs and predicates.
+* **Vertices** represent separate accesses to stored or derived tables. Multiple vertices may range over the same input table.
+* **Range edges** connect vertices to the tables or operations they access.
+* **Qualifier edges** represent predicate conjuncts. An edge connecting several vertices is a cross-table predicate; a loop is a single-table predicate.
+
+In the example, `Q1` accesses `quotations`, `Q3` accesses `inventory`, and `Q2` accesses the result of the inner `SELECT`. The edge between `Q1` and `Q2` represents `IN`; the edge between `Q1` and `Q3` represents the correlated quantity comparison; the loop on `Q3` represents `Q3.type = 'cpu'`.
+
+### Setformers and Quantifiers
+
+Vertices are iterators and may be either **setformers** or **quantifiers**:
+
+* A setformer constructs output tuples from the table over which it ranges. `Q1` contributes quotation columns to the outer result, while `Q3` produces the inner table of part numbers.
+* A quantifier ranges over a table only to restrict another result; its tuples are not copied into that operation's output. `Q2` is an existential quantifier corresponding to `IN`.
+
+Quantifier types include existential ($\exists$) and universal ($\forall$). The built-in setformer type is `ForEach` (`F`), but new iterator types can be added.
+
+### Extending QGM
+
+QGM's table description is generic, while each operation assigns meaning to its qualifier edges and iterator types. This permits new operations without replacing the representation.
+
+For a left outer join, for example, a DBC might introduce a `Preserve Foreach` (`PF`) setformer for the preserved side. Existing catalog lookup, name resolution, and most semantic checks still apply. The extension supplies the behavior that differs: outer join associativity rules, predicate movement restrictions, costing, and execution.
+
+QGM therefore supports both the full expressive power of Hydrogen — nesting, aggregation, correlation, recursion, and iterator types — and extensions such as table functions and new operations.
+
+---
+
+## Rule-Based Query Rewrite
+
+Declarative queries can be rewritten because there are frequently several alternative phrasings of a query. Since relational query languages are ostensibly nonprocedural, these should perform equivalently. Also, only the DBMS can see through complex and abstracted views and nested operations to identify opportunities for optimization. Useful rewrites include:
+
+* Merging views into the queries that use them
+* Eliminating redundant joins
+* Migrating or replicating predicates between operations to minimize the amount of data accessed
+* Pushing projections down to avoid retrieving unused columns
+* Converting subqueries into joins
+* Applying recursive-query transformations such as magic sets
+* Using integrity constraints for semantic optimization
+
+No fixed transformation set will remain complete as the language evolves, so Starburst introduces an explicit, extensible rewrite phase operating on QGM.
+
+### Rule Structure
+
+A rewrite rule contains a **condition** and an **action**, each implemented as a C function. The rule author must guarantee that the action transforms one consistent QGM into another equivalent, consistent QGM. Rules can be grouped into classes to reduce matching work, modularize related transformations, and control execution order.
+
+For example, an existential subquery may become a join if at most one inner tuple can satisfy the predicate for each outer tuple:
+
+```text
+IF OP1.type = Select
+   AND Q2.type = Exists
+   AND at most one T2 tuple matches per evaluation
+THEN Q2.type = ForEach
+```
+
+Once the existential quantifier becomes a setformer, two `SELECT` boxes may be merged if their duplicate semantics are compatible:
+
+```text
+IF OP1.type = Select
+   AND OP2.type = Select
+   AND Q2.type = ForEach
+   AND duplicate handling is compatible
+THEN merge OP2 into OP1
+```
+
+Merging enlarges the optimizer's scope: predicates and iterators that were separated by a query-block boundary can now participate in one join-order search.
+
+### Main Rule Classes
+
+**Predicate migration** pushes predicates into lower operations so tuples can be filtered earlier. Predicates may also be copied and sent to multiple operations, or moved upward and then down another branch. Extensions must define operation-specific safety rules. A predicate that is harmless to push through an ordinary `SELECT` might incorrectly remove preserved tuples if pushed through the wrong side of an outer join.
+
+**Projection push-down** removes unused columns early. It interacts with predicate migration: after moving a predicate downward, columns used only by that predicate may no longer be needed in the higher operation.
+
+**Operation merging** combines compatible QGM boxes by unifying their predicates and iterators. View merging is one case. Not all boxes can merge — `GROUP BY` and `SELECT` generally cannot — and even two `SELECT` boxes may differ in duplicate elimination.
+
+### Rule Engine and Search
+
+The rule engine uses forward chaining and supports several control policies:
+
+* Sequential: process rules in order
+* Priority: try higher-priority rules first
+* Statistical: select rules according to a configured probability distribution
+
+A rewrite budget bounds compilation time. When exhausted, rewriting stops at a consistent QGM state. A separate QGM search facility supplies rule contexts and supports depth-first (top-down) or breadth-first traversal.
+
+### Alternatives and `CHOOSE`
+
+Some rewrites have mutually exclusive alternatives. A join predicate may move to one iterator or another; a multiply referenced view may be merged at every use or materialized once. Choosing correctly requires physical-plan costs, which are unavailable during high-level rewriting.
+
+Starburst initially preserves alternatives in a QGM `CHOOSE` operation. Plan optimization later costs them and removes `CHOOSE`, or leaves it until runtime when the best alternative depends on host-language parameters.
+
+This separation has a weakness: rewrite alternatives cannot be cost-pruned as they are generated. Predicate migration can produce a number of alternatives proportional to the product of predicates and iterators. The paper therefore identifies tighter integration of rewriting and optimization as important future work.
+
+---
+
+## Plan Optimization
+
+Given QGM, the plan optimizer generates alternative QEPs, estimates their costs, and chooses the cheapest. Starburst keeps plan generation, costing, and search strategy largely orthogonal so each can evolve independently.
+
+QGM operations are optimized bottom-up. Rules specific to each operation type generate plans: `SELECT`, for example, has rules for base-table access and joining iterators. A new outer join operation can add outer-join rules while reusing existing single-table access rules.
+
+### LOLEPOPs and Query Evaluation Plans
+
+A **low-level plan operator (LOLEPOP)** is a terminal, executable operator interpreted by the QES. LOLEPOPs include relational operators such as `JOIN` and `UNION`, plus physical operators such as `SCAN`, `SORT`, and `SHIP`. Each consumes zero or more tuple streams and produces zero or more streams, usually one.
+
+A QEP is a nested composition of LOLEPOP invocations. Each LOLEPOP has a C property function describing how it changes its inputs' properties and what cost it adds. For example:
+
+* `SCAN` turns a stored table into an in-memory tuple stream, optionally applying predicates and projecting columns
+* `SORT` changes tuple order
+* `SHIP` changes execution site
+
+### Plan Properties
+
+Every stored table or intermediate plan result carries three kinds of properties:
+
+* **Relational**: joined tables, accessed columns, predicates already applied
+* **Operational**: tuple order and result site
+* **Estimated**: cardinality and cumulative cost
+
+Plans are comparable only when relevant properties agree. A more expensive plan may survive if it produces a useful order or resides at a better site.
+
+### Strategy Alternative Rules
+
+Plan generation uses parameterized, grammar-like production rules called **strategy alternative rules (STARs)**. A STAR is a nonterminal with parameters and one or more definitions in terms of LOLEPOPs or other STARs.
+
+A STAR is a reusable physical-plan template, similar to a grammar rule. It describes multiple ways to implement one task. For example, a conceptual JOIN(A, B) STAR might expand to:
+
+```
+JOIN(A, B) →
+    NESTED_LOOP(A, B)
+  | MERGE_JOIN(ORDERED(A), ORDERED(B))
+  | HASH_JOIN(A, B)
+```
+
+Each alternative has applicability conditions. A merge join requires an equality predicate and ordered inputs; a hash join requires hashable join keys.
+
+The plan generator repeatedly expands STARs, like a macro processor, until every nonterminal has become a LOLEPOP. It then evaluates LOLEPOP property functions bottom-up, beginning with catalog statistics.
+
+Some physical methods require input properties. Merge join requires both streams ordered by the join key. **Glue STARs** find the cheapest way to satisfy such requirements, inserting a `SORT` for order or `SHIP` for location when necessary. This separates a method's logical requirement from the mechanism used to enforce it.
+
+### Join Enumeration and Search Control
+
+For QGM operations with multiple iterators, the join enumerator begins with single-iterator plans and repeatedly combines smaller iterator sets into larger ones. For each pair, it invokes join STARs to generate and cost alternatives. Unlike System R's strictly left-deep search, Starburst can exploit predicates over more than two iterators, implied predicates, and composite inner relations, yielding a richer plan space.
+
+The richer search requires explicit controls:
+
+* STAR alternatives carry ranks, and alternatives above a configured rank may be pruned
+* A priority queue determines expansion order and can emulate breadth-first, depth-first, or custom strategies
+* Query parameters may prohibit composite inners (bushy trees) or joins without predicates (Cartesian products)
+
+The STAR evaluator, search strategy, and STAR array are separate. An optimizer designer can add or modify strategy rules without changing the evaluator, or replace the search strategy without rewriting the rules.
+
+---
+
+## The Query Evaluation System
+
+At runtime, the QES interprets the selected QEP. It asks Core to retrieve tuples from tables and attachments, then performs higher-level operations such as joins and aggregation in its own buffers.
+
+### Lazy Tuple Streams
+
+The interface between operators is an algebra of tuple streams. Operators request and produce tuples lazily, allowing an intermediate result to remain as small as one tuple rather than being fully materialized.
+
+The stream abstraction supports extensibility in three ways:
+
+* New operators use standard macros for requesting and handing off tuples
+* Existing operators remain independent as long as they preserve the stream interface
+* The same algebraic QEP can be interpreted or compiled into an iterative program
+
+### Separating Join Method from Join Kind
+
+Starburst treats subqueries as special forms of join. A join has two independent dimensions:
+
+* **Join method**: the control structure used to combine streams
+* **Join kind**: the semantic function applied during matching
+
+For example, the same nested loop join method can have join kinds include regular join, existential (semijoin), scalar-subquery join, and universal (`op-ALL`) join. A join operator receives the kind as a function parameter, allowing one physical method to implement several semantics. A left outer join could therefore be added as a new kind that reuses existing methods, as a specialized LOLEPOP, or both.
+
+### Evaluate on Demand
+
+SQL distinguishes uncorrelated subqueries, traditionally evaluated once at open time, from correlated subqueries, traditionally evaluated for every outer tuple. Corona replaces both with **evaluate on demand**: compute a subquery only when its result is needed and reuse it while correlation values remain unchanged.
+
+This uniform mechanism simplifies execution and avoids repeated work when consecutive outer tuples share correlation values.
+
+### OR Predicates
+
+An `OR` whose branches require different operators creates another execution problem:
+
+```sql
+SELECT *
+FROM T1
+WHERE T1.A1 = 5
+   OR T1.A2 = (SELECT B2 FROM T2 WHERE T2.B1 = 16)
+```
+
+The first branch can use `FILTER`; the second needs a scalar-subquery `JOIN`. If `FILTER` simply discards a tuple that fails its branch, the join never gets a chance to satisfy the other branch. Starburst introduces an `OR` stream operator that routes tuples among predicate operators without changing those operators' implementations.
+
+The `OR` operator coordinates the branches:
+- Evaluate the first branch.
+- Immediately accept tuples that satisfy it.
+- Forward failed tuples to the subquery-join branch.
+- Accept tuples satisfying either branch.
+- Avoid duplicate output if multiple branches succeed.
