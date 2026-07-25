@@ -1,0 +1,167 @@
+---
+slug: zero-redundancy-optimizer
+title: "ZeRO: Memory Optimization Towards Training Trillion Parameter Models"
+date: "2026-07-25"
+description: "ZeRO eliminates memory redundancy in data-parallel training by progressively partitioning optimizer states, gradients, and parameters across devices, achieving model-parallel memory efficiency with data-parallel compute efficiency — enabling trillion-parameter model training on commodity GPU clusters."
+tags: [zero, data-parallelism, model-parallelism, distributed-training, memory-optimization, optimizer-states, mixed-precision, deepspeed, gpu, large-models]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+Training large deep learning models requires enormous memory. A 1.5B parameter GPT-2 model needs only 3 GB to store its fp16 parameters, yet cannot be trained on a single 32 GB GPU. The gap comes from **model states** — optimizer states, gradients, and the fp32 parameter copy — which together consume 24 GB for that model. As models scale to tens or hundreds of billions of parameters, no single device can hold even one replica of these states.
+
+Existing parallelism strategies each make unsatisfying tradeoffs:
+
+* **Data parallelism (DP)** replicates all model states on every device, providing excellent compute and communication efficiency but zero memory savings. Models beyond roughly 1.4B parameters exhaust 32 GB devices.
+* **Model parallelism (MP)** partitions model states across devices for memory efficiency, but splits computation too finely and introduces heavy cross-device communication. It works within a single high-bandwidth node but efficiency degrades quickly across nodes — a 40B parameter model on two DGX-2 nodes achieved less than 5% of peak hardware FLOPS.
+* **Pipeline parallelism (PP)** partitions layers horizontally, requiring large batch sizes to hide the pipeline bubble, with implications for convergence and activation memory.
+
+ZeRO — the Zero Redundancy Optimizer — resolves this tension. It achieves the memory efficiency of model parallelism while retaining the compute and communication efficiency of data parallelism. The key insight: data parallelism stores redundant copies of model states across all processes, but not all states are needed everywhere at all times. ZeRO partitions these states across data-parallel processes and reconstructs them on demand through a dynamic communication schedule.
+
+---
+
+## Where Does the Memory Go?
+
+Understanding ZeRO requires understanding memory consumption during training. Memory splits into two categories: **model states** (optimizer states, gradients, and parameters) and **residual states** (activations, temporary buffers, and fragmented memory).
+
+### Model States
+
+Consider mixed-precision training with Adam. The model has $\Psi$ parameters. During training, the system maintains:
+
+<div align="center">
+![Figure 1: Mixd-Precision Training](/figures/zero-mix_precision.png)
+</div>
+
+* An fp16 copy of the parameters: $2\Psi$ bytes — used in forward/backward passes to exploit high-throughput Tensor Cores
+* An fp16 copy of the gradients: $2\Psi$ bytes — produced by the fp16 backward pass
+* An fp32 copy of the parameters (for updates): $4\Psi$ bytes — the main copy where updates are applied, since small gradient updates vanish in fp16 precision
+* fp32 momentum (first moment): $4\Psi$ bytes — Adam's exponential moving average of gradients, accumulated across steps
+* fp32 variance (second moment): $4\Psi$ bytes — Adam's exponential moving average of squared gradients, used to adapt per-parameter learning rates
+
+Let $K$ denote the memory multiplier of the optimizer states. For mixed-precision Adam, $K = 12$. Total memory for model states is
+
+$$
+2\Psi + 2\Psi + K\Psi = 16\Psi \text{ bytes.}
+$$
+
+For GPT-2 with 1.5B parameters, this is 24 GB — far exceeding the 3 GB for fp16 parameters alone. The optimizer states dominate, consuming 75% of model-state memory.
+
+### Residual States
+
+**Activations** stored for backpropagation can be substantial. GPT-2 (1.5B parameters, sequence length 1K, batch size 32) requires about 60 GB. Activation checkpointing reduces this to approximately 8 GB by recomputing activations during the backward pass at a 33% compute overhead. Even with checkpointing, a 100B parameter model requires around 60 GB for activations at batch size 32.
+
+**Temporary buffers** for operations like gradient all-reduce are typically fused into a single flattened buffer to improve throughput. For a 1.5B parameter model, a flattened fp32 buffer requires 6 GB.
+
+**Memory fragmentation** arises from interleaving short-lived tensors (discarded activations) with long-lived tensors (checkpointed activations, parameter gradients). Fragmentation can cause out-of-memory failures with over 30% of memory still available, because no contiguous block is large enough to satisfy the request.
+
+---
+
+## ZeRO-DP: ZeRO-powered Data Parallelism
+
+ZeRO-DP is built on three insights about data parallelism and model parallelism:
+
+1. DP has better scaling efficiency than MP. MP reduces computational granularity per GPU and increases communication volume, especially across node boundaries. DP maintains both high granularity and low communication.
+2. DP is memory-inefficient because it replicates all model states. MP is memory-efficient because it partitions them.
+3. Not all model states are needed at all times. Parameters for a given layer are only needed during that layer's forward and backward computation.
+
+ZeRO-DP partitions model states across data-parallel processes instead of replicating them, then uses a dynamic communication schedule to reconstruct states when needed. This yields three progressive optimization stages.
+
+<div align="center">
+![Figure 2: ZeRO-DP](/figures/zero-dp.png)
+</div>
+
+### Stage 1: Optimizer State Partitioning ($P_{os}$)
+
+For a DP degree of $N_d$, the optimizer states are divided into $N_d$ equal partitions. Process $i$ stores and updates only partition $i$ of the optimizer states, then updates only the corresponding $\frac{1}{N_d}$ of the parameters. At the end of each training step, an all-gather across processes reconstructs the fully updated parameters everywhere.
+
+**Memory savings.** Per-device memory drops from $4\Psi + K\Psi$ to $4\Psi + \frac{K\Psi}{N_d}$. When $N_d$ is large, this approaches $4\Psi$ — a 4x reduction from the original $16\Psi$.
+
+**Communication volume.** Identical to baseline DP. The all-gather at the end of each step replaces what would have been local optimizer updates followed by no communication — but the all-reduce that standard DP uses for gradients is simply restructured as a reduce-scatter (to get each partition's reduced gradients) plus an all-gather (to distribute updated parameters), totaling $2\Psi$ elements, same as standard all-reduce.
+
+### Stage 2: Gradient Partitioning ($P_{os+g}$)
+
+Since each process only updates its corresponding parameter partition, it only needs the reduced gradients for those parameters. During backward propagation, as gradients become available, they are reduced only onto the process responsible for that partition (a reduce-scatter operation). Once reduced, a process can release gradients outside its partition.
+
+In practice, gradients are bucketized by partition and reduced in bulk to overlap communication with computation — similar in spirit to how NVIDIA's AMP bucketizes all-reduce, but performing a reduce-scatter at partition boundaries instead.
+
+**Memory savings.** Gradient memory drops from $2\Psi$ to $\frac{2\Psi}{N_d}$. Combined with optimizer state partitioning, per-device memory becomes
+
+$$
+2\Psi + \frac{2\Psi}{N_d} + \frac{K\Psi}{N_d} \approx 2\Psi
+$$
+
+for large $N_d$ — an 8x reduction.
+
+**Communication volume.** Still $2\Psi$, identical to baseline DP. The reduce-scatter contributes $\Psi$ and the subsequent all-gather of updated parameters contributes $\Psi$.
+
+### Stage 3: Parameter Partitioning ($P_{os+g+p}$)
+
+Each process stores only its partition of the parameters. When parameters outside a process's partition are needed for forward or backward computation, they are received via broadcast from the owning process. This is pipelined: before computing the forward pass for a given partition's layers, the responsible process broadcasts those weights, and other processes discard them after use.
+
+**Memory savings.** Total per-device memory becomes $\frac{(2 + 2 + K)\Psi}{N_d}$ — linear reduction with DP degree. With 64-way DP, a 7.5B parameter model requires only 1.9 GB for model states (versus 120 GB with standard DP).
+
+**Communication volume.** The parameter all-gather happens once during the forward pass and once during the backward pass (in reverse order), contributing $2\Psi$ total. Combined with the reduce-scatter for gradients ($\Psi$), total communication is $3\Psi$ — a 1.5x increase over the baseline $2\Psi$. This modest overhead enables memory reduction proportional to $N_d$.
+
+---
+
+## ZeRO-R: Optimizing Residual Memory
+
+After ZeRO-DP eliminates model-state redundancy, residual memory (activations, buffers, fragmentation) can become the secondary bottleneck. ZeRO-R addresses each component.
+
+### Partitioned Activation Checkpointing ($P_a$)
+
+Model parallelism partitions parameters but often replicates activations — each GPU in an MP group needs the full input activation to compute its parameter partition. ZeRO-R eliminates this redundancy by partitioning activation checkpoints across model-parallel GPUs. Activations are only materialized in replicated form one layer at a time, right before they are needed, via an all-gather.
+
+For a 100B parameter model with batch size 32, sequence length 1024, and 16-way MP, activation checkpoints normally require 33 GB per GPU. With $P_a$, this drops to about 2 GB. For extreme cases, these partitioned checkpoints can be offloaded to CPU ($P_{a+cpu}$), reducing activation memory to nearly zero.
+
+The communication overhead is small. In Megatron-LM with activation checkpointing, each transformer block performs six all-reduce operations (two each for forward, forward recomputation, and backward), with total volume $12 \times \text{seq\_length} \times \text{hidden\_dim}$. Partitioned activation checkpointing adds one all-gather per block with volume $\text{seq\_length} \times \text{hidden\_dim}$ — less than 10% overhead on top of existing MP communication.
+
+When MP is combined with DP, $P_a$ reduces activation memory by the MP degree, allowing a proportional batch size increase. Since DP communication volume is inversely proportional to batch size, a 16x batch increase (from 16-way MP) can yield an order-of-magnitude reduction in DP communication — far outweighing the 10% MP overhead.
+
+### Constant Size Buffers ($C_B$)
+
+High-performance libraries fuse all parameters into a single buffer before collective operations to maximize bandwidth. But for a 3B parameter model, a 32-bit fused buffer requires 12 GB. ZeRO-R uses constant-size fused buffers that do not grow with model size. The buffer is kept large enough for efficient bandwidth utilization while preventing memory blow-up.
+
+### Memory Defragmentation ($M_D$)
+
+Fragmentation arises from interleaving short-lived and long-lived memory objects. During the forward pass, discarded activations (short-lived) interleave with checkpointed activations (long-lived). During the backward pass, activation gradients (short-lived) interleave with parameter gradients (long-lived).
+
+ZeRO-R performs on-the-fly defragmentation by pre-allocating contiguous memory chunks for activation checkpoints and gradients, copying them into these pre-allocated regions as they are produced. This prevents OOM failures from fragmentation and improves allocator performance by eliminating the search for contiguous free blocks.
+
+---
+
+## ZeRO and Model Parallelism
+
+With ZeRO-DP eliminating model-state memory redundancy, MP becomes less necessary for fitting large models alone. ZeRO-DP is at least as effective at reducing per-device memory as MP, and sometimes more effective when MP cannot divide the model evenly. It also has comparable or better scaling efficiency, and data parallelism is far easier to use — no model restructuring required.
+
+However, MP remains valuable in two scenarios:
+
+1. **Activation memory for very large models.** When combined with ZeRO-R's activation partitioning, MP reduces the activation footprint proportional to the MP degree.
+2. **Batch size constraints.** When the aggregated batch size under pure DP is too large for good convergence, combining ZeRO with MP allows fitting the model with an acceptable batch size.
+
+ZeRO and MP compose multiplicatively: with DP degree $N_d$ and MP degree $N_m$, the maximum memory reduction per device is $N_d \times N_m$. A trillion-parameter model could run on 1024 GPUs with 16-way MP within each DGX-2 node and 64-way DP across nodes.
+
+---
+
+## Scaling to a Trillion Parameters
+
+The three ZeRO-DP stages enable progressively larger models. With $N_d = 64$:
+
+* $P_{os}$: models up to 7.5B parameters (31.4 GB model-state memory)
+* $P_{os+g}$: models up to 14B parameters (16.6 GB)
+* $P_{os+g+p}$: models up to 128B parameters (1.9 GB)
+
+With $N_d = 1024$ and all three stages enabled, ZeRO can train a trillion-parameter model. A trillion parameters with Adam in 16-bit precision requires approximately 16 TB for model states. Distributed across 1024 GPUs, each device holds 16 GB — well within the 32 GB capacity of a V100.
+
+---
+
+## Comparison with Pipeline Parallelism
+
+Pipeline parallelism partitions a model horizontally across layers, placing each partition on a different device and using micro-batching to hide the pipeline bubble. While PP can partition both parameters and activations, it comes with significant constraints:
+
+* GPipe requires batch sizes proportional to the number of pipeline stages to hide the bubble, which can hurt convergence and requires large activation memory.
+* PipeDream avoids the large batch requirement by keeping multiple stale parameter copies, reducing memory efficiency and deviating from standard training semantics.
+* Horizontal splitting makes tied weights difficult and micro-batching complicates batch normalization.
+
+ZeRO achieves the same or better memory efficiency without these restrictions on functionality, batch size, or training semantics. It preserves standard data-parallel training while transparently managing memory across devices.
