@@ -1,0 +1,185 @@
+---
+slug: gpipe-pipeline-parallelism
+title: "GPipe: Easy Scaling with Micro-Batch Pipeline Parallelism"
+date: "2026-07-24"
+description: "GPipe scales deep neural networks across accelerators by partitioning layers into balanced cells, splitting mini-batches into pipelined micro-batches, accumulating synchronous gradients, and re-materializing activations to reduce memory."
+tags: [gpipe, pipeline-parallelism, model-parallelism, distributed-training, micro-batching, rematerialization, gpu, tpu]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+As neural networks grow, a basic hardware constraint eventually becomes unavoidable: the model, its activations, and the optimizer state no longer fit in the memory of one accelerator. Data parallelism alone does not solve this problem because every worker still holds a full copy of the model.
+
+**Model parallelism** divides the model itself across accelerators. In principle, this allows model capacity to grow with the number of devices. In practice, it introduces two difficult systems problems:
+
+* A sequential network leaves later devices idle while earlier devices are computing.
+* Activations and gradients must cross device boundaries, potentially turning communication into the bottleneck.
+
+Many model-parallel systems address these problems with schedules tailored to a particular architecture. GPipe instead provides a general abstraction for any neural network that can be expressed as a sequence of layers.
+
+Its central idea is simple:
+
+1. Partition the model into consecutive groups of layers.
+2. Place each group on a different accelerator.
+3. Split every mini-batch into smaller micro-batches.
+4. Pipeline those micro-batches through the partitions.
+5. Accumulate their gradients and perform one synchronous update for the entire mini-batch.
+
+Micro-batching improves utilization, while synchronous gradient accumulation preserves the semantics of ordinary mini-batch training.
+
+---
+
+## From Layers to Pipeline Cells
+
+<div align="center">
+![Figure 1: GPipe](/figures/gpipe-figure.png)
+</div>
+
+
+Consider a neural network with $L$ layers. Layer $i$ has:
+
+* a forward function $f_i$
+* parameters $w_i$
+* an optional estimated computation cost $c_i$
+
+The complete network is the composition
+
+$$
+f_L \circ f_{L-1} \circ \cdots \circ f_1.
+$$
+
+Given $K$ accelerators, GPipe divides this sequence into $K$ **cells**. A cell contains consecutive layers, so if partition $p_k$ contains layers $i$ through $j$, its forward function is
+
+$$
+F_k = f_j \circ \cdots \circ f_{i+1} \circ f_i.
+$$
+
+Its parameters are the union of the parameters in those layers:
+
+$$
+W_k = \bigcup_{l=i}^{j} w_l,
+$$
+
+and its estimated cost is
+
+$$
+C_k = \sum_{l=i}^{j} c_l.
+$$
+
+Automatic differentiation derives the corresponding backward function $B_k$ from $F_k$. GPipe then places cell $k$ on accelerator $k$ and inserts communication operations at cell boundaries.
+
+The user only needs to specify:
+
+* the ordered sequence of layers
+* the number of partitions $K$
+* the number of micro-batches $M$
+
+This sequential interface is what makes GPipe architecture-independent. A Transformer, convolutional network, or other deep model can use the same mechanism as long as it can be represented as a sequence whose individual layers fit on one accelerator.
+
+---
+
+## Micro-Batching
+
+### Bubble Cost Without Micro-Batching
+
+Suppose a network is divided over four devices. With one ordinary mini-batch, accelerator 2 cannot begin until accelerator 1 produces its output. Accelerator 3 waits for accelerator 2, and accelerator 4 waits for accelerator 3.
+
+The same dependency appears in reverse during back-propagation. Most devices are idle at any moment, so adding accelerators increases capacity but provides little throughput improvement.
+
+Assume the model is evenly divided across $K$ accelerators. Let the time for one accelerator to process its partition in both directions be
+
+$$
+t_{\mathrm{fb}} = t_f + t_b,
+$$
+
+where $t_f$ and $t_b$ are its forward- and backward-pass times. With only one batch in the pipeline, the $K$ partitions execute sequentially, so the end-to-end processing time is
+
+$$
+T_{\mathrm{naive}} = Kt_{\mathrm{fb}}.
+$$
+
+Over that interval, the $K$ accelerators provide a total compute-time capacity of
+
+$$
+K \times T_{\mathrm{naive}} = K^2t_{\mathrm{fb}}.
+$$
+
+Only one accelerator is doing useful work at a time. The useful compute-time is therefore $Kt_{\mathrm{fb}}$, leaving
+
+$$
+K^2t_{\mathrm{fb}} - Kt_{\mathrm{fb}}
+= (K-1)Kt_{\mathrm{fb}}
+$$
+
+idle. The fraction of accelerator capacity consumed by the bubble is
+
+$$
+\frac{(K-1)Kt_{\mathrm{fb}}}{K^2t_{\mathrm{fb}}}
+= \frac{K-1}{K}
+= O\left(\frac{K-1}{K}\right).
+$$
+
+Equivalently, average accelerator utilization is only $1/K$. As $K$ increases, the idle fraction approaches $1$, so naive model parallelism wastes nearly all of the additional compute capacity. This is the $M=1$ case; GPipe reduces the idle fraction by introducing multiple micro-batches.
+
+
+### Bubble Cost With Micro-Batching
+GPipe exposes more parallel work by splitting a mini-batch of $N$ examples into $M$ micro-batches, each containing
+
+$$
+\frac{N}{M}
+$$
+
+examples. As soon as the first cell finishes the first micro-batch, it sends the boundary activation to the second cell and starts processing the next micro-batch. Different cells can therefore work on different micro-batches at the same time.
+
+A simplified forward schedule for four cells is:
+
+```text
+time →      1    2    3    4    5    6    7
+cell 1     m1   m2   m3   m4
+cell 2          m1   m2   m3   m4
+cell 3               m1   m2   m3   m4
+cell 4                    m1   m2   m3   m4
+```
+
+For $K$ partitions and $M$ micro-batches, the bubble overhead is approximately
+
+$$
+O\left(\frac{K-1}{M+K-1}\right).
+$$
+
+The key ratio is $M/K$:
+
+* With few micro-batches, filling and draining the pipeline is a large fraction of execution time.
+* As $M$ grows, useful steady-state work dominates the fixed pipeline depth.
+
+---
+
+## Re-Materialization
+
+Back-propagation normally requires intermediate activations from the forward pass. Saving every layer's activations for an entire mini-batch consumes
+
+$$
+O(NL)
+$$
+
+activation memory.
+
+GPipe combines partitioning with **re-materialization**, also called activation checkpointing. During the forward pass, each accelerator retains only the activation at its cell boundary. During the backward pass, it runs the cell's forward function $F_k$ again to reconstruct the internal activations required by $B_k$.
+
+Peak activation memory becomes
+
+$$
+O\left(
+N + \frac{L}{K}\frac{N}{M}
+\right).
+$$
+
+The two terms have different sources:
+
+* $O(N)$ stores boundary activations across the mini-batch.
+* $O\left(\frac{L}{K}\frac{N}{M}\right)$ stores internal activations while recomputing one micro-batch within a partition.
+
+Increasing $K$ places fewer layers in each cell, while increasing $M$ makes each micro-batch smaller. Both reduce the internal activation footprint. The trade-off is additional computation: each cell repeats part of its forward pass during back-propagation.
+
+This is a favorable exchange when accelerator memory, rather than raw computation, is the limiting resource.
