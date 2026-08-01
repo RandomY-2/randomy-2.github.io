@@ -1,0 +1,170 @@
+---
+slug: megatron-lm-model-parallel-training
+title: "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism"
+date: "2026-07-30"
+description: "Megatron-LM implements efficient intra-layer model parallelism for transformers by exploiting the structure of MLP and self-attention blocks — partitioning GEMMs to minimize synchronization points and achieving near-linear scaling to billions of parameters with only a few lines of PyTorch."
+tags: [megatron, model-parallelism, transformer, tensor-parallelism, distributed-training, large-models, gpu, nccl, data-parallelism, pytorch]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+Training large transformer language models pushes beyond the memory capacity of a single GPU. A model with billions of parameters requires distributing computation across multiple devices. Pipeline parallelism (GPipe, PipeDream) partitions layers horizontally, but introduces pipeline bubbles and batch-size constraints. Pure data parallelism replicates the full model on each device, limiting the maximum model size to what fits in one GPU's memory.
+
+Megatron-LM takes a different approach: **intra-layer model parallelism**. Rather than splitting layers across pipeline stages, it splits individual layers across GPUs — partitioning the weight matrices of each GEMM within a transformer block. This is orthogonal to pipeline parallelism and can be combined with it.
+
+The key insight is that transformer architectures have inherent structure that admits simple, efficient partitioning. By choosing how to split weight matrices carefully, synchronization points can be minimized: an entire transformer layer requires only two all-reduce operations in the forward pass and two in the backward pass. The implementation requires no custom C++ code or compiler support — just a few communication primitives in PyTorch calling NCCL.
+
+---
+
+## Model Parallel Transformers
+
+A transformer layer consists of a self-attention block followed by a two-layer MLP, with residual connections and layer normalization around each. Megatron introduces model parallelism within both the MLP and self-attention blocks separately, exploiting the algebraic structure of each to minimize communication.
+
+<div align="center">
+![Figure 1: Transformer Layer Structure](/figures/megatron-transformer_layer.png)
+</div>
+
+### Parallelizing the MLP Block
+
+The MLP block contains two GEMMs separated by a GeLU nonlinearity. The first GEMM projects from hidden size $H$ to an intermediate size (typically $4H$), applies GeLU, and the second GEMM projects back to $H$:
+
+$$
+Y = \text{GeLU}(XA)
+$$
+
+**Option 1: Row-parallel split of $A$.** Split $A$ along its rows and $X$ along its columns:
+
+$$
+X = [X_1, X_2], \quad A = \begin{bmatrix} A_1 \\ A_2 \end{bmatrix}
+$$
+
+This yields $Y = \text{GeLU}(X_1 A_1 + X_2 A_2)$. But since GeLU is nonlinear:
+
+$$
+\text{GeLU}(X_1 A_1 + X_2 A_2) \neq \text{GeLU}(X_1 A_1) + \text{GeLU}(X_2 A_2)
+$$
+
+The partial products must be summed (synchronized) before GeLU can be applied. This requires a communication point between the two operations.
+
+**Option 2: Column-parallel split of $A$.** Split $A$ along its columns: $A = [A_1, A_2]$. Now GeLU can be applied independently to each partition's output:
+
+$$
+[Y_1, Y_2] = [\text{GeLU}(XA_1),\ \text{GeLU}(XA_2)]
+$$
+
+This eliminates the synchronization point before the nonlinearity. Each GPU computes its column partition of the first GEMM and applies GeLU locally.
+
+<div align="center">
+![Figure 2: Parallelism in MLP](/figures/megatron-mlp_attention_parallel_mlp.png)
+</div>
+
+Megatron therefore partitions the first GEMM in column-parallel fashion and the second GEMM in row-parallel fashion. The second GEMM takes the partitioned output of GeLU directly — no communication is needed between them because the column split of the first weight matrix corresponds naturally to a row split of the second. The outputs of the second GEMM are then reduced (summed) across GPUs before dropout and the residual connection.
+
+This arrangement fuses two GEMMs with a single all-reduce: one reduce in the forward pass (the $g$ operator) and one in the backward pass (the $f$ operator).
+
+### The $f$ and $g$ Operators
+
+The two communication primitives are conjugates of each other:
+
+* **$f$ operator**: identity in the forward pass, all-reduce in the backward pass.
+* **$g$ operator**: all-reduce in the forward pass, identity in the backward pass.
+
+The $f$ operator is placed before the model-parallel region (distributing the input), and $g$ is placed after it (combining the outputs). Their implementation in PyTorch requires only a custom autograd function:
+
+```python
+class f(torch.autograd.Function):
+    def forward(ctx, x):
+        return x
+
+    def backward(ctx, gradient):
+        all_reduce(gradient)
+        return gradient
+```
+
+The $g$ operator is the conjugate — all-reduce in forward, identity in backward. Together, they ensure that each model-parallel region communicates exactly once in forward and once in backward, with no additional synchronization between the two GEMMs within each block.
+
+### Parallelizing Self-Attention
+
+Multi-head attention has inherent parallelism: each attention head operates independently. Megatron exploits this by partitioning the key ($K$), query ($Q$), and value ($V$) projection matrices in column-parallel fashion such that each GPU computes a subset of attention heads entirely locally. No communication is needed within the attention computation itself.
+
+The output linear projection (after concatenating head outputs) is partitioned along its rows. It takes the local attention output directly — again no communication between the attention computation and the output projection. The all-reduce ($g$ operator) occurs only after the output projection, before dropout and the residual connection.
+
+This mirrors the MLP structure: two fused GEMMs per block, one synchronization point per block per pass direction.
+
+<div align="center">
+![Figure 3: Parallelism in Self-Attention](/figures/megatron-mlp_attention_parallel_attention.png)
+</div>
+
+### Communication Summary
+
+<div align="center">
+![Figure 4: Communication in a Transformer Layer](/figures/megatron-communication.png)
+</div>
+
+A complete transformer layer requires:
+
+* **Forward pass**: two all-reduces (one after MLP, one after self-attention)
+* **Backward pass**: two all-reduces (conjugates of the forward operators)
+
+By fusing pairs of GEMMs and eliminating intermediate synchronization, Megatron reduces the communication cost to the minimum necessary for correctness.
+
+---
+
+## Output Embedding Parallelism
+
+The output embedding layer has dimension $H \times v$ where $v$ is the vocabulary size (e.g., 50,257 for GPT-2). Since this layer shares weights with the input embedding, parallelizing one requires modifying both.
+
+**Input embedding.** The weight matrix $E_{H \times v}$ is partitioned along the vocabulary dimension: $E = [E_1, E_2]$ (column-wise). Each GPU holds a portion of the embedding table. After the input embedding lookup, an all-reduce ($g$ operator) combines the partial results.
+
+**Output embedding.** A naive approach would compute the parallel GEMM $[Y_1, Y_2] = [XE_1, XE_2]$, then all-gather the logits $Y = \text{all-gather}([Y_1, Y_2])$ before cross-entropy. But this communicates $b \times s \times v$ elements (batch size $\times$ sequence length $\times$ vocabulary size) — enormous due to the large vocabulary.
+
+Instead, Megatron fuses the parallel GEMM output with the cross-entropy loss computation. Each GPU computes its partition of the logits and contributes to the scalar loss locally. Only the scalar loss (dimension $b \times s$) needs to be communicated — a massive reduction from communicating the full logit tensor.
+
+---
+
+## Duplicated Computation
+
+Rather than having one GPU compute layer normalization, dropout, or residual connections and broadcast the results, Megatron duplicates these operations across all GPUs. This is a deliberate tradeoff: the compute cost of these operations is negligible compared to the GEMMs, and duplication eliminates communication entirely for these components.
+
+Each GPU maintains:
+
+* Duplicate copies of layer normalization parameters
+* Local dropout and residual connection computation on the all-reduced output
+
+Since all values entering these operations are either local to a GPU or have been synchronized via the preceding all-reduce, each model-parallel worker can independently compute identical results without further communication. Each worker also optimizes its own partition of parameters — no parameter synchronization is required beyond what the partitioning naturally provides.
+
+---
+
+## Hybrid Model and Data Parallelism
+
+<div align="center">
+![Figure 4: Hybrid Model and Data Parallelism](/figures/megatron-hybrid_parallel.png)
+</div>
+
+Model parallelism is orthogonal to data parallelism — both can be used simultaneously. GPUs are organized into two overlapping groups:
+
+**Model-parallel groups.** GPUs within the same node (e.g., 8 GPUs in a DGX-2) form a model-parallel group, holding one instance of the model distributed across them. These GPUs communicate via all-reduce for the $f$ and $g$ operators during forward and backward passes.
+
+**Data-parallel groups.** GPUs at the same position across different model-parallel groups (e.g., GPU 1 from every node) form a data-parallel group. All GPUs within a data-parallel group hold the same model partition. During backpropagation, gradient all-reduce operations run in parallel within each data-parallel group to synchronize weight gradients.
+
+The total number of GPUs is the product of model-parallel degree and data-parallel degree. For example, the 8.3 billion parameter model uses 8 GPUs per model-parallel group and 64-way data parallelism, for a total of 512 GPUs.
+
+All communication is implemented through Python calls to NCCL:
+
+* **Within model-parallel groups**: all-reduces for tensor-parallel communication (high-bandwidth intra-node links)
+* **Across data-parallel groups**: all-reduces for gradient synchronization (can cross node boundaries)
+
+Placing model parallelism within a node and data parallelism across nodes exploits the bandwidth hierarchy: intra-node NVLink provides much higher bandwidth than inter-node network, and model-parallel all-reduces are on the critical path of every forward/backward step while data-parallel all-reduces can overlap with computation.
+
+---
+
+## Random Number Generation
+
+Dropout layers appear both inside and outside model-parallel regions. Correct behavior requires different treatment for each:
+
+**Outside model-parallel regions** (residual connection dropout): all model-parallel workers must apply identical dropout masks, since they all hold duplicate copies of these intermediate values. Megatron seeds the random number generator identically across all workers at the start of training, producing synchronized masks.
+
+**Inside model-parallel regions** (self-attention dropout): each worker operates on a different partition of the data, so dropout masks should differ across workers to achieve randomness across the full operation. Megatron maintains a separate random number generator for these regions, seeded uniquely per model-parallel rank.
+
+This dual-generator approach ensures that duplicated computations remain identical across workers while partitioned computations retain independent stochasticity — without any additional communication for synchronizing random state.

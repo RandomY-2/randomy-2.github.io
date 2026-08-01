@@ -1,0 +1,177 @@
+---
+slug: volcano-optimizer-generator
+title: "The Volcano Optimizer Generator: Extensible Query Optimization with Directed Dynamic Programming"
+date: "2026-07-26"
+description: "Volcano generates data-model-independent query optimizers from a specification of logical and physical algebras, transformation and implementation rules, physical properties, and cost functions — combining top-down goal-directed search with dynamic programming and branch-and-bound pruning."
+tags: [volcano, query-optimization, optimizer-generator, extensible-databases, dynamic-programming, physical-properties, enforcers, cascades, exodus, rule-based]
+category: system-papers
+---
+
+## Introduction
+
+Extensible and object-oriented database systems need query optimizers that work over arbitrary algebras — not just relational select-project-join. But optimization performance cannot be sacrificed for extensibility: data volumes grow continuously, and emerging application domains (scientific computation, engineering) demand at least file-system-level performance. Optimization and parallelization are the mechanisms by which a database system justifies its additional software layers.
+
+The Volcano optimizer generator is designed to produce efficient, extensible optimizers for any algebraic data model. Its requirements are:
+
+* Usable both within the Volcano query execution system and as a standalone tool in other projects.
+* More efficient in optimization time and memory consumption.
+* Effective, extensible support for **physical properties** such as sort order and compression status.
+* Support for heuristics and data-model semantics to guide the search and prune futile branches.
+* Flexible cost models that can generate dynamic plans for incompletely specified queries.
+
+---
+
+## The Optimizer Generator Paradigm
+
+When the DBMS is being built, the **optimizer implementor** writes a model specification — logical operators, physical algorithms, transformation rules, implementation rules, cost functions, and property functions. The optimizer generator translates this specification into C source code, which is compiled and linked with the Volcano search engine to produce the DBMS's optimizer. At runtime, the **DBMS user** submits queries; the generated optimizer maps each query (a logical algebra expression) into an optimal plan (a physical algebra expression).
+
+### Design Principles
+
+Five fundamental decisions shape Volcano's architecture:
+
+**Two algebras.** Query processing in extensible systems is algebraic: operators consume bulk types (sets, bags, arrays, lists, time series) and produce bulk types. But logical operators and physical algorithms are different sets. A `Join` is a logical operator; `HybridHashJoin` and `MergeJoin` are physical algorithms. Volcano uses a **logical algebra** for queries and a **physical algebra** for plans, and optimization maps from one to the other using transformations within the logical algebra and cost-based selection of algorithms.
+
+**Rules for modularity.** Algebraic laws (commutativity, associativity, predicate migration) and operator-to-algorithm mappings are expressed as independent rules. Rules are translated independently by the generator and combined only by the search engine at optimization time. This modularity is an advantage both for initial construction and long-term maintenance of complex optimizer code.
+
+**Algebraic equivalences.** All Volcano optimizer choices are represented as algebraic equivalences in the input specification. Starburst's cost-based optimizer uses an "expansion grammar" with multiple intermediate non-terminal levels, which conflates equivalence (what choices exist) with search method (what order to explore them). Volcano separates these concerns: the implementor states equivalences; the search engine decides the exploration order. Optional facilities allow the implementor to supply heuristics, but they are not mandatory.
+
+**Rule compilation over interpretation.** Interpretation allows augmenting the rule set at runtime, but query optimization is CPU-intensive. Compiled rule sets execute faster. Since extending an optimizer is already time-consuming and hard to be done during runtime, the flexibility argument for interpretation is weak.
+
+**Dynamic programming.** The search engine stores partial results and reuses them — the essence of dynamic programming. Volcano extends this technique from relational join enumeration to general algebraic optimization by combining it with top-down goal-directed search.
+
+### Optimizer Input and Operation
+
+The optimizer implementor provides:
+
+* A set of **logical operators** (the query algebra)
+* **Transformation rules** — algebraic equivalences on the logical algebra, optionally with condition code
+* A set of **algorithms and enforcers** (the physical algebra)
+* **Implementation rules** — mappings from logical operators to algorithms, optionally with condition code. Rules can map multiple logical operators to a single algorithm (e.g., join + projection → fused join-project)
+* An ADT **cost** with arithmetic and comparison functions
+* An ADT **logical properties** — derived from the logical expression alone (schema, expected size, selectivity estimates)
+* An ADT **physical property vector** — depends on algorithm choices (sort order, partitioning, compression). Defined by the implementor with equality and cover comparisons
+* An **applicability function** for each algorithm and enforcer — determines whether it can satisfy the required physical properties and what properties its inputs must have
+* A **cost function** for each algorithm and enforcer
+* A **property function** for each operator, algorithm, and enforcer
+
+**Logical properties** are attached to equivalence classes (sets of equivalent expressions) — they do not change across equivalent forms. **Physical properties** are attached to specific plans — they depend on which algorithm was chosen. When optimizing a many-sorted algebra, the logical properties include the type of an intermediate result, so rule condition code can restrict rules to expressions of the correct type.
+
+**Enforcers** are physical operators with no corresponding logical operator. A sort enforcer does not change what a query computes, only the physical arrangement of its output. Enforcers may produce one property, produce two properties, or enforce one while destroying another. They are comparable to Starburst's "glue" operators.
+
+Each optimization goal is a pair:
+
+$$
+(\text{logical expression},\ \text{physical property vector})
+$$
+
+To evaluate whether an algorithm can serve a goal, the optimizer:
+
+1. Matches the implementation rule's pattern against the expression.
+2. Executes any condition code.
+3. Invokes the algorithm's **applicability function**, which tests whether the algorithm can deliver output satisfying the physical property vector and determines the required physical property vectors for inputs.
+
+For example, optimizing `Join(A, B)` with output required sorted on the join column: hybrid hash join does not qualify (unsorted output), merge-join qualifies (requiring sorted inputs), and the sort enforcer qualifies (relaxing the sort requirement for its input). When optimizing the sort's input, hybrid hash join qualifies — but merge-join must not be considered again (it would redundantly explore "sort over merge-join"). An **excluding physical property vector** prevents this: since merge-join can already satisfy the excluding sort property, it is excluded from the sort's input optimization.
+
+Cost is an abstract data type — it can be a number (estimated elapsed time), a record (CPU time + I/O count, as in System R), or even a function (of available memory), enabling dynamic plans for parameterized queries.
+
+---
+
+## The Search Engine
+
+The search engine is the central component shared by all optimizers generated with Volcano. It is linked with model-specific pattern matching and rule application code produced from the data model specification.
+
+### Directed Dynamic Programming
+
+Dynamic programming was previously used only for relational select-project-join optimization (System R, Starburst), where the search space is small enough for bottom-up enumeration of all join subsets. Volcano extends dynamic programming to general algebraic optimization by combining it with **top-down, goal-directed search**.
+
+The key distinction: System R and EXODUS use **forward chaining** — they derive whatever expressions the rules allow and check whether results contribute to a good plan. Volcano uses **backward chaining** — it explores only those subexpressions and plans that truly participate in a larger expression currently being optimized. The algorithm only derives equivalent expressions for partial queries that are parts of larger subqueries (ultimately the entire query). This is what Volcano calls **directed dynamic programming**.
+
+Partial optimization results are captured in a hash table of expressions and equivalence classes. An **equivalence class** holds two collections:
+
+* Equivalent **logical expressions** — for complete exploration of the search space.
+* **Physical plans** — for fast selection of a plan satisfying given physical properties.
+
+For each combination of physical properties for which an equivalence class has been optimized (e.g., unsorted, sorted on A, sorted on B), the best plan found is kept. The hash table is reinitialized per query; cross-query reuse is noted as future work.
+
+### The FindBestPlan Procedure
+
+<div align="center">
+![Figure 1: FindBestPlan](/figures/volcano-best_plan.png)
+</div>
+
+The search algorithm is invoked as `FindBestPlan(expression, physical_properties, cost_limit)`. The initial call passes the user's query, any user-required physical properties (e.g., `ORDER BY`), and a cost limit (typically infinity, though a limit can catch pathological queries like accidental Cartesian products).
+
+The procedure has two parts:
+
+**Memoization check.** If a plan for the expression satisfying the physical property vector exists in the hash table, return it (or a failure indication) depending on whether it satisfies the cost limit. If the expression has been optimized but not for the current physical properties, proceed to actual optimization.
+
+**Move generation.** Three kinds of moves are available:
+
+1. **Transformations** — apply a transformation rule to derive an equivalent logical expression.
+2. **Algorithms** — an algorithm that can deliver the expression with the desired physical properties (e.g., hybrid hash join for unsorted output, merge-join for sorted output).
+3. **Enforcers** — a physical operator that produces the required properties and permits additional algorithm choices downstream (e.g., sort to enable using hybrid hash join when sorted output is needed).
+
+After moves are generated, they are pursued (currently all moves under exhaustive search; future versions allow the implementor to select and order a subset). This move-selection mechanism is a major extensibility point — in the extreme case, an implementor can pursue only transformations without algorithm selection, replicating Starburst's separate query rewrite phase. In Starburst this separation is mandatory; in Volcano it is optional.
+
+**Pursuing a transformation.** The new expression is formed and optimized via `FindBestPlan`. To handle mutually inverse rules (e.g., applying commutativity twice), the current expression is marked "in progress." If a newly derived expression already exists in the hash table and is marked in progress, it is ignored — its optimal plan will be available when its own optimization completes.
+
+Transformations can create new equivalence classes. Consider associativity: `Join(Join(A, B), C) → Join(A, Join(B, C))`. The outer join expressions are equivalent and share a class. But the inner `Join(B, C)` on the right side does not appear in the original expression — it requires a new equivalence class, which is created and optimized as needed.
+
+**Pursuing an algorithm.** The algorithm's cost function estimates its cost. The applicability function determines the physical property vectors for inputs, and `FindBestPlan` is invoked recursively for each input.
+
+For some binary operators, *consistency* of input properties matters more than the specific properties. A sort-based intersection needs both inputs sorted the same way, but any order works. A parallel join needs compatible partitioning, but any compatible scheme works. The search engine lets the implementor specify a set of physical property vectors to try — e.g., for intersecting `R(A,B,C)` and `S(A,B,C)` where R is sorted on `(A,B,C)` and S on `(B,A,C)`, both orderings are tried while others like `(C,B,A)` are ignored.
+
+**Pursuing an enforcer.** The enforcer's cost is estimated, and the original logical expression is re-optimized with a relaxed physical property vector (the enforcer's property removed). Algorithms that already qualified before relaxation must not be explored again — this is enforced by the excluding physical property vector. If the required output is sorted on the join column, merge-join and sort both qualify. When optimizing the sort's input (no sort requirement), hybrid hash join qualifies but merge-join does not (it can already satisfy the excluding sort property).
+
+### Branch-and-Bound Pruning
+
+The cost limit enables pruning. Once any complete plan is known for a subgoal, no partial plan exceeding that cost can be part of the optimal solution. Cost limits propagate downward through recursive calls and tighten as better plans are discovered.
+
+It is therefore important that a relatively good plan be found quickly (for optimization speed, not correctness). Tight upper bounds at early stages speed optimization of all subsequent subgoals.
+
+### Storing Results
+
+At the end of optimization (or during it), newly derived facts are stored in the hash table. "Interesting" results include:
+
+* Plans optimal for given physical properties — reused by later subgoals.
+* **Failures** — if optimizing a subgoal with a certain cost limit fails, that failure is stored and prevents wasting effort on the same subgoal with the same or lower limit later.
+
+---
+
+## Comparison with EXODUS
+
+EXODUS established the generator paradigm: algebras, rule-based transformations and implementations, separation of logical and physical concerns, and software modularization. The generator concept worked well because the model specification was compiled to machine code with integer-based pattern matching. But the search engine had three serious problems:
+
+1. Modifications for unforeseen algebras produced a bad patchwork of code.
+2. The MESH data structure (holding all explored expressions) was cumbersome in time and space.
+3. Near-random transformations caused most time to be spent **reanalyzing existing plans** rather than discovering new ones.
+
+Volcano addresses each of these, along with adding functionality absent from EXODUS.
+
+### Logical vs. Physical Separation
+
+EXODUS stored logical operators and physical algorithms as a single node type in MESH. Retaining two plans (merge-join and hybrid hash join) for the same logical expression required duplicating the logical expression itself, inflating MESH. Volcano separates equivalence classes (logical) from plans (physical): one logical expression stored once can point to many alternative plans.
+
+### First-Class Physical Properties
+
+Physical properties in EXODUS were accidental: if the cheapest algorithm happened to produce useful order, this was noted; otherwise, sort costs had to be folded into other algorithms' cost functions. The ability to specify required properties and let them *drive* the search was absent. Volcano's physical property vector is a first-class ADT with equality, cover, and applicability functions — contributing significantly to search efficiency.
+
+Physical properties are highly extensible. Beyond sort order, the implementor can define:
+
+* Uniqueness (with sort-based and hash-based enforcers)
+* Location/partitioning in distributed systems (with a network operator as enforcer)
+* "Assembledness" of complex objects in memory (with an assembly operator as enforcer)
+
+### Top-Down, Goal-Directed Search
+
+EXODUS's search was undirected. Transformations were explored whether or not they contributed to the current best plan. Worse, transformations were prioritized by expected cost improvement (rule factor × current node cost), which favored top-of-tree rewrites. When lower expressions were finally transformed, all consumers above had to be reanalyzed — creating an explosion of MESH nodes. For larger queries, most time was spent in reanalysis.
+
+Volcano's top-down search only optimizes subexpressions that are actually needed by a parent subgoal. Combined with memoization, each subgoal is optimized at most once per physical property vector.
+
+### Cost as an Abstract Data Type
+
+EXODUS fixed cost to a specific representation. Volcano makes cost an ADT — the implementor supplies arithmetic and comparison functions. Cost can be a scalar (estimated elapsed time), a record (CPU time + I/O count for a System-R-style model), or a function (of available memory), enabling dynamic plans whose algorithm choices are deferred to runtime.
+
+### Search Strategy Extensibility
+
+Volcano's hash table and its operations are general enough to support search strategies beyond the one described here. The framework supports future extensions: the implementor may supply heuristic functions to select and order moves, controlling search thoroughness. This extensibility is the foundation that Cascades, Volcano's successor, would develop further.
