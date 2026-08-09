@@ -1,0 +1,245 @@
+---
+slug: cascades-optimization-framework
+title: "The Cascades Framework for Query Optimization"
+date: "2026-08-01"
+description: "Cascades reworks the Volcano optimizer generator into a task-driven, top-down search engine — with rules as first-class objects, on-demand exploration, operators that are both logical and physical, function rules, and a clean C++ interface between the DBI and the optimizer."
+tags: [cascades, query-optimization, optimizer-generator, extensible-databases, volcano, exodus, memoization, top-down-search, rules, enforcers]
+category: system-papers
+---
+
+## Introduction
+
+The EXODUS and Volcano optimizer generators established the paradigm that a query optimizer can be produced from a specification of algebras, rules, cost functions, and physical properties. Building real systems on top of Volcano — an object-oriented database and a scientific database prototype — surfaced a number of concrete shortcomings: an awkward interface for support functions, no way to model predicates as first-class operators, cumbersome argument-transfer mechanisms, and a rigid separation between logical transformation and physical implementation that made rewrites like predicate splitting hard to express.
+
+Cascades is a new extensible optimizer designed to keep everything that worked about Volcano — dynamic programming, memoization, top-down goal-directed search, physical properties, enforcers — while fixing these interface and expressiveness problems. Relative to Volcano, the new framework provides:
+
+* **Rules as objects**, subclassable at run time, with per-rule promise and condition functions
+* Rules that can invoke a **DBI-supplied function** to produce substitutes, rather than pattern-matching a fixed template
+* Rules whose substitute is a **complex expression tree** (not just a single implementation operator)
+* Operators that may be **both logical and physical** — for example, a predicate
+* Patterns that match an entire **subtree** (via a `TREE-OP` leaf)
+* Rules to insert **enforcers** (sort, ship, assemble) as ordinary substitutes
+* **Schema- and query-specific rules** for materialized views
+* **Optimization tasks as data structures** rather than procedure invocations, enabling reordering, guidance, and future parallel search
+* **Incremental exploration** of equivalent logical expressions — on demand for a specific pattern, not exhaustively up front
+* A clean C++ interface built out of abstract base classes that the DBI is expected to subclass
+
+The remainder of this post first develops the vocabulary Cascades uses internally — expressions, groups, the memo, rules, and enforcers — then walks through the search algorithm as a set of task objects, and finally describes the abstractions that make up the DBI–optimizer interface.
+
+---
+
+## Expressions, Groups, and the Memo
+
+Before the task machinery makes sense, three data structures need to be pinned down: what Cascades manipulates (**expressions**), how it collapses equivalent expressions together (**groups**), and where it stores everything it has ever seen (the **memo**).
+
+### Expressions
+
+An **expression** is the most granular unit of a query plan. It is one operator plus pointers to its input expressions — no more, no less. Expressions come in three flavors:
+
+* **Logical expressions** describe *what* to compute. For example, `A ⋈ B ⋈ C` — an equijoin over three relations — is a logical expression. Its structure is what a rule matches against; its output cardinality and schema depend only on the logical inputs.
+* **Physical expressions** describe *how* to compute it. `(A ⋈_HJ B) ⋈_NL C` — hash-join `A` and `B`, then nested-loops-join with `C` — is a physical expression. Physical expressions carry cost, and they produce and consume **physical properties** like sort order or partitioning.
+* **Combined expressions** are both logical and physical at once. A single-record predicate `pred(x) > 5` is a natural example: it describes what to filter *and* how to filter, so pattern-matching against it can freely mix logical rewrites (e.g., pushing the predicate through a join) with physical decisions.
+
+An expression carries whatever arguments its operator needs inline — no separate argument-transfer mechanism. This is what lets Cascades treat a predicate as a first-class operator that rules can rewrite, rather than as an opaque payload the optimizer cannot inspect.
+
+### Groups
+
+A **group** is a set of expressions that are logically equivalent — every expression in the group produces the same result. The group is Cascades' unit of dynamic programming: once the best physical plan for a group is found under a given optimization goal, that plan is cached and reused.
+
+For a three-way join `A ⋈ B ⋈ C`, the top-level group `{ABC}` contains every logical form and every physical implementation the optimizer has discovered:
+
+| Logical expressions | Physical expressions |
+| --- | --- |
+| `{AB} ⋈ {C}` | `{AB} ⋈_SM {C}` |
+| `{BC} ⋈ {A}` | `{AB} ⋈_HJ {C}` |
+| `{AC} ⋈ {B}` | `{AB} ⋈_NL {C}` |
+| `{A} ⋈ {BC}` | `{BC} ⋈_SM {A}` |
+| … | … |
+
+Each `{...}` on the input side is itself a reference to another group — `{AB}` is the group of all expressions equivalent to joining `A` and `B`, `{A}` is the group containing the scans of `A`, and so on. The optimizer never materializes `A ⋈ B` twice: both `{AB} ⋈ {C}` and `{C} ⋈ {AB}` share the same `{AB}` group. This sharing is what makes the state space finite.
+
+### The Memo
+
+The **memo** is the data structure that holds every group the optimizer has ever created, along with all the expressions in each group. Physically it is a graph — groups point to expressions, expressions point back to input groups — indexed by a hash table keyed on `(operator, input group ids)` so duplicates can be detected in O(1). When a rule fires and produces an expression that already exists somewhere, the memo silently discards it.
+
+A snapshot of the memo mid-optimization for `A ⋈ B ⋈ C` looks like this:
+
+| Group | Best expr so far | Cost |
+| --- | --- | --- |
+| `{ABC}` | `({A} ⋈_HJ {B}) ⋈_HJ {C}` | 125 |
+| `{AB}` | `{A} ⋈_HJ {B}` | 80 |
+| `{A}` | `SeqScan(A)` | 10 |
+| `{B}` | `SeqScan(B)` | 20 |
+| `{C}` | `IdxScan(C)` | 5 |
+
+Two properties make the memo useful for search:
+
+* **Principle of optimality.** Every sub-plan of an optimal plan is itself optimal. To find the best plan for `{ABC}`, Cascades needs the best plan for each sub-group under whatever physical properties the parent demands — and once found, that per-goal best is cached on the group. This is the dynamic-programming skeleton the whole optimizer hangs off of.
+* **Pattern memory.** Each group also carries bookkeeping about which rules and patterns it has already been searched for. Before firing an exploration for the same pattern twice, Cascades consults this memory and skips the redundant work.
+
+---
+
+## Rules and Enforcers
+
+The other half of the vocabulary is the mechanism that populates the memo: rules.
+
+### Pattern and Substitute
+
+A **rule** is a pair `(pattern, substitute)`. The pattern is an expression tree — possibly with wildcards — that the optimizer tries to match against expressions in the memo. When a match is found, the substitute (also an expression tree) is instantiated with the matched sub-groups and inserted into the memo.
+
+Rules come in two flavors:
+
+* **Transformation rules** rewrite logical to logical. Join commutativity is the canonical example: pattern `A ⋈ B`, substitute `B ⋈ A`. Join associativity is another: pattern `(A ⋈ B) ⋈ C`, substitute `A ⋈ (B ⋈ C)`.
+* **Implementation rules** rewrite logical to physical. `EQJOIN → SORT-MERGE-JOIN` is one: pattern is a logical equijoin, substitute is the physical sort-merge operator over the same inputs. `GET(R) → SEQ-SCAN(R)` is another.
+
+The two are handled by exactly the same task machinery. In a single Apply Rule task, the current expression `A ⋈ B` might be rewritten to `B ⋈ A` (transformation) *and* to `A ⋈_HJ B` (implementation), and both substitutes land in the same group.
+
+### Enforcers
+
+An **enforcer** is a physical operator whose entire job is to produce a physical property the parent demands but the child cannot supply on its own. The most common enforcer is `SORT`: if a merge-join wants its input sorted on `A` but the input group's best plan is an unsorted hash aggregate, the optimizer inserts a `SORT(A)` on top of that plan.
+
+Volcano special-cased enforcers in the search loop. Cascades removes that special case: an enforcer is just a rule whose substitute is a physical operator on a `LEAF-OP` input. The `SORT` rule's substitute might be `SORT(A) over LEAF`, its promise function fires only when a sort order is required, and its `input-reqd-prop` method strips the sort requirement from the child (so a merge-join whose own output is already sorted is not re-sorted redundantly).
+
+Treating enforcers as ordinary rules lets the framework support arbitrary enforcers — `SHIP` for distributed plans, `ASSEMBLE` for object-relational systems — without touching the search loop.
+
+---
+
+## Optimization Algorithm and Tasks
+
+The Cascades search algorithm is broken into pieces called **tasks**. Each task could easily have been a procedure, but Cascades represents tasks as objects with a `perform` method. Every task that has yet to be done sits in a task structure — currently a LIFO stack, but designed so that tasks can be reordered for heuristic guidance and eventually replaced with a dependency graph for parallel search on shared memory.
+
+### Task Types
+
+<div align="center">
+![Figure 1: Optimization Tasks](/figures/cascades-tasks.png)
+</div>
+
+`optimize()` first copies the original query into the internal memo and then kicks off the whole process with one task: **optimize the group corresponding to the root of the query tree**, under a starting goal (initial cost limit, required physical properties, excluded physical properties). That task recursively spawns smaller and smaller subgoals. Five task types cover the search, plus one that is structurally different:
+
+* **Optimize group.** Take a `(group, cost limit, required properties, excluded properties)` tuple — Cascades' equivalent of Volcano's "optimization goal" — and produce the best physical plan or a failure. Before doing any work, the task checks whether the exact same goal has already been pursued against this group and, if so, returns the previously found plan. This check is where dynamic programming lives.
+* **Optimize expression.** Optimize a single expression (rather than every expression in its group) under the same kind of goal. Optimizing a group is implemented by scheduling this task for each expression in the group; optimizing an expression is what runs right after a transformation rule produces a new logical form.
+* **Explore group.** Derive every logical expression in a group that matches a given pattern — the pattern being a subtree of some rule's antecedent. Exploration replaces Volcano's mandatory first phase that expanded every equivalence class exhaustively; Cascades explores only on demand, and only for the pattern that actually motivated the request.
+* **Explore expression.** The expression-level analogue of exploring a group — apply transformation rules to a single expression to expose forms matching a specific pattern.
+* **Apply rule.** For a specific `(rule, expression)` pair, iterate bindings, invoke the condition function, produce substitutes, integrate them into the memo, and schedule follow-on tasks.
+* **Optimize inputs.** The one task that does not simply schedule and vanish — see below.
+
+### Optimization vs. Exploration
+
+The distinction between "optimize" and "explore" mirrors the distinction between what Volcano did in its two phases, but Cascades intermixes them and abolishes the mandatory first phase.
+
+* **Optimizing** a group finds the best physical plan for any expression in it. It applies both transformation and implementation rules; on a complete rule set this transitively finds the best plan reachable from the starting expression.
+* **Exploring** a group derives all *logical* expressions in it that match a given pattern. It applies only transformation rules, and only enough of them to expose whatever the requesting rule needs.
+
+For example, take the join-associativity rule with pattern `(?X ⋈ ?Y) ⋈ ?Z` applied to group `{ABC}`. The rule expects the top-level `EQJOIN`'s left input to itself be an `EQJOIN`. If `{ABC}` currently contains only `{AB} ⋈ {C}`, the pattern's inner `EQJOIN` maps onto `{AB}`, which is a *group*, not a specific expression. To iterate bindings, Cascades needs the concrete logical expressions in `{AB}` — `{A} ⋈ {B}` and (via commutativity) `{B} ⋈ {A}`. In Volcano, `{AB}` would have been fully expanded in the mandatory first phase, so every binding is immediately available. In Cascades, those expressions may not yet exist in the memo; the associativity rule's Apply Rule task first schedules an `Explore group({AB}, pattern=EQJOIN)` to materialize them, and only then iterates bindings.
+
+Exploration tasks also participate in dynamic programming. Before exploring a group, the task checks the group's **pattern memory** to see whether the same pattern has been explored already; if so, the task terminates immediately. Each expression additionally carries a bitmap of rules already applied to it, so the same transformation rule is never fired against the same expression twice.
+
+### Efficiency Comparison
+
+Which strategy is more efficient — Volcano's exhaustive pre-expansion or Cascades' on-demand exploration? In the worst case, without guidance, Cascades reduces to Volcano: every rule that could conceivably contribute must still fire. But when guidance is available, Cascades avoids expressions that no rule will ever consume, and the same group may be explored multiple times for different patterns without redundant rule applications (thanks to the per-expression bitmap and the pattern memory).
+
+The paper anticipates two sources of guidance, neither yet implemented. First, static analysis of the rule set: by looking at each rule's antecedent and consequent top operators, the optimizer can build a reachability relation over operators and take its transitive closure to exclude rules that cannot possibly connect one operator to another. This can be done once when the optimizer is generated. Second, DBI-supplied heuristics via the guidance mechanism described below. If either source produces incorrect information, Cascades may prune valid plans; correctness of guidance is therefore critical.
+
+### Applying a Rule
+
+Performing an apply-rule task has four parts:
+
+1. **Iterate bindings.** A **binding** is a concrete matching of the rule's pattern against a real expression tree in the memo. Consider the join-associativity rule with pattern `(EQJOIN ?X ?Y) ⋈ ?Z`, applied to a group `{ABC}` that currently holds three logical expressions: `{AB}⋈{C}`, `{BC}⋈{A}`, and `{AC}⋈{B}`. Only the first matches the top-level pattern shape (the outer operator's left input must itself be an `EQJOIN`), so the binding iterator produces `?X={A}, ?Y={B}, ?Z={C}`. If `{AB}` had multiple logical expressions, each would give a different binding. Because the pattern's leaves are groups, the iterator has to enumerate combinations across sub-groups — the recursive `BINDING` iterator produces one feasible tuple at a time so this is not materialized. Each binding is translated into a tree of `EXPR` nodes belonging to the DBI-facing class hierarchy (rather than the optimizer's internal representation). This copy costs some effort but isolates the optimizer from methods invoked by DBI code.
+2. **Produce substitutes.** For each binding, the rule's condition function is called. Qualifying bindings are then converted into substitutes. Continuing the example: the substitute pattern `?X ⋈ (?Y ⋈ ?Z)` becomes the concrete expression `{A} ⋈ ({B} ⋈ {C})`. For **simple rules** the substitute is a fixed expression tree the optimizer can build directly; for **function rules** the DBI supplies an iterator that produces one substitute per invocation, so a single binding may yield multiple transformations (splitting a conjunctive predicate `p AND q AND r` into every legal push-down assignment, for instance).
+3. **Integrate into the memo.** Each substitute is inserted bottom-up into the memo. Any new sub-group created — say, `{BC}` if it did not already exist — is registered. Duplicates are detected via the memo's hash table keyed on `(operator, input group ids)`. If `{BC}` already existed from a previous rule firing, its group id is reused and the substitute collapses into the same equivalence class. Duplicate expressions are discarded so no further work is done on them.
+4. **Schedule follow-ons.** If the substitute's root is a genuinely new expression in the group, the task decides what to do next based on the calling context:
+   * If the current activity is an exploration, an **explore expression** task is scheduled for the substitute against the same pattern.
+   * If it is an optimization and the root is a logical operator, an **optimize expression** task is scheduled with the same goal.
+   * If the root is a physical operator, an **optimize inputs** task is scheduled to cost the inputs.
+   * If the root operator is both logical and physical (allowed in Cascades), both kinds of follow-ons are created.
+
+### Optimize Inputs
+
+The optimize-inputs task is different from the others: it does not schedule follow-ons and vanish. It becomes active repeatedly. It schedules an optimize-group task for one input, waits for the result, updates state, then schedules the next input, and so on.
+
+To make the branch-and-bound concrete, suppose Cascades is costing a physical expression `{AB} ⋈_HJ {C}` under an initial cost limit of 200. The task first calls the operator's `input-reqd-prop` to derive the goal for the left input — say, `{AB}` needs to arrive with no particular ordering, but sorted plans should not be excluded. It schedules `Optimize {AB}` under a cost limit of 200. Suppose the best plan for `{AB}` comes back with cost 80 and the local hash-join cost is 40. The parent's running cost is now `80 + 40 = 120`, so the remaining budget for `{C}` is `200 − 120 = 80`. The task tightens the limit and schedules `Optimize {C}` with cost limit 80. If `{C}`'s best plan costs 5, the parent expression comes in at `80 + 40 + 5 = 125` and beats any prior candidate at the group level.
+
+At every step, the operator's cost-limit methods verify feasibility and derive the next input's tightened budget. Sub-groups whose only reachable plans exceed the current limit are pruned immediately — as in Volcano's search, only subtrees and interesting properties that could actually participate in a plan are optimized, and pruning is as tight as possible.
+
+---
+
+## Data Abstraction and the DBI Interface
+
+Designing Cascades required alternating between three perspectives: (1) shaping the DBI–optimizer interface into minimal, functional, clean abstractions; (2) implementing a prototype DBI on top of that interface to make sure it was usable; and (3) designing an efficient search engine based on lessons from EXODUS, Volcano, and feedback from the first user group. Every class in the interface is designed to become the root of a DBI-defined subclass hierarchy: creating a new object of one class is associated with another (a new `GUIDANCE`, for instance, is created by a `RULE`), and the optimizer relies only on virtual methods defined on the base class.
+
+### Operators and Their Arguments
+
+The class `OP-ARG` covers **both logical and physical operators**. Two methods — `is-logical` and `is-physical` — determine an operator's role, and the two are not mutually exclusive. An operator may be neither (useful when optimization is organized as an expansion grammar with non-terminal operators, as in Starburst); it may be both (natural for sargable single-record predicates in the style of System R); or it may be strictly one via DBI-defined subclasses of `OP-ARG` that pin down `is-logical` and `is-physical`.
+
+Operator arguments live directly inside the operator. There is no separate argument-transfer mechanism as in EXODUS and Volcano. Combined with the ability to make an operator both logical and physical, this is what lets Cascades treat predicates as first-class operators rather than as opaque arguments that the optimizer cannot manipulate. Complex predicate rewrites — splitting a conjunctive predicate into parts that push through a join, for instance — are most efficiently written as C++ functions; Cascades exposes them via function rules and the `TREE-OP` pattern (below), so predicate transformations are no longer the cumbersome exercise they were in the earlier generators.
+
+Two special operators exist for use in patterns:
+
+* **`LEAF-OP`** matches any subtree. When a matching expression is extracted from the memo, each `LEAF-OP` in the pattern is replaced by a leaf that refers, by array index, to an equivalence class in the memo. This is the standard "any subtree" wildcard familiar from Volcano.
+* **`TREE-OP`** also matches any subtree, but extraction produces the entire subtree down to logical-algebra leaves, not just a group reference. This is particularly useful when a function rule needs to inspect the whole expression it is about to transform (e.g., a predicate).
+
+Beyond `is-logical`/`is-physical`, every operator supplies an `opt-cutoff` method that says how many moves to pursue during optimization; by default all moves are pursued, guaranteeing exhaustive search. Logical operators additionally provide matching, hashing, and initial/improved logical-property methods (used for duplicate detection, pattern matching, and property propagation). Physical operators provide methods that compute output physical properties, local algorithm cost, subplan cost from input costs and properties, and — between optimizing two inputs — verify the cost limit and derive the next input's cost limit. Finally, `input-reqd-prop` maps a physical operator's optimization goal to the goal for one of its inputs (cost limit plus required and excluded physical properties).
+
+### Logical and Physical Properties, Costs
+
+The property and cost interfaces are deliberately minimal:
+
+* `COST` supports destruction, printing, and comparison. Cost instances are produced by other classes' methods (mainly operators').
+* `SYNTH-LOG-PROP` (synthesized logical properties) has only a hash function, used to speed duplicate detection.
+* `SYNTH-PHYS-PROP` (synthesized physical properties) has no methods at all — instances are produced and consumed by operator methods.
+* `REQD-PHYS-PROP` (required physical properties) has one method: does a synthesized physical-property instance cover this required one? The comparison returns `MORE` when one is strictly more specific than the other (sorted on `A, B, C` covers sorted on `A, B`), and `UNDEFINED` by default.
+
+### Expression Trees
+
+`EXPR` is the DBI-facing representation of an expression: an operator plus pointers to input expressions. The optimizer's internal data structures are separate. `EXPR` provides constructors, destructors, printing, accessors for the operator and inputs, and a recursive matching method that dispatches per-node into each operator's matching method.
+
+### Search Guidance
+
+Beyond pattern, cost limit, and required/excluded physical properties, rule application is also parameterized by a `GUIDANCE` instance. Guidance is about the *search process*, not about the expressions being optimized: it captures heuristics that should carry from one rule application to the next.
+
+The simplest built-in example is `ONCE-GUIDANCE` paired with `ONCE-RULE`. Commutativity-style rules are self-inverse — applying `A ⋈ B → B ⋈ A` twice returns to the starting expression. Cascades expresses "don't do that" as a guidance instance attached to the substitute: when commutativity produces `B ⋈ A`, the follow-on `Optimize expression(B ⋈ A)` task is scheduled with a `ONCE-GUIDANCE` that marks commutativity as already fired for this expression, so it will not fire again. This is finer-grained than the per-expression rule bitmap because it survives across sub-groups.
+
+Guidance is also the mechanism by which the DBI can implement rule "modules." One influential proposal (Mitchell et al.) divides a rule set into modules and applies them one at a time — say, run all predicate-pushdown rules to fixed point, *then* consider join reordering. A Cascades DBI expresses this by having a guidance instance name the current module, and each rule inspects that indication in its promise function: a join-reorder rule returns `0` when the guidance still says "predicate-pushdown," and a positive promise once the module advances.
+
+### Pattern Memory
+
+Each group carries a `PATTERN-MEMORY` used to short-circuit redundant exploration. Before a group is explored for a pattern, the pattern memory is asked (a) to record the pattern and (b) to decide whether exploration should proceed. The simplest possible memory is a Boolean: has this group been explored at all? More sophisticated pattern memories store each pattern individually and admit fine-grained decisions. When exploration promise functions are correspondingly fine-grained, this dovetails with the whole guidance story.
+
+Pattern memories also support a `merge` operation: when two groups turn out to hold the same equivalence class (because a transformed expression collides with an existing one in a different group), their pattern memories must be merged into one.
+
+### Rules
+
+Rules are objects (`class RULE`). They have a name, an antecedent (the pattern), and a consequent (the substitute); both are expression trees. Because rules are objects, they can be created at run time — enabling schema- and even query-specific rules for materialized views — and are naturally subclassable.
+
+A **simple rule** has nothing more than name, pattern, and substitute. Pattern and substitute can be arbitrarily complex. The one remaining restriction is that all but the substitute's top operator must be logical. That still allows things like transforming a logical join `A ⋈ σ_p(B)` into a physical nested-loops operator whose inner input is a logical selection `A ⋈_NL σ_p(B)` — i.e., detaching a predicate from a join algorithm and pushing it into the inner subtree in one rule application.
+
+Two edge cases in the pattern/substitute shape give rise to two special sub-classes:
+
+* If the substitute is a single `LEAF-OP`, the rule is a **reduction rule**: applying it merges two groups. For example, `WHERE 1=1 → LEAF` matches a tautological filter and collapses its group into the child's group. Reduction rules are how Cascades expresses the "simplification rules" that Starburst applies as an initial rewrite phase.
+* If the pattern is a single `LEAF-OP`, the rule is an **expansion rule**: it can, in principle, fire against any expression, so its promise and condition functions do most of the work of deciding when to actually fire. Expansion rules are the mechanism for enforcer rules — see the sort enforcer walkthrough below.
+
+Two kinds of condition functions parameterize rule firing, both against the current optimization goal (cost limit and required/excluded physical properties):
+
+* **Promise functions** are called *before* exploration of subgroups. Their return value indicates how useful the rule looks: `0` or less prevents any further work on this rule and expression, positive values grade promise. There is one promise function for optimization and one for exploration. The default returns `0` when a specific physical property is required, `2` for implementation rules, and `1` otherwise — so implementation rules run before transformation rules, and neither fires when a physical property (like a sort order) is required but the rule cannot supply it. Concretely, a merge-join implementation rule might promise `4` when the join predicate is an equality (`R.A = S.A`) and `0` otherwise; a hash-join might promise `3` on equality and `0` on anything else. Under exhaustive-search cutoff, promise values do not change the final plan — only the order plans are found in, and therefore pruning effectiveness and optimization time.
+* **Condition functions** are called *after* the pattern's subgroups have been fully explored and a complete matching expression is available. Whereas promise returns a real number, condition returns a Boolean.
+
+Rules also carry a small collection of methods beyond the standard constructor/destructor/print/accessors:
+
+* `rule-type` — simple rule vs. function rule (below).
+* `top-match` — does an operator in the memo match the rule's top pattern operator? This is the only built-in check before promise is called.
+* `opt-cases` — how many times to optimize a physical expression under different required properties. Almost always `1`; a merge-join on two equality clauses `R.A = S.A and R.B = S.B` is a rare case where the plan should be optimized under both `sort(A, B)` and `sort(B, A)`.
+* `opt-guidance`, `expl-guidance`, `input-opt-guidance`, `input-expl-guidance` — factory methods that produce the guidance instances used when the newly created expression (or its inputs) is optimized or explored. All default to `NULL`.
+
+### Enforcer Rules Worked Out
+
+The sort enforcer is expressed as an expansion rule whose pattern is a single `LEAF-OP` and whose substitute is `SORT(A) over LEAF-OP`. The rule's methods pin down exactly when it fires:
+
+* **Promise.** Returns `0` unless the current optimization goal requires a sort order.
+* **Condition.** True whenever the enforcer's inserted `SORT` would actually satisfy the required order.
+* **`input-reqd-prop`.** For the child, strips the required sort *and* adds an excluded property that forbids sorted plans on that child. The exclusion is what keeps a `SORT(A)` from being stacked on top of a merge-join that already emits sorted output — the merge-join plan would be considered redundantly under the child goal, so it is preemptively excluded.
+
+Ship enforcers (for distributed plans) and assemble enforcers (for object-relational systems) follow the same shape with different physical operators. The search loop treats them like any other rule: `Apply rule(sort-enforcer, current-expression)` fires whenever a required sort property is on the goal, produces a substitute, and the substitute's `Optimize inputs` recurses into the child with the reworked goal.
+
+### Function Rules
+
+**Function rules** (`class FUNCTION-RULE`) address the many transformations that are easier to express as C++ code than as a pattern-substitute pair. Once an expression matching the pattern is extracted, an iterator method is invoked repeatedly to produce substitutes. Combined with `TREE-OP` (which lets the extracted expression be arbitrarily deep), function rules can express essentially any transformation — dividing a complex join predicate into left/right/both clauses, for instance, or view merging. In the limit, a set of function rules could implement every transformation in the optimizer, though doing so would defeat much of the framework's purpose.

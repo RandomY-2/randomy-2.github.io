@@ -1,0 +1,209 @@
+---
+slug: pytorch-fully-sharded-data-parallel
+title: "PyTorch FSDP: Fully Sharded Data Parallel"
+date: "2026-08-05"
+description: "FSDP shards parameters, gradients, and optimizer states across GPUs, materializes each unit on demand via AllGather, and reduces gradients via ReduceScatter — co-designed with PyTorch's Tensor, dispatcher, and CUDA caching allocator to deliver non-intrusive user experience with hardware-aware sharding strategies, communication overlap, and native mixed precision."
+tags: [fsdp, pytorch, data-parallelism, model-sharding, distributed-training, zero, allgather, reducescatter, mixed-precision, cuda-caching-allocator, gpu, large-models]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+In recent years, the community has introduced and investigated numerous advanced methodologies to enlarge neural network models:
+
+* **Pipeline parallelism** partitions a network into stages and pipelines micro-batches through them. It works only for models that can be expressed as a sequence of stages, and typically requires manual model rewriting.
+* **Tensor parallelism** shards individual layers (GEMMs) across devices and communicates activations at layer boundaries. It is tightly bound to a specific model architecture (transformer MLP and attention blocks) and tends to be brittle when the model shape changes.
+* **Zero-Redundancy parallelism** shards parameters, gradients, and optimizer states across data-parallel ranks and communicates parameters on demand to reconstruct the unsharded form for each forward and backward pass. It preserves the illusion of a single-replica model on every rank.
+
+PyTorch **Fully Sharded Data Parallel (FSDP)** takes the third path. It is inspired by DeepSpeed's `ZeroRedundancyOptimizer` but redesigned as a native PyTorch component — co-designed with the `Tensor` implementation, the dispatcher, and the CUDA caching allocator. The result is a library that gives users a DDP-like experience while scaling to models that no single GPU could hold.
+
+FSDP splits the model into **units**, flattens and shards the parameters within each unit, and materializes the unsharded parameters of one unit at a time via `AllGather` immediately before the unit runs. After the unit finishes, the unsharded parameters are discarded. Gradients follow the mirror path: `ReduceScatter` reduces and shards them at the end of each unit's backward pass. Peak memory is therefore proportional to the size of the *largest* fully-materialized unit, not to the full model.
+
+The design has to answer four thorny questions along the way:
+
+* **User experience.** How to preserve DDP-like ergonomics when the model may not even fit in one GPU to be constructed?
+* **Hardware heterogeneity.** How to exploit fast intra-host links (NVLink) versus slow inter-host networks?
+* **Resource utilization.** How to keep GPUs busy despite the added communication?
+* **Memory planning.** How to operate near the memory ceiling without triggering `cudaMalloc` retries and fragmentation storms?
+
+The rest of this post walks through FSDP's answers.
+
+---
+
+## System Design
+
+<div align="center">
+![Figure 1: FSDP Overview](/figures/fsdp-system_overview.png)
+</div>
+
+FSDP decomposes a model into units and handles each unit independently. Consider a six-layer model split into three units `[layer0, layer3]`, `[layer1, layer2]`, `[layer4, layer5]`. Each unit is wrapped and its parameters are sharded across the data-parallel ranks. During training:
+
+1. Just before `layer1` runs in the forward pass, FSDP `AllGather`s the shards for unit 1's parameters from every rank so it can materialize the unsharded weights.
+2. `layer1` and `layer2` execute using the unsharded weights.
+3. FSDP frees the peer shards so unit 1 returns to its sharded state.
+4. The next unit repeats the process.
+
+The backward pass mirrors the forward pass, with two additions. Before backward enters `layer2`, FSDP `AllGather`s unit 1's parameters again to compute activation gradients. Once autograd finishes the unit's backward pass, FSDP frees the peer shards and issues a `ReduceScatter` on the gradients — each rank ends the step holding only its shard of the parameters and its shard of the gradients. The optimizer step operates purely on sharded state.
+
+The peak memory therefore consists of:
+
+$$
+\underbrace{\text{full sharded model}}_{\Psi / F} \;+\; \underbrace{\text{largest unsharded unit}}_{\max_i \psi_i}
+$$
+
+where $\Psi$ is the total parameter count, $F$ is the sharding factor, and $\psi_i$ is the size of FSDP unit $i$. The user controls unit boundaries via a wrapping policy and thereby controls the memory-throughput trade-off.
+
+---
+
+## Model Initialization
+
+The first practical problem is initializing a model whose unsharded form does not fit on one GPU. DDP solved this trivially by requiring the model to be constructed on-device; FSDP cannot.
+
+FSDP offers three initialization strategies:
+
+**Initialize unsharded on GPU.** For models small enough to fit on one GPU but not to train on one GPU (training also needs gradients, activations, and optimizer states), the user constructs the whole model on-device and hands it to FSDP. The optimizer is instantiated *after* FSDP has sharded the model, so it operates on sharded parameters directly.
+
+**Initialize unsharded on CPU.** For truly large models, the unsharded copy lives in CPU memory and FSDP streams it to the GPU one unit at a time. Each unit is sharded on arrival, so at most one unit's worth of unsharded parameters is on the GPU at any moment. This is robust to cross-submodule initialization dependencies because CPU memory holds everything, but the CPU is the bottleneck — memory bandwidth and parallelism are far lower than the GPU's.
+
+**Deferred initialization.** The most general approach: allocate parameter tensors on a *fake device* that records every op invoked during `__init__` without actually allocating storage. When a tensor is later moved from the fake device to a real GPU, the recorded ops are replayed against real storage. This lets users construct any third-party model without a single byte of GPU allocation, while still faithfully reproducing custom initialization logic. FSDP then walks the fake-device model, decomposes it into units, and materializes each unit on the GPU (replaying its recorded ops) before sharding and moving on to the next.
+
+Even with deferred initialization, an inherent limitation remains: if a sub-module's `__init__` reads a parameter from a *different* unit, that parameter may have already been sharded and discarded. In practice this is rare, and users can fall back to CPU initialization when needed.
+
+---
+
+## Sharding Strategies
+
+The **sharding factor** $F$ controls how aggressively FSDP shards. It ranges from $1$ (full replication — equivalent to DDP with `AllReduce` for gradients) to the global world size $W$ (full sharding — every parameter partitioned across all ranks). Values in between give **hybrid sharding**.
+
+### Full Sharding
+
+Full sharding minimizes memory but has the highest communication cost — about 1.5x the volume of DDP under a bandwidth-optimal ring algorithm. Two collective properties determine efficiency, and FSDP is engineered around both:
+
+1. **Even input size.** NCCL's `AllGather` and `ReduceScatter` are fastest when every rank contributes an identically-sized tensor. Uneven inputs force PyTorch's `ProcessGroup` to emulate the collective using group broadcasts, which is significantly slower.
+2. **Larger input size.** For fixed total volume, batching data into fewer, larger collectives amortizes the launch overhead and saturates the network. Once per-`AllGather` size drops below roughly 33M FP32 elements, throughput degrades sharply.
+
+<div align="center">
+![Figure 2: Communication Efficiency](/figures/fsdp-communication.png)
+</div>
+
+FSDP's answer is the **`FlatParameter`**. All parameters within a unit are flattened into 1D tensors, concatenated, and right-padded (by at most $F - 1$ elements) so the total length is divisible by $F$. Sharding is a plain equal-chunk division of the `FlatParameter`. The sharded and unsharded shapes are exactly what `AllGather` and `ReduceScatter` want — no additional copies for either input or output tensors.
+
+For a model with $\Psi$ elements, $N$ `FlatParameter`s of sizes $\psi_1, \ldots, \psi_N$ with $\sum \psi_i = \Psi$, and sharding factor $F$, the peak parameter memory is
+
+$$
+O\!\left(\sum_{i=1}^{N}\frac{\psi_i}{F} + \max_{i=1}^{N}\psi_i\right).
+$$
+
+The first term (sharded state, always resident) is fixed by $\Psi$ and $F$. The second term (the currently unsharded unit) is fully controlled by how the user groups sub-modules into units:
+
+* Fewer, larger units → lower $N$, larger collectives, better throughput, higher peak memory.
+* More, smaller units → higher $N$, more collectives, more overhead, lower peak memory.
+
+The number of collectives per iteration is $O(N)$. Wrapping policies expose this trade-off directly to the user.
+
+### Hybrid Sharding
+
+Hybrid sharding sits between full replication and full sharding. For sharding factor $F$ and world size $W$, ranks form $W/F$ **sharded groups** of size $F$ and $F$ complementary **replicated groups** of size $W/F$. Parameters are sharded within each sharded group and replicated across each replicated group.
+
+For gradients, the single global `ReduceScatter` becomes a `ReduceScatter` within each sharded group followed by an `AllReduce` within each replicated group:
+
+$$
+\sum_{r=1}^{W} g_r = \sum_{i=1}^{W/F} \sum_{r \in S_i} g_r.
+$$
+
+This maps naturally onto datacenter topologies. Consider a cluster of $W$ accelerators grouped into hosts of $G$ accelerators each, where intra-host bandwidth (NVLink) dwarfs inter-host bandwidth. Setting $F = G$ (with sharded groups matching hosts and replicated groups formed from same-local-rank ranks across hosts) confines `AllGather` and `ReduceScatter` entirely within hosts. Only the `AllReduce` for gradient reduction crosses hosts. Per-GPU cross-host traffic for an $M$-sized model drops to
+
+$$
+2M\frac{W - 1}{GW},
+$$
+
+compared with $2M(W-1)/W$ for full replication and $3M(W-1)/W$ for full sharding — a drastic reduction that exploits over-subscribed fat-tree topologies. The smaller-group `AllReduce`s also suffer less from stragglers and network interference than global collectives.
+
+The other motivation for hybrid sharding is *medium-sized* models — those that OOM with full replication but leave most memory unused under full sharding. Adjusting $F$ gives a smooth memory-throughput dial rather than a binary choice.
+
+### Autograd Integration
+
+The `FlatParameter` must inter-operate with PyTorch autograd to guarantee (1) correct gradient propagation and (2) timely gradient reduction.
+
+For (1), before forward computation FSDP re-exposes the original parameters as views into the unsharded `FlatParameter` using autograd-visible `torch.split()` and `torch.view()` calls. The autograd engine then allocates the unsharded `FlatParameter`'s gradient and writes each original parameter's gradient to the appropriate offset defined by `torch.split()`'s backward function — no manual bookkeeping.
+
+For (2), FSDP registers a gradient hook that fires once the `FlatParameter`'s gradient has finished accumulating. That hook runs the post-backward logic including the `ReduceScatter`. Because FSDP is built on top of autograd rather than around it, it automatically handles unconventional cases — parameters not used in the forward pass, multiple forwards before a backward, and so on.
+
+---
+
+## Communication Optimizations
+
+Parameter sharding buys memory at the cost of extra communication. FSDP has a small arsenal of techniques to keep that communication off the critical path.
+
+### Overlapping Communication and Computation
+
+<div align="center">
+![Figure 3: Communication Overlap](/figures/fsdp-comm_overlap.png)
+</div>
+
+`ProcessGroupNCCL` uses a dedicated internal NCCL stream per device for asynchronous collectives. The naive `async-collective-and-Work.wait()` idiom that DDP uses works because DDP's backward `AllReduce` is issued *before* the computation with which it should overlap. FSDP's forward `AllGather`, however, is issued *after* its preceding computation — in eager mode, FSDP does not know which `FlatParameter` to gather until the module actually runs.
+
+If FSDP followed DDP's approach, `ProcessGroupNCCL`'s automatic synchronization of the internal NCCL stream with the current (default) stream would force the `AllGather` to wait for the preceding computation, defeating the whole purpose. FSDP instead issues `AllGather`s on a **separate CUDA stream**, bypassing the false dependency on the default stream and letting each `AllGather` overlap with prior computation. Synchronization is done on streams, not on `Work` objects.
+
+One subtlety: the backward pass skips the `AllGather` for the outermost FSDP unit. FSDP intentionally keeps that unit's parameters resident so that they do not have to be freed at the end of forward and re-gathered at the start of backward.
+
+### Backward Prefetching
+
+FSDP shares a single process group (and therefore a single NCCL stream) for both `AllGather` and `ReduceScatter`, so collectives are serialized within the stream. In the backward pass, this means the current `ReduceScatter` blocks the next `AllGather`, which in turn blocks the next backward computation — two consecutive exposed communication operations on the critical path.
+
+**Backward prefetching** issues the next `AllGather` *before* the current `ReduceScatter`. The challenge is knowing which `FlatParameter` to gather next while in eager mode. FSDP resolves this by recording the module execution order during the forward pass and reversing it as a proxy for backward order. The recording is refreshed every iteration, so dynamism across iterations is preserved.
+
+### Forward Prefetching
+
+For workloads where the CPU thread is slow (e.g., small models with heavy Python overhead), the next forward `AllGather` may not be issued early enough to keep the NCCL stream busy. When the model has a static computational graph, FSDP can use the previous iteration's forward order to prefetch the next `AllGather` explicitly during the current forward — issuing it before the current unit's computation.
+
+### Gradient Accumulation
+
+FSDP supports gradient accumulation in two flavors:
+
+* **With communication.** Standard accumulation: `ReduceScatter` still runs each micro-step, and each rank saves the sharded gradients. This is what falls out of running multiple iterations without zeroing gradients.
+* **Without communication.** Skip `ReduceScatter` for accumulation micro-steps and let each rank save the *unsharded* gradients locally. Higher memory, but eliminates most of the collective traffic — often a good end-to-end throughput win when memory permits.
+
+---
+
+## Memory Management
+
+FSDP saturates GPU memory by design. That makes it especially sensitive to the CUDA caching allocator, which is a middle layer between PyTorch and `cudaMalloc`/`cudaFree` and normally makes allocation costs invisible.
+
+### How the Caching Allocator Affects Memory
+
+The allocator avoids the expensive `cudaFree` (which triggers a device synchronization) by holding onto freed blocks internally and reusing them. The goal is a steady state where no further calls into CUDA are needed. The allocator runs on the CPU thread and decides block reuse *when the CPU processes the allocation request* — long before the corresponding GPU kernel actually runs.
+
+For a single stream, ordering is trivial: sequential semantics guarantee that a block is safe to reuse. Across streams, there is no such guarantee. A block freed in a producer stream cannot be reused for the consumer stream until the last GPU kernel depending on it has finished, and the CPU has no way to know that ahead of time.
+
+Worse, caching allocator blocks are pinned per stream. Over-allocating to the producer stream (because the CPU raced ahead and asked for more) means those blocks *cannot* serve the consumer stream, even if the GPU has plenty of free memory in aggregate. When the consumer stream then needs an allocation the allocator cannot serve, it triggers a **`cudaMalloc` retry** — a blocking sequence of `cudaFree`s that resets the allocator state and stalls the pipeline for milliseconds. On a fast training loop this is a throughput cliff.
+
+### Rate Limiter
+
+FSDP allocates `AllGather` destination buffers on its dedicated producer stream, while forward and backward computation consume them on the default stream. If the CPU races ahead, the allocator may need to serve a fresh `AllGather` while previous `AllGather` buffers are still live on the consumer stream — no block reuse, more `cudaMalloc`s, potential retries.
+
+The **rate limiter** intentionally blocks the CPU thread to keep at most two `AllGather`s in flight — the minimum required to still overlap communication with computation. This gives the CPU thread a soft cap that keeps the producer stream in step with the consumer stream and lets the allocator reuse blocks steadily.
+
+---
+
+## Native Mixed Precision
+
+Mixed precision normally keeps two parameter copies — a low-precision one (FP16/BF16) for compute and a full-precision one (FP32) for the optimizer step. Naively this raises the parameter memory footprint from $K_{\text{full}}\Psi$ to $(K_{\text{low}} + K_{\text{full}})\Psi$.
+
+FSDP sidesteps the doubling by exploiting its existing invariant: only one unit's unsharded `FlatParameter` is ever materialized at a time. The sharded copies (which are always resident) stay in full precision to serve the optimizer; the unsharded copy (materialized transiently) is allocated in low precision. Peak parameter memory drops from
+
+$$
+\frac{K_{\text{full}}}{F}\sum_{i=1}^{N}\psi_i + K_{\text{full}}\max_{i=1}^{N}\psi_i
+$$
+
+to
+
+$$
+\frac{K_{\text{full}}}{F}\sum_{i=1}^{N}\psi_i + K_{\text{low}}\max_{i=1}^{N}\psi_i.
+$$
+
+The unsharded term shrinks by the precision ratio (2x for FP16/BF16, 4x for FP8), and the overall footprint *decreases* under mixed precision rather than increases.
+
+Unlike `torch.amp.autocast`, which casts just-in-time at each operator, FSDP's native mixed precision casts once per `FlatParameter` — in the pre-forward pass, and again in the pre-backward if the parameter was resharded after forward. Collectives run entirely in low precision, so `AllGather` and `ReduceScatter` volumes drop proportionally.
+
+Users typically pair FP16 or BF16 for compute with FP32 for the optimizer. FP16's narrow dynamic range requires gradient scaling to avoid underflow, but a standard local gradient scaler breaks mathematical equivalence when gradients are sharded across ranks — the scale factor's max-across-gradients no longer sees the full picture. FSDP ships a **sharded gradient scaler** that operates correctly across the reduce-scattered gradient shards.
