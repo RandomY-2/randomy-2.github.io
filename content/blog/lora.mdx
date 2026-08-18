@@ -1,0 +1,153 @@
+---
+slug: lora-low-rank-adaptation
+title: "LoRA: Low-Rank Adaptation of Large Language Models"
+date: "2026-08-15"
+description: "LoRA freezes the pretrained weights of a large model and injects a pair of small trainable rank-decomposition matrices into each attention projection, reducing trainable parameters by up to 10,000x and optimizer-state memory by up to 3x — while matching full fine-tuning quality and introducing zero inference latency when the update is merged back into the base weights."
+tags: [lora, fine-tuning, parameter-efficient, low-rank, adapters, transformer, gpt-3, attention, adaptation, intrinsic-rank]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+One paradigm in modern NLP is to pretrain a very large model on general-domain data and then fine-tune it for each downstream task. Fine-tuning works well but has an unpleasant property: the fine-tuned model has **exactly as many parameters** as the pretrained one.
+The community has tried to mitigate this by training only a subset of parameters or by inserting small "adapter" modules between layers. These approaches shrink the trainable footprint but come with sharp trade-offs:
+
+* **Adapters** insert bottleneck layers into the network. They add sequential depth, so even a small adapter costs measurable inference latency — a problem when large models are already deployed with tensor parallelism and every additional synchronous op counts.
+* **Prompt/prefix tuning** prepends trainable tokens to the input. It leaves the model's parameters entirely untouched but consumes the usable context window and, empirically still produces worse performance than finetuning.
+
+**LoRA** takes inspiration from earlier studies that showed learned over-parametrized models in fact reside on a low intrinsic dimension: they can be fine-tuned effectively even when the update is constrained to a small random subspace of the full parameter space.
+LoRA hypothesizes that if the pretrained weights themselves live near a low-dimensional structure, the change to those weights during task adaptation is also intrinsically low-dimensional — i.e., that $\Delta W$ has a low "intrinsic rank." Concretely, for a pretrained weight $W \in \mathbb{R}^{d \times k}$, traditional fine-tuning learns a full update
+
+$$
+W' = W + \Delta W, \qquad \Delta W \in \mathbb{R}^{d \times k},
+$$
+
+which has $dk$ trainable parameters — the same as $W$ itself. LoRA instead factors the update through an $r$-dimensional bottleneck:
+
+$$
+W' = W + BA, \qquad B \in \mathbb{R}^{d \times r},\ A \in \mathbb{R}^{r \times k},\ r \ll \min(d, k),
+$$
+
+so the number of trainable parameters drops from $dk$ to $r(d + k)$. For a GPT-3 attention projection with $d = k = 12{,}288$, choosing $r = 4$ shrinks the update from ~151M parameters per matrix to under 100K — more than a 1500x reduction per matrix.
+
+<div align="center">
+![Figure 1: LoRA Reparametrization](/figures/lora-ab.png)
+</div>
+
+---
+
+## Problem Statement
+
+Fine-tuning a pretrained autoregressive language model $P_\Phi(y \mid x)$ on a downstream dataset $\mathcal{Z} = \{(x_i, y_i)\}$ maximizes the standard conditional log-likelihood:
+
+$$
+\max_{\Phi} \sum_{(x, y) \in \mathcal{Z}} \sum_{t=1}^{|y|} \log P_\Phi\!\left(y_t \mid x, y_{<t}\right).
+\tag{1}
+$$
+
+Starting from pretrained weights $\Phi_0$, gradient descent walks the parameters to $\Phi_0 + \Delta\Phi$. The catch is that $|\Delta\Phi| = |\Phi_0|$: the update has the same dimensionality as the model, so one full copy is needed per downstream task.
+
+Parameter-efficient methods introduce a much smaller set of parameters $\Theta$ and re-parametrize the update as $\Delta\Phi = \Delta\Phi(\Theta)$ with $|\Theta| \ll |\Phi_0|$. The optimization becomes:
+
+$$
+\max_{\Theta} \sum_{(x, y) \in \mathcal{Z}} \sum_{t=1}^{|y|} \log P_{\Phi_0 + \Delta\Phi(\Theta)}\!\left(y_t \mid x, y_{<t}\right).
+\tag{2}
+$$
+
+The design question is what family of $\Delta\Phi(\Theta)$ to choose.
+
+---
+
+## Low-Rank Reparametrization
+
+The low-intrinsic-rank hypothesis translates into a concrete constraint on $\Delta W$. For a pretrained weight matrix $W_0 \in \mathbb{R}^{d \times k}$, LoRA restricts its update to a rank-$r$ product:
+
+$$
+W_0 + \Delta W = W_0 + BA, \qquad B \in \mathbb{R}^{d \times r},\ A \in \mathbb{R}^{r \times k},\ r \ll \min(d, k).
+$$
+
+$W_0$ is frozen. $A$ and $B$ carry all the trainable parameters. For an input $x$, the forward pass becomes:
+
+$$
+h = W_0 x + \Delta W x = W_0 x + BA \, x.
+\tag{3}
+$$
+
+The two branches — the frozen $W_0$ path and the trainable $BA$ path — take the same input and their outputs are summed. Nothing else about the layer changes. A few implementation details are worth calling out:
+
+* **Initialization.** LoRA paper initializes $A$ using Gaussian and $B$ as zero, so $\Delta W = BA = 0$ at step zero and training starts exactly at the pretrained model. The gradient still flows through both matrices because $A$'s randomness ensures $\Delta W$ is not stuck at a saddle point.
+* **Scaling.** $\Delta Wx$ is scaled by $\alpha / r$, where $\alpha$ is a hyperparameter fixed to the first $r$ tried. This decouples the effective learning rate from the choice of $r$: doubling $r$ does not require retuning the LR, because the $\alpha/r$ factor keeps the update magnitude roughly constant.
+* **A generalization of full fine-tuning.** If $r$ is set to the full rank of $W_0$, LoRA recovers the expressiveness of full fine-tuning (it can represent any $\Delta W$). Contrast this with adapters, which converge to an MLP as their bottleneck grows, or prefix tuning, which cannot represent updates to weights that act on positions outside the prefix. LoRA's expressiveness scales monotonically with the number of trainable parameters, up to and including full fine-tuning as the limit.
+* **No Additional Inference Latency.** When deployed in production, we can explicitly compute and store $W = W_0 + BA$ and perform inference as usual. Note that both $W_0$ and $BA$ are in $\mathbb{R}^{d \times k}$. When we need to switch to another downstream task, we can recover $W_0$ by subtracting $BA$ and then adding a different $B'A'$, a quick operation with very little memory overhead. Critically, this guarantees that we do not introduce any additional latency during inference compared to a fine-tuned model by construction.
+---
+
+## Applying LoRA to Transformers
+
+The reparametrization is agnostic to what layer it wraps. A Transformer block has six weight matrices worth considering:
+
+* Four in self-attention: $W_q, W_k, W_v, W_o$, each of shape $d_\text{model} \times d_\text{model}$ (the multi-head split is a reshape, not a separate matrix).
+* Two in the MLP: an up-projection $d_\text{model} \times 4 d_\text{model}$ and a down-projection $4 d_\text{model} \times d_\text{model}$.
+
+The paper limits LoRA to the attention projections and freezes the MLP entirely.
+
+---
+
+## Which Attention Weights Should LoRA Adapt?
+
+The paper fixes a parameter budget of 18M trainable parameters on GPT-3 175B (about 35 MB in FP16) and sweeps how the budget is spent. With 96 layers, that budget corresponds to $r = 8$ if applied to a single attention projection, or $r = 4$ if split across two, and so on.
+
+**Concentrating the budget on a single projection type is a mistake.** Putting the entire budget into $\Delta W_q$ (rank 8, all 96 layers) or $\Delta W_k$ underperforms every configuration that splits the budget across two matrices. The intuition is that a rank-8 update to $W_q$ alone cannot compensate for the absence of any update to $W_v$ — different projections carry qualitatively different information, and adapting only one type of them starves the others.
+
+<div align="center">
+![Figure 2: LoRA Which Attention](/figures/lora-which_weight.png)
+</div>
+
+---
+
+## What Is the Optimal Rank $r$?
+
+The paper tried $r \in \{1, 2, 4, 8, 64\}$ across three configurations — $\{W_q, W_v\}$, $\{W_q, W_k, W_v, W_o\}$, and $\{W_q\}$ alone:
+
+* $r = 1$ works. On GPT-3 175B, LoRA with rank 1 applied to $\{W_q, W_v\}$ is already competitive with rank 64 on WikiSQL and MultiNLI. Rank 8 vs rank 64 is a wash within noise.
+
+<div align="center">
+![Figure 3: LoRA Best R](/figures/lora-best_r.png)
+</div>
+
+Rank 1 corresponds to a single outer product per attention projection: a $d$-dimensional column vector times a $k$-dimensional row vector. The claim that this is enough to steer GPT-3 175B onto a new task is remarkable, and the paper's response is to interrogate whether the higher-rank runs actually *use* their additional capacity.
+
+### Subspace Similarity Across Ranks
+
+Take $A_{r=8}$ and $A_{r=64}$ — the trainable "down-projection" matrices learned at ranks 8 and 64 respectively, using the *same* pretrained model. Perform SVD on each and let $U_{A_{r=8}}$ and $U_{A_{r=64}}$ be the right-singular unitary matrices. The question is: how much of the top-$i$ subspace of $U_{A_{r=8}}$ is contained in the top-$j$ subspace of $U_{A_{r=64}}$? The paper measures this with a normalized Grassmann similarity:
+
+$$
+\phi(A_{r=8}, A_{r=64}, i, j)
+=
+\frac{\left\|U_{A_{r=8}}^{i\top} \, U_{A_{r=64}}^{j}\right\|_F^2}{\min(i, j)}
+\in [0, 1],
+\tag{4}
+$$
+
+where $U^i$ denotes the top-$i$ singular vector columns. $\phi = 1$ means complete subspace overlap; $\phi = 0$ means orthogonality.
+
+The result: for $\Delta W_q$ and $\Delta W_v$, the *top* singular direction of $A_{r=8}$ overlaps with the top singular direction of $A_{r=64}$ with normalized similarity greater than 0.5. Beyond the top few directions, similarity drops to noise levels. In other words, the rank-64 run is learning the same one-dimensional adaptation subspace as the rank-1 run — plus 63 directions of essentially random noise. This is a direct explanation of why $r = 1$ competes with $r = 64$ on downstream tasks: the *useful* dimensions are the same, and the additional capacity of rank 64 goes into training-time random directions that do not transfer.
+
+---
+
+## How Does $\Delta W$ Compare to $W$?
+
+The rank analysis says $\Delta W$ is low-rank. It does not say *where* in $W$'s spectrum that low-rank update lives. The natural question is whether $\Delta W$ amplifies directions that are already prominent in the pretrained weights, or whether it targets directions that pretraining underemphasized.
+
+The paper answers this by projecting $W$ onto the $r$-dimensional subspace spanned by $\Delta W$'s singular vectors. Concretely, let $U, V$ be the left and right singular-vector matrices of $\Delta W = BA$. Compute $U^\top W V^\top$ — this is $W$ restricted to $\Delta W$'s row and column subspaces. Then compare its Frobenius norm $\|U^\top W V^\top\|_F$ against $\|W\|_F$ and against the same quantity computed with $U, V$ replaced by the top-$r$ singular vectors of $W$ (a natural baseline) or by random directions.
+
+<div align="center">
+![Figure 4: LoRA Compare](/figures/lora-frobenius.png)
+</div>
+
+Three conclusions fall out:
+
+1. **$\Delta W$ correlates with $W$ more strongly than a random matrix does.** The Frobenius norm of $W$ restricted to $\Delta W$'s subspace is larger than under random $U, V$. So $\Delta W$ is *not* orthogonal noise on top of $W$ — it lives inside directions that already carry signal.
+2. **But $\Delta W$ does not just repeat the top singular directions of $W$.** If it did, $\|U^\top W V^\top\|_F$ under LoRA's $\Delta W$-derived $U, V$ would match the norm under $W$'s own top-$r$ singular vectors. It does not — LoRA's subspace picks up directions that are *present but not dominant* in $W$.
+3. **The amplification is huge.** For $r = 4$, the ratio $\|\Delta W\|_F / \|U^\top W V^\top\|_F$ is about 21.5 (concretely, $6.91 / 0.32$). The LoRA update is amplifying its target directions by more than an order of magnitude relative to how much $W$ itself was expressing them. As $r$ grows, the amplification factor drops — the additional rank-64 directions are diluted by noise, consistent with the subspace-similarity finding.
+
+The picture that emerges is that the pretrained model has already learned a wide set of features during general-domain training but only emphasizes a subset of them; a downstream task has its own subset of features it needs, and those features are already *present* in $W$ but *underexpressed*. LoRA's job is not to invent new features — it is to identify the small subset of already-learned features that the task cares about and amplify them by an order of magnitude. This is a much cheaper problem than learning features from scratch, which is why a rank as small as 1 can suffice.
