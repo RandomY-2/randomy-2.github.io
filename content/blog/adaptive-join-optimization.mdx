@@ -1,0 +1,245 @@
+---
+slug: adaptive-optimization-large-join-queries
+title: "Adaptive Optimization of Very Large Join Queries"
+date: "2026-08-23"
+description: "Join ordering is NP-hard, yet most queries are small enough to solve exactly — and the largest real-world queries access over 4,000 relations. This paper introduces an adaptive framework that uses dynamic programming for small queries, a novel search space linearization technique for medium queries, and iterative greedy-plus-DP for mega queries, scaling gracefully from 2 to 5,000 relations without a cliff in plan quality."
+tags: [query-optimization, join-ordering, dynamic-programming, linearization, IKKBZ, database, query-graph, NP-hard, greedy, bushy-trees]
+category: system-papers
+---
+
+## Introduction
+
+While most queries are reasonably small, join queries with up to a hundred relations are not outliers anymore, and the distribution of query sizes has an incredible long tail. The largest real-world query the authors are aware of accesses more than 4,000 relations. This large spread makes query optimization very challenging.
+
+Join ordering is known to be NP-hard, which means we cannot hope to solve such large problems exactly. On the other hand most queries are much smaller, and there is no reason to sacrifice optimality there. The question is: how do we build a single optimizer that handles both extremes?
+
+Current systems deal with this by hard switching between algorithms. PostgreSQL uses dynamic programming for queries with fewer than 12 relations and switches to genetic algorithms for larger ones. DB2 uses dynamic programming and falls back to a greedy strategy. These switching points imply non-graceful degradation — good plans up to a certain point, and significantly worse results once queries get slightly larger. The optimizer should try to solve the problem exactly, and adaptively tune down the result quality only when optimality can no longer be guaranteed.
+
+Looking at the immense span from 2 to 5,000 relations, there are different requirements depending on query size:
+
+* **Small queries (bulk of workloads)**: We clearly want the optimal join order.
+* **Medium queries (up to ~100 relations)**: We cannot guarantee optimality in general, but we want to be close to optimal.
+* **Large queries (up to ~1,000 relations)**: We must accept suboptimality, but we want quality to degrade gracefully.
+* **Mega queries (1,000+ relations)**: We must be happy to construct a decent plan at all — most optimizers simply break for such queries.
+
+The paper introduces an adaptive optimization framework that finds optimal solutions for most common queries, near-optimal solutions for very large classes of queries, and scales down gracefully for mega queries. It achieves this by combining dynamic programming with a novel **search space linearization** technique, and by introducing implementation tricks necessary to handle very large queries efficiently.
+
+---
+
+## Setting
+
+The paper targets query optimizers for commercial database systems, supporting all kinds of SQL queries including unusual predicates and non-inner joins. The input is a **query graph** $G = (V, E)$ where nodes $V$ are the set of relations and edges $E$ are the join possibilities implied by the query's join conditions.
+
+<div align="center">
+![Figure 1: Query Graph Example](/figures/ada_join-setting.png)
+</div>
+
+A join tree $T$ **adheres** to a query graph $G$ if for every subtree $T' = T_1 \bowtie T_2$ there exist relations $R_1 \in T_1$ and $R_2 \in T_2$ such that $(R_1, R_2) \in E$. Given a query graph $G$ and a cost function $C$, the task is to construct a join tree $T$ that adheres to $G$ and minimizes $C$.
+
+In the general case — queries with non-inner joins — the query graph can be a **hyper-graph**: a join edge connects sets of relations rather than just two, and accordingly $R_1$ and $R_2$ in the adherence definition can be sets of relations. All reordering constraints for non-inner joins are assumed to be encoded in the query graph.
+
+The algorithms assume that the query graph is connected. If the original query graph is not connected (i.e., it contains implicit cross products), the connected components are joined with cross product edges. Additional implicit cross products are **not** considered during optimization, for two reasons:
+
+* **Performance**: Cross products dramatically expand the search space, and in practice they are rarely useful — a cross product is inherently $O(n^2)$, so it only makes sense for very small relations.
+* **Correctness**: In the presence of non-inner joins, introducing cross products between arbitrary relations can produce wrong results.
+
+For the cost function, the dynamic programming parts assume nothing except the **Bellman principle**, which states that an optimal solution contains optimal solutions to its subproblems. The ranking steps used by some algorithms require a cost function with the **Adjacent Sequence Interchange (ASI)** property, which states that whether two adjacent subsequences $U$ and $V$ should be swapped in a join sequence $AUVB$ depends only on comparing their ranks — independent of the surrounding sequences $A$ and $B$. Formally, there exists a function $T$ and a rank
+
+$$
+\mathrm{rank}(S) = \frac{T(S) - 1}{C(S)}
+$$
+
+such that
+
+$$
+C(AUVB) \leq C(AVUB) \iff \mathrm{rank}(U) \leq \mathrm{rank}(V)
+$$
+
+whenever both orderings satisfy the query graph's precedence constraints.
+
+The running example of an ASI cost function is $C_{out}$, which charges a plan for the size of every intermediate result and nothing for scanning a base table:
+
+$$
+C_{out}(T) =
+\begin{cases}
+0 & \text{if } T \text{ is a single relation} \\
+|T| + C_{out}(T_1) + C_{out}(T_2) & \text{if } T = T_1 \bowtie T_2
+\end{cases}
+$$
+
+A cheaper $C_{out}$ plan is one that keeps intermediates small. For $C_{out}$, $T(S)$ is the selectivity product of the sequence and the rank of a join is $\frac{1-sel}{costs}$. If the overall cost function lacks ASI properties, $C_{out}$ is used for ranking while the true cost function is used for the dynamic programming part.
+
+---
+
+## Related Work
+
+### Dynamic Programming
+
+Selinger et al. pioneered the use of dynamic programming for join ordering by constructing optimal partial plans of increasing size — referred to as **DPSize**. To reduce the search space, many systems consider only left-deep instead of bushy trees (**DPSizeLinear**). Considering left-deep trees only is tempting as it significantly speeds up optimization, but bushy plans are often much more efficient.
+
+Graph-based DP strategies that organize the search by query graph structure perform significantly better than DPSize, as they avoid considering relation combinations that cannot lead to a final join tree. Improvements include top-down formulations that allow cost-based pruning and generalizations to non-inner joins. The latter approach is called **DPHyp**.
+
+While the join ordering problem is NP-hard in general, not every instance is hard. If the query graph forms a chain, DPHyp finds the optimal solution in $O(n^3)$, which is tractable even for relatively large $n$. Other query shapes are more difficult. Since the difficulty follows from the shape of the query graph, we can:
+
+* **Predict** the optimization time by looking at the query graph
+* **Reduce** the optimization time by manipulating the query graph
+
+This observation led to **query simplification**, where the query graph is successively made more restrictive using a greedy heuristic until it becomes tractable for dynamic programming. This works well when the query is just a bit too complex for DP, but for very large queries the greedy step dominates and results can be poor.
+
+### Iterative Dynamic Programming
+
+Iterative DP combines dynamic programming with a greedy step, and comes in two flavors:
+
+* **IDP-1** runs DPSize up to a given size $k$, greedily chooses the cheapest plan of that size, conceptually transforms it into a base relation, and repeats. The problem: each iteration has runtime $O(n^k)$, so for large $n$ we must choose very small $k$, and the algorithm degenerates into a greedy approach.
+* **IDP-2** first constructs a complete join tree using a greedy approach, then optimizes subtrees of size $k$ using DP. This works well even for large queries, and is referred to as **iterative DP**.
+
+### Greedy Algorithms
+
+* **Min-sel**: Orders joins by increasing selectivity. The most elaborate variant tries every relation as start relation and picks the cheapest overall sequence. While easy to implement, plan quality can be quite poor.
+* **GOO (Greedy Operator Ordering)**: Greedily constructs bushy join trees by repeatedly picking the pair with minimum result cardinality. Result quality is usually good and it can handle large queries when implemented carefully.
+
+### The IKKBZ Algorithm
+
+The IK/KBZ family (**IKKBZ**) can construct the optimal join plan in polynomial time — an extremely attractive property — but with significant limitations:
+
+* It needs a cost function with **ASI properties**, meaning it must be possible to compute a cost/benefit ratio (the **rank**) for every join. This works for $C_{out}$ but not in general.
+* It requires an **acyclic** query graph.
+* It can only construct **linear** join trees, which are inferior to bushy trees.
+
+These limitations usually prevent standalone practical usage, but its good properties make it an ideal intermediate step within the adaptive framework.
+
+---
+
+## Adaptive Optimization
+
+The framework analyzes the query graph and picks the most appropriate algorithm:
+
+1. If the query graph is simple enough, it uses **dynamic programming** to construct the optimal join tree.
+2. If that is not possible within the optimization budget, it switches to a novel **search space linearization** technique to make dynamic programming tractable — not a greedy approach.
+3. For even larger queries, it introduces a **greedy step**, but again uses linearization to improve the greedy solution.
+
+### 4.1 Small Queries
+
+For small queries we clearly want the optimal join order. The only question is: what is "small"? The answer depends on the shape of the query graph:
+
+* **Best case (chain queries)**: Linear query graphs can be solved exactly with 100 relations, as graph-based DP has $O(n^3)$ complexity.
+* **Worst case (clique queries)**: Runtime is $O(3^n)$, so we can only solve about 14 relations exactly.
+
+Real queries fall between these extremes, and it is not obvious how to predict optimization time. However, we can reasonably cheaply count the **number of connected subgraphs** of a query graph — the subsets of relations that can be joined without a cross product. Graph-based DP stores one table entry per such subset, so this count *is* the DP table size; if it is reasonably small (e.g., up to 10,000), we know that DP will be fast.
+
+<div align="center">
+![Figure 2: Counting Connected Subgraphs](/figures/ada_join-count.png)
+</div>
+
+The counting algorithm (Figure 2) is a streamlined variant of DPHyp reduced to graph traversal without any DP table. It is much faster than a real DP algorithm because we only need the count, not actual join trees, and it stops once the count exceeds the budget.
+
+The strategy:
+
+* If the query joins fewer than 14 relations, unconditionally use DPHyp.
+* Otherwise, if the query has up to 100 relations, count connected subgraphs up to the budget of 10,000. If within budget, use DPHyp regardless of the number of relations.
+* If the count exceeds the budget, switch to search space linearization.
+
+### 4.2 Medium Queries
+
+At some point DP becomes too expensive, but this threshold depends on the query graph's shape. For linear graphs we can solve quite large queries exactly, while cliques or stars are much harder. The key idea: make medium-sized queries (up to 100 relations) tractable for DP by **linearizing** the search space.
+
+<div align="center">
+![Figure 3: Search Space Linearization](/figures/ada_join-linear.png)
+</div>
+
+The core idea is to restrict the DP algorithm to consider only **connected subchains of a linear relation ordering**, instead of arbitrary combinations of relations. For the original graph a DP algorithm fills a table with $O(2^n)$ entries, while for the linearized representation the table has only $O(n^2)$ entries. This difference grows exponentially with query size.
+
+**The critical question**: how do we choose the linearization? A bad ordering makes good join orders impossible during the DP phase. Fortunately, we have an excellent tool: the **IKKBZ algorithm** can find the optimal left-deep tree for an acyclic query graph in polynomial time.
+
+<div align="center">
+![Figure 4: IKKBZ Algorithm](/figures/ada_join-ikkbz.png)
+</div>
+
+IKKBZ sorts all joins by **rank** — the cost/benefit ratio. For $C_{out}$, the rank is $\frac{1-sel}{costs}$. If sorting by rank is not possible due to query graph restrictions, the **IKKBZ-normalize** step collapses contradictory sequences into compound relations until all relations are sorted by rank. This produces the optimal left-deep tree for acyclic query graphs with ASI cost function — and a left-deep tree *is* a linearization.
+
+The resulting linearization guarantees desirable properties:
+
+* If the optimal join tree is linear (left/right-deep or zig-zag), the solution is **guaranteed optimal**.
+* If the optimal tree is bushy, the cost of the optimal linear tree is an **upper bound** for the final plan's cost.
+* This ensures optimal solutions for the entire class of **star queries**, as their solutions are inherently linear.
+
+For cyclic query graphs, a minimum spanning tree (minimizing join selectivities) is constructed before running IKKBZ. The spanning tree is only used for IKKBZ itself — the subsequent DP step uses the full query graph including cycles.
+
+<div align="center">
+![Figure 5: LinearizedDP Algorithm](/figures/ada_join-linear_dp.png)
+</div>
+
+The full algorithm (Figure 5) first runs IKKBZ to linearize the relation order, then runs a custom DP algorithm for the linearized query graph. Since the relations form a linear chain, every subproblem is a subchain of the linearization, identifiable by its start and end node. The DP table $T$ is organized as $|V| \times |V|$, and the optimal solution for the linearization is extracted from $T[0, |V| - 1]$.
+
+This DP strategy explicitly exploits the linear search space, making it much simpler and faster than general DP strategies. The runtime is $O(n^3)$, fine for up to 100 relations but eventually insufficient for even larger queries.
+
+**Limitation**: Hyper-graphs cannot be expressed in linearized form. Linearized DP can only be applied to queries representable as a regular graph.
+
+### 4.3 Large Queries
+
+When the query exceeds the $O(n^3)$ algorithm's capacity, a greedy step is introduced. The approach borrows from Iterative DP: first construct an execution plan using a greedy algorithm, then improve it by running a more expensive optimization algorithm on subplans up to size $k$.
+
+The key advantage of the linearized DP as the inner optimization step: we can choose $k = 100$. The original Iterative DP had to use small values ($k = 4$–7) to keep optimization time reasonable. With linearized DP, relations can move up to **100 positions** within the tree, giving the DP phase much more freedom to correct greedy mistakes.
+
+For the greedy phase, **Greedy Operator Ordering (GOO)** is used, as it produces good bushy plans and can be implemented efficiently.
+
+<div align="center">
+![Figure 6: GOO-DP Algorithm](/figures/ada_join-goo.png)
+</div>
+
+The algorithm (Figure 6):
+
+1. Run GOO to construct a bushy plan.
+2. Run linearized DP on the most expensive subtree of up to size $k$.
+3. Reduce the optimization budget by the DP table size after each iteration.
+4. Repeat until the budget is exhausted.
+
+The typical invocation is `GOO-DP(Q, linearizedDP, 100, 10000)`, which yields very good results with modest optimization time.
+
+For queries with hyper-edges (non-inner joins), linearized DP cannot be used directly. In this case the call becomes `GOO-DP(Q, DPHyp, 10, 10000)`, using the hyper-graph-aware DPHyp as the inner algorithm — at the cost of a much smaller $k$ value.
+
+### 4.4 Putting Everything Together
+
+<div align="center">
+![Figure 7: Adaptive Algorithm](/figures/ada_join-ada_join.png)
+</div>
+
+The **adaptive** strategy picks the most appropriate algorithm based on query complexity:
+
+1. **$\leq$ 14 relations**: Use DPHyp unconditionally (always tractable regardless of structure). Result: **optimal**.
+2. **$\leq$ 10,000 connected subgraphs**: DPHyp is still fast. Result: **optimal**.
+3. **$\leq$ 100 relations, no hyper-edges**: Use linearized DP. Result: **near-optimal**.
+4. **$>$ 100 relations, no hyper-edges**: Use GOO + linearized DP ($k = 100$). Result: **good**.
+5. **$\leq$ 100 relations, hyper-edges**: Use DPHyp as inner optimizer. Result: **near-optimal** (smaller $k$).
+6. **$>$ 100 relations, hyper-edges**: Use GOO + DPHyp ($k = 10$). Result: **acceptable**.
+
+The key property is that optimal solutions are guaranteed for the common case of reasonably simple queries, while simultaneously scaling smoothly to mega queries. No hard cliff in plan quality exists because:
+
+* Linearized DP is less expensive but still very powerful when DP becomes infeasible.
+* Subproblems of up to 100 relations are optimized with DP even when a greedy step is introduced.
+
+---
+
+## Implementation for Large Queries
+
+### Representing Sets of Relations
+
+An important data structure for all join ordering algorithms is the set of relations — referred to as **BitSets**. Four implementations are used depending on query size:
+
+* **$\leq$ 64 relations**: A 64-bit unsigned integer, where the $k$-th bit represents the presence of relation $k$. Set operations like union are a single machine instruction.
+* **$\leq$ 128 relations**: Two integers, requiring two instructions for union or intersection.
+* **$\leq$ 1,024 relations**: A vector of integers, where the presence of relation $k$ is encoded by bit $k \bmod 64$ in the $\lfloor k/64 \rfloor$-th integer. Operations are still bitwise but applied to all integers in the vector.
+* **$>$ 1,024 relations**: A **sparse** BitSet maintaining a sorted vector of relations. Union and intersection become much more expensive.
+
+### Representing Join Edges
+
+Cardinality estimates are initially derived from base relation cardinalities and join edge selectivities. For acyclic subplans, intermediate result cardinality is estimated as the product of covered cardinalities and involved selectivities — the standard independence assumption.
+
+For **cyclic** queries, this independence assumption produces unacceptably inaccurate estimates. To dampen this effect, a minimum spanning tree (MST) of the involved joins is built during estimation with regard to selectivity, and cardinality is estimated based on this MST. Kruskal's algorithm with a union-find data structure builds the MST efficiently. The MST is only constructed at the moment a cyclic partial solution is actually built.
+
+Efficient cycle detection is achieved by:
+
+* Utilizing a **union-find** data structure to recognize redundant join edges.
+* Introducing a **join lookup** table giving all joins touching a particular relation. By using the lookup for the relations on the smaller side of a join, all relevant joins are found quickly.
+
+Both union-find and the join lookup speed up all cases where connecting join edges must be found (e.g., GOO and QuickPick).
