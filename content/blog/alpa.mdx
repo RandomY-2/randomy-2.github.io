@@ -1,0 +1,267 @@
+---
+slug: alpa-automating-model-parallelism
+title: "Alpa: Automating Inter- and Intra-Operator Parallelism for Distributed Deep Learning"
+date: "2026-09-08"
+description: "Alpa is a compiler that automatically generates model-parallel execution plans covering data, operator, and pipeline parallelism — recasting them as intra- and inter-operator parallelisms, solving each level with ILP and DP, and orchestrating the result on hierarchical device meshes."
+tags: [alpa, model-parallelism, compiler, intra-operator, inter-operator, pipeline-parallelism, tensor-parallelism, data-parallelism, ilp, dynamic-programming, jax, xla, distributed-training, gpu]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+Training models with hundreds of billions of parameters requires combining data, operator, and pipeline parallelism at the granularity of individual tensor operators. The right combination can improve training throughput by an order of magnitude, but constructing it currently requires substantial expertise in both machine learning and distributed systems, specialized to the model architecture and the cluster.
+
+Automating this process would allow model developers to explore new architectures without manually specifying a parallelization strategy. The difficulty is the size of the search space. An execution plan must determine the number of data-parallel replicas, the partition axis of each operator, the assignment of operators to pipeline stages, and the mapping of devices onto the resulting executables. These decisions are interdependent, and the number of valid plans grows exponentially with model size and cluster size. Prior auto-parallel systems either search over a single form of model parallelism or rely on strong assumptions about the model and the hardware.
+
+The key insight in Alpa is that these techniques can be organized into a **hierarchical space** that corresponds to the hierarchical structure of a compute cluster. Closely located devices communicate at high bandwidth; distant devices do not. Different parallelization methods have correspondingly different communication requirements.
+
+<div align="center">
+![Figure 1: Generation of parallelization plans](/figures/alpa-overview.png)
+</div>
+
+Alpa therefore recategorizes ML parallelization as **intra-operator** and **inter-operator** parallelism, rather than the conventional split into data, operator, and pipeline parallelism:
+
+* **Intra-operator parallelism** partitions ML operators along one or more tensor axes (batch or non-batch) and dispatches those partitions across devices (Fig. 1c).
+* **Inter-operator parallelism** slices the model into disjoint stages and pipelines those stages on different sets of devices (Fig. 1d).
+
+The two techniques apply at different granularities of the computation, distinguished by whether operators themselves are partitioned. A parallel execution plan is specified hierarchically, with one plan per category. This decomposition has two consequences.
+
+* First, the two parallelisms have asymmetric communication profiles. Intra-operator parallelism utilizes devices well, but communicates at every split and merge of a partitioned operator on every training iteration. Inter-operator parallelism communicates only between adjacent stages — a small volume if the cut is chosen well — but leaves devices idle under pipeline-scheduling constraints. Alpa maps intra-operator parallelism onto devices connected by high-bandwidth links, and inter-operator parallelism onto more distant devices with lower inter-device bandwidth.
+
+* Second, each level becomes a tractable subproblem that can be solved near-optimally in isolation. The joint plan is not guaranteed to be globally optimal, but it performs strongly in practice across several large-model families.
+
+Alpa is the first compiler that automatically generates execution plans covering data, operator, and pipeline parallelism. Given a model and a cluster, it partitions the cluster into **device meshes** (sets of devices with preferably high-bandwidth connections), partitions the computation graph into **stages**, assigns stages to meshes, and orchestrates intra-operator parallelism *within* a mesh and inter-operator parallelism *between* meshes.
+
+---
+
+## Background: Distributed Deep Learning
+
+<div align="center">
+![Figure 2: Intra- and inter-operator parallelism on an MLP](/figures/alpa-mlp_parallelism.png)
+</div>
+
+### Intra-Operator Parallelism
+
+An operator acts on multi-dimensional tensors. Partitioning a tensor along selected axes, assigning the resulting shards to multiple devices, and executing those shards concurrently constitutes **intra-operator parallelism**. Alpa defines every parallelization approach that follows this workflow as intra-operator parallelism.
+
+Fig. 2a–c shows several instantiations on a two-layer MLP:
+
+* **Data parallelism** is intra-operator parallelism: the inputs and matmuls are partitioned along the batch axis, and the weights are replicated.
+* When the weights do not fit on a single device, **partitioning the weights** (Fig. 2b) is the operator parallelism used by Megatron-LM.
+* Partitioning the operators of the weight-update phase yields **weight-update sharding**, equivalently ZeRO. This is typically presented as an optimization of data parallelism; in this taxonomy it is another intra-operator plan.
+
+Because tensors are partitioned, collective communication is required at every split and merge. The defining cost of intra-operator parallelism is therefore substantial communication among the participating devices.
+
+### Inter-Operator Parallelism
+
+**Inter-operator parallelism** is the orthogonal class: it does not partition operators. It assigns different operators of the graph to different devices.
+
+Fig. 2d shows batch-splitting **pipeline parallelism** as the primary case. Possible schedules include GPipe, PipeDream, and synchronous 1F1B. Alpa uses synchronous 1F1B throughout: it preserves synchronous training semantics, has the same pipeline latency as GPipe, and has lower peak memory.
+
+Devices communicate only between adjacent stages, typically with point-to-point send/recv. The volume can be much smaller than the collectives of intra-operator parallelism. The trade-off is idle time: data dependencies between stages leave some devices waiting during forward and backward computation, regardless of the schedule.
+
+The two parallelisms therefore operate at different granularities and have distinct communication requirements, which correspond to the bandwidth hierarchy of current clusters. Alpa uses this correspondence to structure hierarchical compilation passes.
+
+---
+
+## Overview
+
+Alpa is a compiler that generates a model-parallel execution plan by optimizing the two levels separately.
+
+* At the **intra-op** level, it minimizes the cost of executing a stage (i.e., subgraph) of the computational graph, with respect to its intra-operator parallelism plan, on a given device mesh, which is a set of devices that may have high bandwidth between each other (e.g., GPUs within a single server). Different meshes might have different numbers of computing devices according to the workload assigned.
+* At the **inter-op** level, it minimizes the inter-op parallelization latency, with respect to how to slice the model and device cluster into stages and device meshes and how to map them as stage-mesh pairs. The inter-op optimization depends on knowing the execution cost of each stage-mesh pair reported by the intra-op optimizer.
+
+The result is a hierarchical plan that is locally near-optimal at each level.
+
+<div align="center">
+![Figure 3: Compiler passes and runtime architecture](/figures/alpa-compiler.png)
+</div>
+
+Three compilation passes implement this (Fig. 3). The input is a model as a Jax IR plus a cluster configuration.
+
+1. The **inter-op pass** slices the IR into stages and the cluster into meshes. A dynamic program assigns stages to meshes. For each candidate assignment it invokes the intra-op pass to obtain the execution cost of that stage on that mesh.
+2. The **intra-op pass** optimizes the execution of the received stage running on its assigned mesh, by minimizing its execution cost using an Integer Linear Programming (ILP) formulation, and reports the cost back to the inter-op pass.
+3. By repeatedly querying the intra-op pass for each allocation of a stage-mesh pair, the inter-op pass uses the DP to minimize the inter-op parallel execution latency and obtains the best slicing scheme of stages and meshes.
+4. After the dynamic program has selected a slicing, each stage is compiled as a parallel executable on its mesh. A **runtime orchestration pass** inserts the communication required between adjacent stages (which now reside on different meshes), generates static per-mesh instructions for a pipeline schedule, and launches execution.
+
+---
+
+## Intra-Operator Parallelism
+
+Alpa optimizes the intra-op plan within one device mesh. It uses **SPMD-style** intra-op parallelism: operators are partitioned evenly and every device in the mesh runs the same instructions. This is a natural fit because devices in a mesh have equivalent compute capability. SPMD shrinks the search space while still expressing data parallelism, ZeRO, Megatron-style operator parallelism, and their combinations — a space that earlier auto-op-parallel systems such as Tofu and FlexFlow do not fully cover. Unlike randomized search (FlexFlow) or systems that assume linear graphs (Tofu), Alpa formulates the problem as an ILP and solves it for graphs with tens of thousands of operators.
+
+### The Space of Intra-Operator Parallelism
+
+Given an operator in the computational graph, there are multiple possible parallel algorithms to run it on a device mesh. A matmul $C_{ij} = \sum_k A_{ik} B_{kj}$ is a three-level loop. Parallelizing loop $i$, loop $j$, loop $k$, or combinations of them produces different compute and communication costs, different required layouts for the inputs, and different layouts for the output. If an input does not already have the required layout, a layout conversion is needed, which may add communicate overhead. The intra-op pass selects one parallel algorithm per operator to minimize the execution time of the whole graph.
+
+**Device mesh.** A device mesh is a 2-dimensional logical view of a set of physical devices. Every device has the same compute capability. Communication along the first mesh axis and along the second mesh axis may have different bandwidths; groups along the same axis are assumed to have the same communication performance. One physical set can be viewed in many ways. Two nodes of 8 GPUs (16 devices) can be a $2 \times 8$, $1 \times 16$, $4 \times 4$, $8 \times 2$, or $16 \times 1$ mesh. Which logical view to use is an inter-op decision. For the remainder of this section the mesh is fixed.
+
+**Sharding spec.** The layout of an $N$-dimensional tensor is a **sharding spec** $X_0 X_1 \cdots X_{n-1}$ with $X_i \in \{S, R\}$. $S$ means that axis is partitioned; $R$ means it is replicated. For a matrix, $SR$ is row-partitioned, $RS$ is column-partitioned, $SS$ is both, and $RR$ is fully replicated. Partitioned tensor axes then have to be mapped onto mesh axes. Alpa only considers 2D meshes, so a partitioned axis maps to the first mesh axis, the second, or both. A superscript records that mapping: $S^0$ partitions along mesh axis 0, $S^{01}$ along both. $S^0 R$ means the tensor is row-partitioned into two parts — the first replicated on devices 0 and 1, the second on devices 2 and 3.
+
+<div align="center">
+![Table 1: Sharding specs of a 2D tensor on a 2×2 mesh](/figures/alpa-sharding_specs.png)
+</div>
+
+**Resharding.** When an operator's chosen algorithm requires a different sharding spec than its input currently has, Alpa inserts a **resharding** (layout conversion), which may communicate. Converting a fully replicated tensor to any other spec is a local slice and requires no communication. Swapping the partitioned axis is an all-to-all.
+
+<div align="center">
+![Table 2: Resharding cases](/figures/alpa-resharding.png)
+</div>
+
+**Parallel algorithms of an operator.** With those definitions, consider a batched matmul $C_{b,i,j} = \sum_k A_{b,i,k} B_{b,k,j}$ on a 2D mesh. One algorithm maps loop $i$ onto mesh axis 0 and loop $j$ onto mesh axis 1, producing output spec $RS^0 S^1$ with operand specs $RS^0 R$ and $RRS^1$. Each device already holds the input tiles it needs, so communication is zero. Another algorithm parallelizes the reduction loop $k$; the partial sums then require an all-reduce. The same analysis produces a catalog of algorithms for convolution, reduction, and the other primitives.
+
+<div align="center">
+![Table 3: Parallel algorithms for batched matmul](/figures/alpa-batched_matmul.png)
+</div>
+
+The model graph is XLA HLO, which collapses common DL operators into fewer than 80 primitives, so the possible parallel algorithms can be enumerated by hand for each primitive.
+
+### ILP Formulation
+
+The cost of a graph $G = (V, E)$ is the sum of compute and communication on every node plus resharding on every edge. Alpa formulates this as an ILP and solves it with an off-the-shelf solver.
+
+For node $v$, let $k_v$ be the number of candidate algorithms. Communication costs are a vector $c_v \in \mathbb{R}^{k_v}$; compute costs are $d_v \in \mathbb{R}^{k_v}$. A one-hot decision vector $s_v \in \{0,1\}^{k_v}$ selects the algorithm. Resharding between $v$ and a consumer $u$ is a matrix $R_{vu} \in \mathbb{R}^{k_v \times k_u}$. The objective is
+
+$$
+\min_s \sum_{v \in V} s_v^{\top}(c_v + d_v)
++ \sum_{(v,u) \in E} s_v^{\top} R_{vu} s_u.
+\tag{1}
+$$
+
+The first term is per-node compute and communication; the second is per-edge resharding. The product $s_v^{\top} R_{vu} s_u = \sum_{i,j} R_{vu,ij}\, s_{v,i} s_{u,j}$ is quadratic in the decision variables, so Alpa introduces an auxiliary one-hot $e_{vu} \in \{0,1\}^{k_v k_u}$ with $e_{vu,ij} \equiv s_{v,i} s_{u,j}$: entry $(i,j)$ is 1 if and only if $v$ chooses algorithm $i$ and $u$ chooses algorithm $j$. For example, $s_v = [0,1,0]$ and $s_u = [1,0]$ yield $e_{vu} = [0,0,1,0,0,0]$ over the pairs $(1,1),(1,2),(2,1),(2,2),(3,1),(3,2)$. The resharding cost then becomes the linear sum $\sum_{i,j} R_{vu,ij}\, e_{vu,ij}$, with constraints $\sum_j e_{vu,ij} = s_{v,i}$ and $\sum_i e_{vu,ij} = s_{u,j}$ tying $e$ to $s$. $e_{vu}$ is not an independent parallelization choice; it is bookkeeping so that an ILP solver can handle the resharding term.
+
+Costs are estimated rather than profiled. Communication costs $c_v$ and $R_{vu}$ are bytes transferred divided by the relevant mesh-axis bandwidth. Compute costs $d_v$ are set to zero. This approximation is justified by two observations:
+
+1. Heavy operators such as matmul are never replicated. Every legal algorithm divides the work evenly, so all algorithms for one operator have the same arithmetic complexity.
+2. Lightweight operators (for example, elementwise ops) may be replicated, but their compute cost is negligible.
+
+To keep the ILP small, computationally trivial operators — elementwise, transpose, reduction — are merged into one of their operands and inherit that operand's sharding spec. A BFS computes each node's depth; a node merges into its deepest operand.
+
+After the ILP, a post-pass rewrites all-reduce into reduce-scatter plus all-gather wherever that rewrite applies. The communication volume stays the same, but fewer tensors remain replicated, which is the effect of weight-update sharding / ZeRO.
+
+---
+
+## Inter-Operator Parallelism
+
+The inter-op pass slices the model and the cluster into stage–mesh pairs. The objective is to minimize end-to-end pipeline latency for the whole graph. Earlier systems typically assume devices are pre-assigned per stage and that every stage uses a fixed data- or operator-parallel plan. Alpa makes neither assumption: mesh assignment and the intra-op plan of each stage are chosen jointly.
+
+### The Space for Inter-Operator Parallelism
+
+Consider the operators in topological order, $o_1, \ldots, o_K$, where $o_k$ depends only on $o_1, \ldots, o_{k-1}$. (Alpa uses the order in the model IR, which preserves locality from the user's program.) Slice them into $S$ stages $s_1, \ldots, s_S$, where stage $s_i$ is the contiguous range $(o_{l_i}, \ldots, o_{r_i})$, and assign $s_i$ to a submesh of shape $n_i \times m_i$ cut from a **cluster mesh** of shape $N \times M$ (typically $N$ machines with $M$ accelerators each).
+
+Let $t_i = t_{\mathrm{intra}}(s_i, \mathrm{Mesh}(n_i, m_i))$ be the latency of stage $s_i$ on that submesh — the value the ILP minimizes and reports. With $B$ micro-batches, the minimum pipeline latency is
+
+$$
+T^*
+=
+\min_{\substack{s_1,\ldots,s_S \\ (n_1,m_1),\ldots,(n_S,m_S)}}
+\left\{
+\sum_{i=1}^{S} t_i
++ (B-1)\cdot \max_{1 \le j \le S}\{t_j\}
+\right\}.
+\tag{2}
+$$
+
+The first term is the first micro-batch walking through every stage. The second is the remaining $B-1$ micro-batches, bounded by the slowest stage.
+
+<div align="center">
+![Figure 5: Pipeline latency](/figures/alpa-pipeline_latency.png)
+</div>
+
+Two additional constraints apply:
+
+1. **Forward/backward colocation.** A forward operator is placed on the same submesh as its corresponding backward operator. Backward typically reuses the same tensors, so this avoids fetching them across meshes. $t_{\mathrm{intra}}$ is the sum of forward and backward latency, so Eq. 2 is end-to-end.
+2. **Full cluster coverage.** The submeshes $(n_1, m_1), \ldots, (n_S, m_S)$ must cover the $N \times M$ cluster — no idle devices.
+
+### DP Formulation
+
+The **cluster mesh** $N \times M$ is the logical view of all devices in the cluster. Typically $N$ is the number of machines and $M$ is the number of accelerators per machine. For example, 4 machines with 8 GPUs each form a $4 \times 8$ cluster mesh.
+
+To guarantee that the cluster can be tiled, Alpa restricts submesh shapes to two families, distinguished by physical topology:
+
+1. **Intra-machine** $(1, m)$: devices within a single machine. The allowed shapes are $(1,1), (1,2), (1,4), \ldots, (1, 2^m)$. For example, $(1,4)$ is 4 GPUs on one node.
+2. **Multi-machine** $(n, M)$ with $n > 1$: complete machines, using every accelerator on each of $n$ nodes. The allowed shapes are $(2, M), (3, M), \ldots, (N, M)$. For example, on an $N \times 8$ cluster, $(2, 8)$ is all 8 GPUs on each of 2 machines.
+
+Physical assignment is greedy: larger submeshes first, then smaller ones. Stages that share a shape are packed onto neighboring devices to reduce cross-stage communication distance.
+
+The restriction matches common cloud setups (AWS GPU instances with 1/2/4/8 GPUs; GCP TPU slices of 8/32/128/256/512). The excluded shapes — $n > 1$ and $m < M$ — are typically suboptimal, because an alternative $(n', M)$ with the same device count $n' \cdot M = n \cdot m$ has more devices on the high-bandwidth axis. Under the restriction it is sufficient to enforce $\sum_i n_i \cdot m_i = N \cdot M$.
+
+The DP enumerates the bottleneck $t_{\max} = \max_j t_j$ and, for each value, minimizes the first term $t_{\mathrm{total}}(t_{\max}) = \sum_i t_i$. Define $F(s, k, d; t_{\max})$ as the minimum total latency of slicing operators $o_k$ through $o_K$ into $s$ stages on $d$ devices, with every stage no slower than $t_{\max}$. The base is $F(0, K+1, 0; t_{\max}) = 0$, and the recurrence is
+
+$$
+\begin{aligned}
+F(s,k,d;t_{\max})
+&= \min_{\substack{k \le i \le K \\ n_s \cdot m_s \le d}} \Biggl\{ \\
+&\quad t_{\mathrm{intra}}\bigl((o_k,\ldots,o_i),\ \mathrm{Mesh}(n_s,m_s),\ s\bigr) \\
+&\quad + F(s-1,\ i+1,\ d-n_s\cdot m_s;\ t_{\max})
+\Biggr\}
+\end{aligned}
+\tag{3}
+$$
+
+restricted to assignments with $t_{\mathrm{intra}} \le t_{\max}$. The resulting latency for a given bottleneck is
+
+$$
+T^*(t_{\max})
+=
+\min_s \{F(s,0,N\cdot M;t_{\max})\}
++ (B-1)\cdot t_{\max}.
+\tag{4}
+$$
+
+$t_{\mathrm{intra}}((o_k,\ldots,o_i), \mathrm{Mesh}(n_s,m_s), s)$ is the intra-op pass: the best latency of that subgraph on that many physical devices, assuming $s$ subsequent stages (needed for the 1F1B memory bound below). $\mathrm{Mesh}(n_s, m_s)$ is only a *count* of devices, so Alpa enumerates every logical shape $(n_l, m_l)$ with $n_l \cdot m_l = n_s \cdot m_s$, queries the intra-op pass, compiles the subgraph with XLA (fusion, memory planning), and profiles the executable for latency $t_l$, per-device stage memory $\mathit{mem}_{\mathrm{stage}}$, and activation memory $\mathit{mem}_{\mathrm{act}}$. A candidate is legal only if it fits. For 1F1B that check is
+
+$$
+\mathit{mem}_{\mathrm{stage}} + s \cdot \mathit{mem}_{\mathrm{act}} \le \mathit{mem}_{\mathrm{device}}.
+\tag{5}
+$$
+
+Alpa keeps the logical mesh that minimizes $t_l$ and fits; if none fits, $t_{\mathrm{intra}} = \infty$.
+
+This DP builds on TeraPipe, but the roles are reversed. TeraPipe assumes identical pipeline stages and searches over *micro-batch sizes*. Alpa groups operators into *heterogeneous* stages, holds micro-batch size fixed, and additionally optimizes each stage's mesh shape.
+
+**Complexity.** For one $t_{\max}$ the slicing is $O(K^3 NM(N + \log M))$. There are $O(K^2 (N + \log M))$ candidate values of $t_{\max}$ — one per operator range and submesh — so the full DP is $O(K^5 NM(N + \log M)^2)$. This is impractical for graphs with tens of thousands of operators. Two optimizations bring the cost into a practical range.
+
+**Early pruning.** Enumerate $t_{\max}$ from small to large. Once $B \cdot t_{\max}$ already exceeds the best $T^*$ so far, stop: a larger bottleneck cannot improve the objective. Also skip a $t_{\max}$ unless it is at least $\epsilon$ above the previous one, so the solution is at most $B \cdot \epsilon$ from optimal. With $\epsilon = 10^{-6}$ s the algorithm matched the true optimum ($\epsilon = 0$) on every evaluated setting.
+
+**Operator clustering.** Most operators are inexpensive (for example, ReLU); their precise stage assignment has little effect on total latency. A second DP clusters neighboring operators into $L \ll K$ layers before Eq. 2 runs. It merges two kinds of operators: (1) inexpensive operators that inflate the length of the graph, and (2) neighbors that would communicate heavily if placed on different meshes. Let $G(k, r)$ be the minimum, over clusterings of $o_1, \ldots, o_k$ into $r$ layers, of the *maximum* amount of data received by any single layer:
+
+$$
+G(k,r)
+=
+\min_{1 \le i \le k}
+\Big\{
+\max\{G(i-1,r-1),\, C(i,k)\}
+\Big\}
+\tag{6}
+$$
+
+subject to $\mathrm{FLOP}(o_i,\ldots,o_k) \le (1+\delta)\,\mathrm{FLOP}_{\mathrm{total}} / L$. $C(i,k)$ is the size of inputs that $(o_i,\ldots,o_k)$ receives from earlier operators. Each clustered layer is kept within $1+\delta$ of the average FLOP, and among equal-communication solutions Alpa prefers the most uniform per-layer FLOP. Clustering costs $O(K^2 L)$. $L$ is a hyperparameter, chosen small from the device count and the number of heavy operators; in practice it has little effect on final performance.
+
+<div align="center">
+![Algorithm 1: Inter-op pass](/figures/alpa-inter_op.png)
+</div>
+
+Algorithm 1 is the full inter-op workflow: flatten and cluster the graph, profile every stage–mesh pair through the intra-op pass, then run the DP.
+
+---
+
+## Parallelism Orchestration
+
+Once stages, meshes, and assignments are fixed, each stage is compiled against its mesh using the ILP's sharding specs. Compilation sits on XLA and GSPMD and produces a parallel executable per stage–mesh pair. Collectives for **within-mesh** communication (the intra-op plan) are inserted automatically.
+
+A separate orchestration pass then handles **cross-mesh** communication between stages and emits static instructions for the pipeline.
+
+<div align="center">
+![Figure 6: Cross-mesh resharding](/figures/alpa-cross_mesh_resharding.png)
+</div>
+
+**Cross-mesh resharding.** Manual systems such as Megatron-LM force every pipeline stage to use the same data-parallel and tensor-parallel degrees. Communication between stages is then a trivial P2P send/recv between corresponding ranks of two identical meshes (Fig. 6a). In Alpa, adjacent stages may sit on meshes of different shapes, and the tensor in flight may have different sharding specs on each side (Fig. 6b, 6c). That pattern is **cross-mesh resharding**: a many-to-many multicast.
+
+Alpa builds a communication plan in two passes. The first computes the correspondence between tiles on the source mesh and tiles on the destination mesh, and emits P2P send/recv pairs that move each tile. The second looks for replication in the destination sharding spec. If the destination replicates a tile, that tile only needs to cross the slow inter-mesh link once; the destination mesh can then all-gather over its own high-bandwidth links. Send/recv pairs from the first pass are rewritten into that all-gather.
+
+This is **local all-gather cross-mesh resharding**. Cross-stage traffic is already kept small by the slicing. The heuristic is effective in practice; a globally optimal multicast plan is left as future work.
+
+**Pipeline execution instructions.** Because stages contain different operators and may run on differently shaped meshes, Alpa cannot use an SPMD pipeline runtime. It uses an **MPMD** runtime: each mesh gets its own static instruction list.
+
+The instruction set covers allocating and freeing stage tensors, moving tensors according to the cross-mesh resharding plan, synchronization, and computation. A driver process generates the full lists from a user-selected pipeline schedule and dispatches them to every worker before execution, so the runtime critical path contains no driver–worker communication.

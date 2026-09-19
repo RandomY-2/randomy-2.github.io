@@ -1,0 +1,196 @@
+---
+slug: optimal-top-down-join-enumeration
+title: "Optimal Top-Down Join Enumeration"
+date: "2026-09-15"
+description: "DeHaan and Tompa give a top-down join enumerator that is optimal with respect to the join graph: memoized partitioning search, linear-delay minimal cuts for CP-free bushy plans, and branch-and-bound that is faster than prior methods — without switching to the Volcano/Cascades transformational paradigm."
+tags: [join-enumeration, query-optimization, top-down-search, dynamic-programming, memoization, branch-and-bound, join-graph, cartesian-product, volcano, cascades, system-r]
+category: system-papers
+---
+
+## Introduction
+
+Most database systems still enumerate join orders with some variant of System R's bottom-up dynamic programming. The notable exceptions are systems based on the top-down transformational search of Volcano and Cascades. Bottom-up methods can be optimal with respect to the shape of the join graph; no comparable result had been published for transformational search. Transformational systems, however, get several benefits of top-down search that bottom-up methods cannot use:
+
+* demand-driven interesting orders
+* branch-and-bound pruning
+* exploiting partial information
+
+DeHaan and Tompa show that those benefits do not require a transformational architecture. They give a top-down join enumeration algorithm that is optimal with respect to the join graph, retains much of the architecture of traditional dynamic programming, and is significantly faster than previously published methods when combined with branch-and-bound. The result is a migration path for existing bottom-up optimizers: they can adopt top-down search without switching to the Volcano/Cascades paradigm.
+
+The paper focuses on enumerating join orders for a single select-project-join block. Ono and Lohman quantified the number of join operators that must be considered for various graph shapes. Moerkotte and Neumann later showed that classical bottom-up enumerators miss those lower bounds, and gave a bottom-up algorithm that is optimal over any join graph. This paper is the first enumerator that meets the same bound *and* searches top-down.
+
+---
+
+## Existing Approaches
+
+An algorithm is **bottom-up** if it considers small logical expressions before large ones; otherwise it is **top-down**. The input is a connected join graph $G = (V, E)$, where $V$ is the set of relations and each edge in $E$ is a join predicate. The survey below is restricted to strategies that can guarantee optimality.
+
+### Compositional Dynamic Programming
+
+Compositional DP is bottom-up, enumerating already-optimized sets $V_1$ and $V_2$ to obtain a new plan for $V = V_1 \cup V_2$. System R used this for left-deep plans without cartesian products (CPs), ordering work by expression size; Moerkotte and Neumann generalize it to bushy plans.
+
+Size-driven enumeration is far from optimal: it attempts compositions of overlapping sets, and for CP-free spaces it generate-and-tests many cartesian products that are then discarded. Moerkotte and Neumann's **connected-subgraph complement pairs** (DPCCP) instead grow $V_1$ and $V_2$ from the graph structure, and achieve Ono and Lohman's lower bounds on the number of join operators considered.
+
+### Partitioning Dynamic Programming
+
+Partitioning DP still works bottom-up, but drives enumeration by the choice of $V$, then partitions $V$ into all possible $V_1$ and $V_2$. The order of $V$ must be chosen so that every valid partition's subexpressions have already been optimized.
+
+Vance and Maier invented this method for bushy plans *with* CPs, using efficient subset generation. Moerkotte and Neumann's CP-free variant is inefficient: subset generation is oblivious to the query graph, so it produces large numbers of cartesian products that are all discarded.
+
+### Prefix Search
+
+Prefix search is bottom-up but uses backtracking rather than dynamic programming. Left-deep trees are sequences of relations; the plan space is enumerated by extending prefixes. Because it does not divide and conquer, it is incompatible with memoization. Sybase SQL Anywhere uses it in small-footprint settings that cannot afford a DP table. The search space is $\Theta(n!)$ left-deep trees, so the optimizer relies on aggressive branch-and-bound that sacrifices optimality for speed.
+
+### Transformational Search
+
+Transformational search represents logical expressions as ordered binary join trees. After converting the query to an arbitrary logical tree, the space is searched by top-down application of logical-to-logical (join reordering) and logical-to-physical (join method) transformations. Memoization avoids redundant work. Volcano, Cascades, OPT++, Columbia, and Microsoft SQL Server all use this model.
+
+The paradigm is a natural fit for demand-driven interesting orders and branch-and-bound, and it additionally provides extensibility, online modification of the search space, and early complete physical plans. It has two weaknesses relative to classical join enumeration.
+
+**Memory.** Transformational search stores *all* generated plans, not just optimal ones. For spaces with CPs that is $\Omega(n 2^n)$ (left-deep) or $\Omega(3^n)$ (bushy), versus $\Omega(2^n)$ for bottom-up join enumeration.
+
+**CP-free optimality.** There is no published transformational method that optimally enumerates CP-free join plans — left-deep or bushy — of arbitrary queries. Unique-derivation mechanisms can hit Ono and Lohman's bounds for plans *with* CPs, and for acyclic queries a generate-and-test discard of CPs is optimal in the number of operators. For some simple cyclic queries, however, the unique derivation path of a bushy CP-free plan must pass through a plan that contains a CP, so generate-and-test misses part of the CP-free space.
+
+Because transformational systems dominate the top-down literature, "top-down search" is sometimes used as a synonym for transformational search. Strengths and weaknesses that come from *transformations* are then incorrectly attributed to every top-down method.
+
+### Partitioning Search
+
+Partitioning search is the top-down analogue of partitioning DP: a given $V$ is partitioned into $V_1$ and $V_2$. Instead of a rigid bottom-up order, recursion on $V_1$ and $V_2$ plus memoization determine the enumeration order. Chaudhuri et al. gave a top-down partitioning algorithm for left-deep trees with CPs, presented as a simplification of System R; they did not consider interesting orders, branch-and-bound, or avoiding cartesian products.
+
+---
+
+## Optimal Top-Down Partitioning
+
+The central claim of the paper is that top-down partitioning with memoization is competitive with bottom-up DP. Earlier comparisons between bottom-up DP and transformational search had suggested that bottom-up methods are inherently more efficient, especially for CP-free spaces, and that top-down search needs branch-and-bound or demand-driven interesting orders to keep up. That is a property of *transformations*, not of top-down search.
+
+### Algorithmic Framework
+
+<div align="center">
+![Algorithm 1: Top-Down Partition Search](/figures/join_enum-algorithm1.png)
+</div>
+
+This skeleton generalizes Chaudhuri et al. with demand-driven interesting orders and an abstract `Partition` on each join. Left-deep vs. bushy, with or without cartesian products, is controlled solely by the implementation of `Partition`.
+
+The skeleton *can* request interesting orders, which is desirable because it limits optimization to expressions that are actually useful. The paper treats interesting orders as orthogonal to join-order enumeration and does not implement them in the experimental apparatus, so comparisons test enumeration of the search space only. Top-down search enables demand-driven interesting orders; it does not require them. A top-down join-order search can still use existing bottom-up techniques for interesting orders inside each enumerated join operator.
+
+Analysis uses a **bitmap** model of computation. Query size is typically much smaller than 100 relations and a machine word is 32 or 64 bits, so $G$ is stored as an array of bitmaps and set operations (containment, union, intersection, difference) are constant-time. Under that model, connectivity testing costs $\Theta(|V|)$ rather than $\Theta(|E|)$, and an induced subgraph $G|_{V'}$ can be formed lazily in constant time. The true asymptotic case would use an edge-list encoding and would add at most a linear factor.
+
+Following Moerkotte and Neumann, an enumeration algorithm is **optimal** if it incurs no more than linear time overhead between enumerated join operators. `GetBestPlan` invokes `Partition` at most once per unique $V$ (memoization). Each returned partition yields a unique join operator in the search space. The framework is therefore optimal if `Partition` takes linear time between successive outputs.
+
+### Naive Partitioning
+
+The naive left-deep partitioner ignores the edges of $G$:
+
+<div align="center">
+![Algorithm 2: Naive Partitioning](/figures/join_enum-algorithm2.png)
+</div>
+
+Each invocation outputs $|V|$ partitions in total time $\Theta(|V|)$, so the resulting search is optimal for left-deep trees *with* CPs.
+
+Avoiding cartesian products requires that $G|_{(V \setminus \{v\})}$ stay connected. Adding that test raises the work per invocation to $\Theta(|V|^2)$, while the number of partitions can be as small as two (chains). In the worst case the partitioner spends quadratic time between successive outputs — a linear factor worse than optimal for left-deep CP-free trees.
+
+Bushy plans with CPs replace the loop with enumeration of all nonempty strict subsets of $V$. Work per invocation is $\Theta(2^{|V|})$ and $2^{|V|}-2$ partitions are emitted, so the search is optimal for bushy trees with CPs. Inserting two connectivity tests for the CP-free bushy space raises the cost to $\Theta(|V| \cdot 2^{|V|})$. The number of partitions ranges from $2^{|V|}-2$ (cliques) to $|V|-1$ (acyclic graphs). The search is optimal only for near-cliques and can be exponentially suboptimal in general.
+
+Naive top-down partitioning is therefore optimal for spaces that include cartesian products, and suboptimal for CP-free spaces — the same pairs that naive bottom-up partitioning enumerates.
+
+### Minimal Cuts
+
+Generate-and-test does not use the join graph. Graph-theoretic partitioning can emit each valid partition in linear time.
+
+For the **left-deep** CP-free space, $G|_{(V \setminus \{v\})}$ is disconnected exactly when $v$ is an **articulation vertex**. Aho, Hopcroft, and Ullman's DFS identifies the articulation vertices in $\Theta(|E|)$ time, so no per-candidate connectivity test is needed. The resulting search is optimal for left-deep trees without cartesian products.
+
+For the **bushy** space, a partition is a graph **cut**: a set of edges whose deletion splits $G$ into two or more components. A cut is **minimal** if it contains no other cut as a subset; a minimal cut divides $G$ into exactly two connected components. Minimal cuts of $G$ are therefore dual to partitions $(V_L, V_R)$ for which $G|_{V_L}$ and $G|_{V_R}$ are both connected. A non-articulation vertex is the special case in which one component is a singleton.
+
+The networking literature studies $(s,t)$-cuts: minimal edge sets that disconnect a source $s$ from a sink $t$. Provan and Shier give a recursive paradigm for several variants, including $K$-connectivity cutsets. The case $K = V$ is exactly the set of all minimal cuts of $G$.
+
+Their algorithm uses a **biconnection tree** $\mathbb{T}$ for $G = (V, E)$ rooted at a distinguished vertex $t \in V$. Vertex nodes of $\mathbb{T}$ correspond one-to-one with vertices of $G$; set nodes correspond one-to-one with the biconnected components of $G$. An edge of $\mathbb{T}$ joins a vertex $v$ to every set node $\beta$ that contains $v$. $\mathbb{T}$ can be built in $\Theta(|E|)$ time by a small modification of the same DFS. The non-articulation vertices of $G$ are precisely the leaves of $\mathbb{T}$ (and the root, if $t$ has only one child).
+
+<div align="center">
+![Figure 1: Graph $G$ with corresponding biconnection tree $\mathbb{T}$](/figures/join_enum-biconnection_tree.png)
+</div>
+
+### Lazy Tree Building
+
+`MinCutLazy` maintains two disjoint connected vertex sets $S$ and $T$. $S$ grows on each recursive call. $T$ is seeded with an arbitrary vertex $t$ and records vertices already added to $S$ on a different branch. $\mathcal{N}(S)$ is the neighbor set of $S$. Each invocation emits the minimal cut corresponding to the current $S$ (two symmetric partitions) and then tries to extend $S$ by a neighbor without disconnecting $G|_{(V \setminus S)}$.
+
+For a vertex node $v$ of $\mathbb{T}$, $\mathcal{D}_{\mathbb{T}}(v)$ is $v$ together with its descendant vertex nodes, and $\mathcal{A}_{\mathbb{T}}(v)$ is $v$ together with its ancestor vertex nodes. The **pivot set** $P$ is the subset of $\mathcal{N}(S)$ not yet in $T$ that are maximally distant from $t$ in $\mathbb{T}$. Each pivot is used to extend $S$ recursively.
+
+<div align="center">
+![Algorithm 3: Minimal Cut Partitioning](/figures/join_enum-algorithm3.png)
+</div>
+
+The expensive step is `BuildBccTree`. The important optimization is to reuse the parent's tree $\mathbb{T}^{\mathrm{old}}$ whenever it is still **usable** for $G|_{(V \setminus S)}$ — i.e., whenever $\mathcal{D}$ and $\mathcal{A}$ can still be evaluated on it.
+
+**Usability.** Given connected induced graphs $G|_{V_1}$ and $G|_{V_2}$ with $V_2 \subseteq V_1$, a root $t \in V_2$, and the biconnection tree $\mathbb{T}_1$ of $G|_{V_1}$ rooted at $t$: $\mathbb{T}_1$ is usable for $G|_{V_2}$ if the mapping from each biconnected component of $G|_{V_2}$ into a set node of $\mathbb{T}_1$ is injective. The shape of a biconnection tree depends only on $t$ and the singleton intersections among biconnected components, so $\mathcal{D}$ and $\mathcal{A}$ on $V_2$ can then be computed as $\mathcal{D}_{\mathbb{T}_1}(v) \cap V_2$ and $\mathcal{A}_{\mathbb{T}_1}(v) \cap V_2$.
+
+Testing Definition 3.1 requires the biconnected components of $G|_{V_2}$, which is as expensive as building $\mathbb{T}_2$. A conservative test examines $\mathbb{T}_1$ only: $\mathbb{T}_1$ is usable for $G|_{V_2}$ if, for every set node $\beta$ that intersects $V_1 \setminus V_2$, every child of $\beta$ also lies in $V_1 \setminus V_2$. The test can produce false negatives — a deleted leaf of a set node may leave $\mathbb{T}_1$ usable even though the lemma rejects it — but never false positives.
+
+Provan and Shier's original algorithm costs $\Theta(|E|)$ per cut, dominated by rebuilding the biconnection tree on every call. `MinCutLazy` has the same worst-case bound: the usability test is $O(|V|)$, and on a clique $\mathbb{T}^{\mathrm{old}}$ is never usable. That is already optimal for the enumerator. For chains and stars the amortized cost drops to constant time per cut. Empirically, lazy construction is far better than eager reconstruction on acyclic graphs, degrades gracefully as cyclicity grows, and matches eager reconstruction on cliques. Combined with the top-down skeleton, `MinCutLazy` yields an optimal enumerator for bushy trees without cartesian products.
+
+### Enumeration vs. Bottom-Up DP
+
+In a shared Java framework with three physical join methods and a textbook I/O cost model (no interesting orders), top-down partitioning mirrors the analogous bottom-up algorithm:
+
+* Naive top-down and naive bottom-up have the same suboptimal complexity and indistinguishable running time.
+* `MinCutLazy` top-down (`TBNmc`) and DPCCP bottom-up (`BBNccp`) are both optimal, and their running times are also indistinguishable.
+* Even on cliques — `MinCutLazy`'s worst case — the overhead of building biconnection trees is a small constant (10–15%).
+
+There is no inherent performance penalty in moving from bottom-up DP to top-down partitioning. The widely implemented size-driven bottom-up enumerator has no top-down analogue and is slower than the graph-aware methods.
+
+---
+
+## Branch-and-Bound Pruning
+
+Exhaustive bottom-up DP and exhaustive top-down partitioning have essentially the same cost. Top-down search can additionally prune with branch-and-bound while still guaranteeing optimality.
+
+The algorithm keeps an upper bound $U$ (best solution so far) and a lower bound $L$ on the best solution obtainable from the current partial plan. Whenever $U \le L$ and $L$ is conservative, the partial plan can be abandoned. In the worst case the method degrades to exhaustive search plus a small constant for the estimator.
+
+### Accumulated-Cost Bounding
+
+Physical plans are built one join operator at a time. $U$ is the cost of the best *complete* plan so far; $L$ is the cost already accumulated on the path down the search tree. Both quantities are passed downward. SQL Anywhere's prefix search uses this explicitly. Volcano, Cascades, and Columbia use an equivalent **budget** $U - L$: each operator decrements the budget, and search stops when the budget reaches zero.
+
+Partitioning search is divide-and-conquer, so accumulated-cost bounding is integrated by giving every procedure a budget $B$ and returning failure if no plan meeting $B$ exists. Failures are stored in the memo so a later call with a no-larger budget fails immediately.
+
+### Predicted-Cost Bounding
+
+Predicted-cost bounding hypothesizes what lies *below*. For the current logical expression, $U$ starts at $\infty$ until the first plan for that expression is found. A lower bound $L$ is predicted for each unexplored partition from logical properties only, and unpromising branches are skipped. Adding this to `CalcBestJoin` is a comparison against the current best plan before optimizing a partition.
+
+The paper's I/O cost model charges for reading join inputs, so the lower bound for $G_L \bowtie G_R$ is proportional to the I/O of scanning $G_L$ and $G_R$, with base relations charged zero (an index join might not touch every tuple). Columbia's contribution was predicted-cost bounding; because Columbia sits on Cascades, it actually combines both styles and passes a budget rather than resetting $U = \infty$.
+
+### What Actually Helps
+
+On weighted star queries (relation cardinalities and join selectivities drawn to match a TPC-H-like mix), the two strategies diverge.
+
+**Storage.** Accumulated-cost bounding cuts the number of stored *plans* sharply as query size grows. Counting cells that store either a plan or a lower bound, the reduction plateaus around 80%. Predicted-cost bounding is weaker, plateauing around 70%. Combining both is no better than accumulated-cost alone. That ordering is expected: accumulated-cost bounds come from real physical costs, while predicted-cost bounds must stay conservative using only logical properties.
+
+**CPU time.** Predicted-cost bounding reduces runtime roughly in proportion to the pruned plans — around 90% on these stars. Accumulated-cost bounding helps on small queries and then becomes *worse than exhaustive search* as $n$ grows. Combining both is almost as bad as accumulated-cost alone.
+
+The reason is that a budget contextualizes each subexpression and undercuts memoization. Optimality of `TBNmc` depends on exploring each logical expression once. Abandoning a subtree when the budget is exhausted means the same expression can be re-optimized many times, which destroys the linear-delay guarantee. The spike in CPU is re-enumeration, not a larger set of unique expressions — unique expressions stay around 20% of the exhaustive table.
+
+This does not indict SQL Anywhere: prefix search has no memo table, so it already pays for redundant work. It does raise a question about transformational optimizers that combine accumulated-cost budgets with memoization. Saving every derived plan may amortize some of the re-enumeration; existing published measurements may not have been detailed enough to see the rest.
+
+Predicted-cost bounding is the strategy that actually makes the optimal top-down enumerator faster than exhaustive search.
+
+---
+
+## Exploiting Partial Information
+
+Bottom-up DP precomputes an optimal plan for every logical subexpression. Top-down search computes those plans on demand, which is what makes branch-and-bound possible. The same demand-driven structure can exploit information that already exists.
+
+### Flexible Memo Tables
+
+After optimizing $Q_1 = A \bowtie B \bowtie C$, the table holds plans for $A$, $B$, $C$, $AB$, $BC$, and $ABC$. A subsequent $Q_2 = B \bowtie C \bowtie D$ forces a bottom-up optimizer to re-derive $B$, $C$, and $BC$. A top-down optimizer that starts from $Q_1$'s table hits $BC$ on the way down from $BCD$ and skips that subtree.
+
+Bottom-up methods write blindly and later read; top-down partitioning uses the table as a **cache**. That questions the assumption that each query gets a fresh table. Keying the memo by a canonical logical expression (not just the set of relations) is enough to keep $Q_1$ and $Q_2$ from colliding when the predicates on $B$ or $C$ differ.
+
+Bottom-up methods also cannot drop a subplan before every larger expression that depends on it has been computed. Transformational systems are equally rigid: transformations fire against expressions already in the memo, so early deletion curtails the search space. Top-down partitioning degrades gracefully if a subplan is missing — it recomputes it.
+
+Treating the memo as a global plan cache has two consequences. First, similar queries — including the many physical optimizations issued by a logical optimizer that rewrites views — can share work without folding view rewriting into the join enumerator. Second, memory can be traded for time. Bottom-up DP uses $\Omega(2^n)$ for optimal plans; transformational search uses $\Omega(3^n)$ because it stores every plan; prefix search uses $O(n)$ but searches $\Omega(n!)$ left-deep trees. Partitioning search needs $\Omega(2^n)$ for optimal time, but eviction (for example LRU) only causes recomputation, not incorrectness.
+
+### Multi-Phase Optimization
+
+A practical optimizer often searches a small space first and widens it only if plan quality is insufficient. For a bottom-up optimizer there is no reason to do this when the globally optimal plan is required: a plan that is optimal in a smaller space may be suboptimal in a larger one and must be recomputed. A top-down algorithm with branch-and-bound can use that smaller-space plan as an initial upper bound.
+
+Predicted-cost pruning is especially effective once cartesian products are allowed, because CPs introduce many bad plans that are cheap to reject. Relative comparisons between pruned bushy-with-CP search and exhaustive left-deep or CP-free search match the patterns Shapiro et al. reported for Columbia.
+
+A two-phase strategy — optimal CP-free plans in phase one, used only as upper bounds for a CP-inclusive phase two — adds only a small percentage of overhead when both phases are exhaustive (except left-deep stars). With predicted-cost pruning in both phases, the first phase pays for itself: about a 20% improvement in the second phase on larger queries, except again left-deep stars. Progressive widening is already attractive for plan-quality control; for a top-down optimizer the extra bound is effectively free.
