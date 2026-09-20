@@ -1,0 +1,166 @@
+---
+slug: orca-distributed-serving
+title: "Orca: A Distributed Serving System for Transformer-Based Generative Models"
+date: "2026-09-19"
+description: "ORCA serves Transformer-based generative models by scheduling at iteration granularity rather than request granularity, using selective batching to mix requests with different sequence lengths, and scaling with intra-layer, inter-layer, and pipeline parallelism — 36.9× higher throughput than FasterTransformer at the same latency on GPT-3 175B."
+tags: [orca, llm-serving, iteration-level-scheduling, selective-batching, transformer, inference, gpt, batching, kv-cache, pipeline-parallelism, fastertransformer, gpu]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+Transformer-based generative models such as GPT-3 process a request by running the model many times. Each iteration emits one token, which is fed back as input to the next iteration. Models such as ResNet or BERT, by contrast, finish a request in a single forward pass. That **multi-iteration** property is a poor fit for the way current inference stacks are built.
+
+A typical deployment pairs a serving system (Triton, TensorFlow Serving) with an execution engine (FasterTransformer, TensorRT). The serving system groups requests into a batch and hands the batch to the engine. The engine returns only after every request in the batch has finished. Because requests generate different numbers of tokens, early finishers cannot be returned to the client, and newly arrived requests cannot join until the whole batch completes.
+
+ORCA's response is to schedule the engine at the **granularity of iteration** rather than request. The scheduler asks the engine to run a single iteration on the current set of requests, inspects the results, returns finished requests immediately, and considers new arrivals for the next iteration.
+
+Doing this while still batching is not straightforward. Requests in the same scheduled iteration may have processed different numbers of tokens, so Attention sees tensors of different shapes and cannot be batched in the usual way. **Selective batching** applies token-wise batching to operations that do not need a request dimension (Linear, LayerNorm, Add, GeLU) and runs Attention per request. Because Attention has no model parameters, not batching it has little effect on the cost of loading weights.
+
+On top of these two techniques, ORCA adds intra-layer and inter-layer model parallelism, a memory-aware scheduler, and a control/data-plane split so that the design scales to models with hundreds of billions of parameters. On GPT-3 175B, it achieves $36.9\times$ higher throughput than FasterTransformer at the same latency. The same approach applies to other autoregressive Transformer models, not only language models.
+
+---
+
+## Background
+
+### Inference Procedure of GPT
+
+GPT is a decoder-only Transformer. It receives a sequence of input tokens and extends that sequence one token at a time. Figure 1a shows a three-layer GPT completing `"I think this"` into `"I think this is great <EOS>"`. Nodes that share parameters (the same layer at different iterations) have the same color. We call a run of all layers on the current input an **iteration**.
+
+<div align="center">
+![Figure 1: GPT inference procedure, Transformer layer, and internal state usage](/figures/orca-figure1.png)
+</div>
+
+The first iteration is the **initiation phase**: it consumes all prompt tokens in parallel and produces the first output token. Subsequent iterations form the **increment phase**: each takes a single previously generated token and produces the next one. The increment phase is sequential by construction; the initiation phase is not.
+
+Attention is the operation that makes this procedure different from a recurrent network. It takes query, key, and value, computes softmax-normalized weights from query–key dot products, and returns a weighted average of the values. With causal masking, every preceding token participates. A naïve implementation would recompute keys and values for the whole prefix at every iteration. Incremental decoding (fairseq, FasterTransformer, Megatron-LM) instead **caches** those tensors and reuses them.
+
+Figure 1c contrasts that cache with LSTM state. LSTM's cell and hidden state have constant size across time. Transformer's keys $k_{l,1:t}$ and values $v_{l,1:t}$ **grow with $t$**. Attention at token $t$ therefore operates on tensors whose shapes depend on how many tokens have already been processed — the fact that later prevents naïve batching of mixed-length requests.
+
+The rest of a GPT layer is standard: LayerNorm, QKV Linear, Attention, Attn Out Linear, residual Add, LayerNorm, MLP (Linear–GeLU–Linear), and a second residual Add (Figure 1b). In this post, as in the paper, **Attention** means only the attention computation itself, not the surrounding linear projections.
+
+### ML Inference Serving Systems
+
+Serving systems sit above execution engines. They expose an endpoint, form batches, pick a model variant, and share devices across services. Engines (TensorRT, TVM, FasterTransformer, …) run the tensor program. The split is useful: the serving layer can be model-agnostic, while the engine specializes to a hardware target.
+
+**Batching** is the main lever for accelerator efficiency. Concatenating per-request tensors into one large tensor both occupies more parallel units and amortizes the cost of reading model parameters from off-chip memory. Throughput is therefore a strong function of batch size, especially for memory-intensive layers.
+
+<div align="center">
+![Figure 2: Request-level serving workflow](/figures/orca-figure2.png)
+</div>
+
+Figure 2 is the resulting workflow. The scheduler (1) dequeues a batch and (2) dispatches it to the engine. The engine (3) runs as many iterations as the longest request needs and (4) returns every completion together. In the example, $x_1$ (`"I think"`) and $x_2$ (`"I love"`) are issued as one batch; the engine eventually returns `"this is great"` and `"you"`.
+
+---
+
+## Challenges and Proposed Solutions
+
+### C1: Early-Finished and Late-Joining Requests
+
+The serving system and the engine talk to each other only at two moments: when the engine is idle and a new batch is dispatched, and when that batch has fully completed. The batch is **frozen** for its entire lifetime.
+
+That is costly for generation. Requests in one batch typically need different numbers of iterations. In Figure 3, $x_1$ and $x_2$ share a prompt length, but $x_2$ emits `<EOS>` at iteration 2. Iterations 3 and 4 still compute for $x_2$ (the `"-"` tokens). The extra work wastes FLOPs, and $x_2$'s response is held until $x_1$ finishes. A request that arrives after dispatch waits for the same reason.
+
+<div align="center">
+![Figure 3: Extra computation for early-finished requests](/figures/orca-figure3.png)
+</div>
+
+This pathology does not appear in training: teacher forcing consumes the whole target sequence in one iteration, so there are no early finishers and no late joiners.
+
+### Iteration-Level Scheduling
+
+The scheduler instead repeats three steps: select a set of requests, run **one** iteration for that set, and consume the resulting tokens. Finished requests leave as soon as their `<EOS>` (or `max_tokens`) is observed. A new arrival waits at most one iteration, not a whole batch.
+
+<div align="center">
+![Figure 4: ORCA system overview](/figures/orca-figure4.png)
+</div>
+
+Figure 4 is the resulting architecture.
+
+* An **endpoint** (HTTPS or gRPC) admits requests and sends responses.
+* A **request pool** holds every in-flight request for its lifetime.
+* A **scheduler** selects a subset of the pool, invokes the engine for one iteration, appends each output token, and evicts completed requests.
+* An **engine** executes the tensor program, possibly across GPUs and machines.
+
+In the figure, the scheduler (1) picks $(x_1, x_2, x_3, x_4)$ and (2) supplies prompt tokens for first-time requests — $(x_{31}, x_{32})$ for $x_3$ and $(x_{41}, x_{42}, x_{43})$ for $x_4$. The engine (3) runs one iteration and (4) returns $(x_{15}, x_{23}, x_{33}, x_{44})$. Unlike Figure 2, the membership of the batch can change on the next iteration. How that membership is chosen is the scheduling algorithm below.
+
+### C2: Batching an Arbitrary Set of Requests
+
+Iteration-level scheduling is only useful if the engine can batch *whatever* the scheduler selected. Canonical batching requires identical ops on identically shaped tensors. Three situations violate that:
+
+1. Two requests in the **initiation** phase with different prompt lengths ($x_3$ has 2 tokens, $x_4$ has 3).
+2. Two requests in the **increment** phase at different token indices ($x_1$ vs. $x_2$), so their cached $K/V$ tensors have different lengths.
+3. A mix of initiation and increment ($x_1$ vs. $x_3$): initiation consumes the whole prompt; increment consumes one token.
+
+Canonical batching therefore requires that selected requests share a phase *and* a length (prompt length, or current index). The probability of finding such a set drops exponentially in the target batch size, so large batches become impractical.
+
+### Selective Batching
+
+The restriction above comes from treating every operation as request-wise batched. A Transformer layer normally takes a tensor of shape $[B, L, H]$, formed by stacking $B$ request tensors of the same shape $[L, H]$. This is impossible for requests with different numbers of tokens: for example, $x_3$ and $x_4$ in Figure 4 have shapes $[2, H]$ and $[3, H]$.
+
+ORCA observes that most Transformer operations do not actually need request boundaries. Linear, LayerNorm, Add, and GeLU operate independently on each token, so requests of different lengths can simply be concatenated along the token dimension. Thus, $x_3$ and $x_4$ become one $[5, H]$ tensor, and the full batch $(x_1, x_2, x_3, x_4)$ becomes $[7, H]$.
+
+Attention is the exception: a token from one request must not attend to tokens from another request. **Selective batching** therefore batches all requests token-wise for non-Attention operations, but temporarily separates them for Attention. A `Split` operation partitions the flattened tensor into per-request slices before Attention, and a `Merge` concatenates the Attention outputs afterward.
+
+<div align="center">
+![Figure 5: Selective batching](/figures/orca-figure5.png)
+</div>
+
+Figure 5 shows an example. QKV Linear processes all seven tokens together as a $[7, H]$ tensor. Its output is then split so that Attention runs separately for $x_3$, $x_4$, $x_1$, and $x_2$ on tensors of shapes $[2, 3H]$, $[3, 3H]$, $[1, 3H]$, and $[1, 3H]$, respectively. The four Attention outputs are merged back into $[7, H]$, after which Attn Out Linear and the remaining operations again execute as one token-wise batch.
+
+For increment-phase requests such as $x_1$ and $x_2$, Attention also retrieves previously generated keys and values from the *Attention K/V manager*, indexed by request id. The current token attends only to its own cached prefix — e.g., $x_1$ uses the cached K/V for $x_{11}, x_{12}, x_{13}$ — so requests with different history lengths can still participate in the same iteration.
+
+Separating Attention is relatively inexpensive because Attention itself has no model parameters; unlike Linear layers, it does not benefit from batching through reuse of weight reads across requests.
+
+---
+
+## ORCA Design
+
+The components in Figure 4 already define the execution model. What remains is scaling to models that do not fit on one GPU, and deciding *which* requests to run at each iteration.
+
+### Distributed Architecture
+
+ORCA reuses the two model-parallel strategies developed for Transformer training and also used by FasterTransformer.
+
+* **Intra-layer parallelism** shards Linear and Attention GEMMs, and their parameters, across GPUs.
+* **Inter-layer parallelism** assigns equal numbers of Transformer layers to consecutive workers.
+
+<div align="center">
+![Figure 6: Intra- and inter-layer parallelism](/figures/orca-figure6.png)
+</div>
+
+Figure 6 splits a 4-layer GPT into two inter-layer partitions, each further split three ways, for six GPUs.
+
+<div align="center">
+![Figure 7: Distributed execution engine](/figures/orca-figure7.png)
+</div>
+
+Each **worker process** owns one inter-layer partition and may run on a separate machine. It has one CPU control thread per GPU (the intra-layer degree). When the scheduler issues an iteration, the **engine master** forwards tokens plus a control message — request ids, current indices for increment-phase requests, prompt lengths for initiation-phase requests — to Worker 1. Worker 1's controller fans that message out to its GPU threads, which issue kernels (Attention uses the request id and index to locate cached $K/V$), and **forwards the control message to Worker 2 without waiting** for those kernels. Only the last worker synchronizes, reads output tokens, and returns them to the master.
+
+The reason for this care is CPU–GPU synchronization. FasterTransformer and Megatron-LM send control metadata over NCCL, so every iteration incurs a GPU round-trip just to deliver CPU-side information (batch size, lengths, finished flags). ORCA splits the planes: **gRPC** carries control messages and tokens between master and controllers; **NCCL** carries only GPU-produced intermediate tensors (dashed arrows in Figure 7).
+
+### Scheduling Algorithm
+
+Selective batching lets the engine run any set of requests. The scheduler still has to pick that set. ORCA uses **iteration-level FCFS**: if $x_i$ arrived before $x_j$, then $x_i$ has run at least as many iterations as $x_j$. A later request may still *complete* first if it needs fewer tokens.
+
+Two further constraints apply.
+
+**Max batch size.** Larger batches raise throughput and latency, with diminishing throughput returns. `max_bs` is an operator knob, as in other serving systems.
+
+**K/V memory.** Intermediate activations can be pooled and reused immediately. Cached keys and values cannot: they live until the request finishes. A scheduler that ignores this can deadlock — no request can run because there is no slot for the next token's $K/V$. ORCA therefore **reserves** `max_tokens` slots (the per-request cap on total length) the first time a request is scheduled, and refuses the request if `n_rsrv + max_tokens` would exceed `n_slots`. `n_slots` is sized to fill leftover GPU memory after weights and workspace; unlike `max_bs`, it does not require a latency–throughput experiment.
+
+<div align="center">
+![Algorithm 1: ORCA scheduling algorithm](/figures/orca-algorithm1.png)
+</div>
+
+Algorithm 1 is the loop. `Select` sorts non-running pool entries by arrival time, takes at most `max_bs` of them, and admits an initiation-phase request only if its reservation fits. After each scheduled iteration, finished requests release their slots. Arrival and completion are assumed to run concurrently with this loop.
+
+**Pipeline parallelism.** The same loop keeps `n_scheduled = n_workers` batches in flight (lines 9–10). Every inter-layer worker then has a batch to run; the scheduler does not wait for batch $AB$ to return before injecting $CD$ and $EF$.
+
+<div align="center">
+![Figure 8: Pipeline parallelism in ORCA vs. FasterTransformer](/figures/orca-figure8.png)
+</div>
+
+Figure 8a is that pipeline with three workers and `max_bs = 2`. Requests A through F arrive in order. The scheduler first issues $AB$, then $CD$, then $EF$, and only then waits; when $AB$ returns, A and B are still the oldest unfinished requests, so they are issued again.
+
+Request-level serving cannot do this. Triton cannot inject C until FasterTransformer finishes $AB$. FasterTransformer recovers some overlap by splitting $AB$ into **microbatches** (Figure 8b: A and B). Each partition then batches at most the microbatch, so batching efficiency falls, and if there are fewer microbatches than partitions the pipeline has bubbles. Iteration-level scheduling removes the tradeoff: ORCA pipelines full batches, not subdivisions of a frozen one.

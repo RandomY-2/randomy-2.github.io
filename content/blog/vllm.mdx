@@ -1,0 +1,198 @@
+---
+slug: vllm-pagedattention
+title: "vLLM: Efficient Memory Management for Large Language Model Serving with PagedAttention"
+date: "2026-09-19"
+description: "vLLM treats the KV cache like virtual memory: PagedAttention stores keys and values in non-contiguous blocks, a block table maps logical pages to physical GPU slots, and copy-on-write sharing plus preemption raise batch size — 2–4× higher throughput than Orca and FasterTransformer at the same latency."
+tags: [vllm, pagedattention, llm-serving, kv-cache, virtual-memory, paging, copy-on-write, beam-search, orca, fastertransformer, gpu, inference]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+High-throughput LLM serving is expensive. Autoregressive generation is sequential and **memory-bound**: each new token depends on the key and value tensors of every preceding token, so GPUs spend much of their time moving those states rather than computing. Batching more requests amortizes weight loads, but only if there is room in GPU memory for every request's **KV cache**.
+
+<div align="center">
+![Figure 1: GPU memory layout and the effect of KV cache growth on throughput](/figures/vllm-figure1.png)
+</div>
+
+On a 13B model and a 40 GB A100, about 65% of memory is static weights and about 30% is KV cache (Figure 1, left). Activations are a small remainder. The cache therefore determines the maximum batch size. Existing systems store each request's cache in one contiguous tensor and **pre-allocate** it to the model's maximum length. Because actual lengths are unknown and highly variable, that policy fragments memory and forbids sharing across sequences. Profiling in Figure 2 shows that only $20.4\%$–$38.2\%$ of reserved KV memory holds actual token states.
+
+<div align="center">
+![Figure 2: KV cache memory waste in existing systems versus vLLM](/figures/vllm-figure2.png)
+</div>
+
+**PagedAttention** borrows the OS answer to fragmentation and sharing: virtual memory with paging. It splits a sequence's KV cache into fixed-size **blocks** that need not be contiguous. Blocks are pages, tokens are bytes, and requests are processes. Small on-demand blocks cut internal fragmentation; uniform block size removes external fragmentation; block-level mapping enables sharing within a request (parallel samples, beam candidates) and across requests (shared prefixes).
+
+**vLLM** is a distributed serving engine built on that algorithm. A centralized scheduler and a KV cache manager allocate physical blocks on GPU (and CPU, for swap), translate logical block IDs in a block table, and preempt sequences when memory is exhausted. On GPT, OPT, and LLaMA, including models that do not fit on one GPU, vLLM raises throughput by $2$–$4\times$ versus FasterTransformer and Orca at the same latency, with larger gains on long sequences, large models, and decoding algorithms that share prefixes.
+
+---
+
+## Background
+
+### LLM Service and Autoregressive Generation
+
+A completion or chat request supplies a prompt $(x_1,\ldots,x_n)$ and receives tokens $(x_{n+1},\ldots,x_{n+T})$. The concatenation is a **sequence**. Tokens are sampled one at a time, each depending on all previous keys and values. Those tensors are cached (the KV cache). The cache of a token depends on its *position*, so the same string at two positions is not the same cache.
+
+Generation splits into two phases.
+
+* The **prompt (prefill) phase** consumes the entire prompt, produces $k_1,\ldots,k_n$ and $v_1,\ldots,v_n$, and emits the first output token. All prompt tokens are known, so this phase is matrix–matrix multiplication and uses the GPU well.
+* The **autoregressive generation phase** takes one new token per iteration, appends one $(k,v)$ pair, and samples the next token, until a maximum length or `<eos>`. Cached prefixes are reused; only the new pair is computed. Iterations cannot be parallelized, so this phase is matrix–vector and memory-bound, and it dominates single-request latency.
+
+### Batching Techniques for LLMs
+
+Batching amortizes weight movement. Two obstacles remain: requests arrive at different times, and they have very different lengths. Request-level batching either stalls early arrivals or pads every sequence to the longest, wasting compute and memory.
+
+Iteration-level scheduling (Orca) and cellular batching (BatchMaker) operate at iteration-level: after each iteration, finished sequences leave, new ones join, and specialized kernels avoid padding. Queueing delay drops to one iteration. That improves throughput, but the number of sequences that *fit* is still set by KV cache memory.
+
+---
+
+## Memory Challenges in LLM Serving
+
+Throughput is therefore **memory-bound**. Three properties of the cache make that bound tight.
+
+**Large KV cache.** For OPT-13B, one token's keys and values occupy $800$ KB: $2 \times 5120 \times 40 \times 2$ bytes (key/value, hidden size, layers, fp16). At a 2048 maximum length, one request can need $1.6$ GB. Even if the entire leftover GPU memory were cache, only tens of requests would fit — and fragmentation reduces that further. GPU FLOPS have been growing faster than capacity (A100 to H100 more than doubles FLOPS at the same 80 GB ceiling), so the bound is getting worse.
+
+**Complex decoding.** Different decoding algorithms imply different sharing. In parallel sampling — several random completions of one prompt — the prompt KV can be shared (about $12\%$ of cache), but each sample's autoregressive tokens must stay private: they differ, and each token's cache depends on its own prefix and position. Beam search can share much more (up to $55\%$), including blocks generated after the prompt, and the sharing pattern changes as candidates are dropped and replaced. Contiguous per-sequence tensors cannot express either pattern.
+
+**Unknown lengths.** Prompts vary widely; outputs are not known until `<eos>`. The cache grows during decoding and can exhaust memory, so the system must delete or swap some sequences' state.
+
+### Memory Management in Existing Systems
+
+Deep-learning frameworks require contiguous tensors, so FasterTransformer and Orca store each request's KV cache as one contiguous chunk sized to the **maximum possible** length, independent of the actual prompt or the eventual output.
+
+<div align="center">
+![Figure 3: Reserved slots, internal fragmentation, and external fragmentation in contiguous KV allocation](/figures/vllm-figure3.png)
+</div>
+
+Figure 3 shows the three wastes. Request A is reserved to 2048 tokens, request B to 512.
+
+* **Reserved** slots will be written later, but holding them for the whole lifetime blocks other requests.
+* **Internal fragmentation** is the unused tail after `<eos>`; it is known only when the request finishes.
+* **External fragmentation** is leftover space between differently sized pre-allocations (e.g., a buddy allocator) that is known to be unusable before serving even starts.
+
+Reserved memory is eventually used; the other two are pure waste. Effective occupancy can fall to $20.4\%$. Compaction is impractical at KV-cache scale, and even a compacted contiguous chunk still cannot share blocks across decoding algorithms.
+
+---
+
+## Method
+
+vLLM addresses these constraints with PagedAttention and a paged KV manager.
+
+<div align="center">
+![Figure 4: vLLM system overview](/figures/vllm-figure4.png)
+</div>
+
+Figure 4 is the architecture. A **centralized scheduler** coordinates GPU workers. A **KV cache manager** holds per-sequence **block tables** and issues allocate/free/swap commands to CPU and GPU **block allocators**. Workers each hold a model shard and a cache engine.
+
+### PagedAttention
+
+PagedAttention computes self-attention when keys and values live in **non-contiguous** memory. A sequence's cache is partitioned into KV blocks of $B$ tokens. Write $K_j = (k_{(j-1)B+1},\ldots,k_{jB})$ and $V_j = (v_{(j-1)B+1},\ldots,v_{jB})$. Attention becomes blockwise:
+
+$$
+A_{ij}
+=
+\frac{\exp(q_i^\top K_j / \sqrt{d})}
+{\sum_{t=1}^{\lceil i/B \rceil} \exp(q_i^\top K_t \mathbf{1} / \sqrt{d})},
+\qquad
+o_i
+=
+\sum_{j=1}^{\lceil i/B \rceil} V_j A_{ij}^\top,
+\tag{4}
+$$
+
+where $A_{ij}$ is the row of scores on block $j$. The kernel fetches each physical block separately.
+
+<div align="center">
+![Figure 5: PagedAttention over non-contiguous KV blocks](/figures/vllm-figure5.png)
+</div>
+
+In Figure 5 the query `"forth"` attends to three blocks that are not adjacent in DRAM: block 0 (`Four score and seven`), block 1 (`years ago our fathers`), block 2 (`brought forth`). Each block contributes a chunk of scores, then a chunk of the weighted value sum.
+
+(Each token has keys and values across layers and heads. vLLM gives each head/layer its own block table; managing them together in one block is equivalent.)
+
+### KV Cache Manager
+
+The manager is virtual memory for the cache. Logical blocks of a sequence are filled left to right; only the last block has unused slots. A **block engine** carves GPU DRAM (and CPU RAM, for swap) into equal physical blocks. A **block table** maps each logical block to a physical ID and a `#filled` count.
+
+Logical contiguity no longer requires physical contiguity, and physical memory need not be reserved for the maximum length. Waste for a request is confined to the unused slots of its last block — the analogue of a page's internal fragmentation.
+
+### Decoding with PagedAttention and vLLM
+
+<div align="center">
+![Figure 6: Logical-to-physical block table during decoding](/figures/vllm-figure6.png)
+</div>
+
+Figure 6 walks through one sequence with $B = 4$.
+
+1. The prompt has 7 tokens. vLLM allocates two logical blocks and maps them to physical blocks 7 and 1. Prefill (ordinary self-attention) writes four tokens into block 0 and three into block 1, leaving one slot.
+2. The first decode step runs PagedAttention on physical blocks 7 and 1 and writes the new KV into the remaining slot; `#filled` becomes 4.
+3. The last logical block is full, so the next token allocates logical block 2, mapped to a new physical block 3.
+
+At every iteration the scheduler picks a batch, allocates any newly required physical blocks, concatenates this step's input tokens (full prompts for prefills, last tokens for decodes), and runs the model. PagedAttention reads prior cache by logical block ID and writes new cache into the mapped physical blocks. $B > 1$ lets the kernel process several positions per block and raises occupancy; larger $B$ also raises fragmentation. The default, justified in the ablation, is $B = 16$.
+
+When a request finishes, its blocks return to the free pool. Figure 7 shows two sequences packed into the same physical space: neighboring logical blocks need not be neighbors in DRAM.
+
+<div align="center">
+![Figure 7: Two requests sharing the physical block pool](/figures/vllm-figure7.png)
+</div>
+
+### Application to Other Decoding Scenarios
+
+Greedy decoding and ordinary sampling emit one sequence per prompt. Production APIs also need algorithms with richer sharing.
+
+**Parallel sampling.** Program assistants draw several completions from one prompt. The prompt KV can be shared; the decoded suffixes cannot.
+
+<div align="center">
+![Figure 8: Parallel sampling with copy-on-write](/figures/vllm-figure8.png)
+</div>
+
+Figure 8 maps both samples' prompt blocks to the same physical blocks (7 and 1) and gives those blocks a **reference count** of 2. When sample A1 must write into a shared last block, vLLM **copy-on-write**s: it allocates physical block 3, copies block 1, and decrements the old refcount. A2 then writes in place because the refcount is already 1. All prompt blocks except the last remain shared — particularly valuable for long prompts.
+
+**Beam search.** Translation and similar tasks keep the top-$k$ candidates at every step. Unlike parallel sampling, candidates share not only the prompt but later blocks, and the sharing tree changes as beams die and spawn, analogous to a process tree of `fork`s.
+
+<div align="center">
+![Figure 9: Beam search block sharing](/figures/vllm-figure9.png)
+</div>
+
+Figure 9 ($k = 4$) is a snapshot. All beams share block 0 (the prompt). Candidate 3 diverges at block 2; candidates 0–2 share the first three blocks and split at the fourth. After the dotted line, the new top-4 all descend from candidates 1 and 2. Blocks of the dropped beams have refcount 0 and are freed (2, 4, 5, 8); new physical blocks 9–12 hold the fresh tokens. Previous systems would memcpy large KV prefixes between beams; vLLM copies at most one block, and only on write into a still-shared page.
+
+**Shared prefix.** A system prompt or few-shot template is prepended to many user inputs. vLLM pins the prefix's physical blocks (as an OS pins a shared library) and maps new requests onto them, copy-on-write on the last prefix block. Prefill then runs only on the user suffix.
+
+<div align="center">
+![Figure 10: Shared prefix for few-shot translation](/figures/vllm-figure10.png)
+</div>
+
+**Mixed decoding.** Parallel samples, beams, and ordinary completions can sit in the same batch. The model and the PagedAttention kernel see only a list of physical block IDs per sequence; sharing is entirely in the translation layer. That is what lets vLLM batch requests that existing engines would isolate.
+
+### Scheduling and Preemption
+
+vLLM schedules **FCFS**: earlier arrivals run first, later arrivals are the first to be preempted. All blocks of a sequence are touched together, so eviction is **all-or-nothing**. Sequences that share memory (the beams of one request) are a **sequence group** and are gang-scheduled.
+
+When physical blocks run out, two recovery methods apply.
+
+* **Swapping** copies evicted blocks to CPU RAM, managed by a second allocator. Once a sequence is swapped, vLLM stops admitting new requests until every preempted sequence finishes. Swap space is bounded by the GPU KV pool: at most as many CPU blocks as GPU blocks.
+* **Recomputation** discards the cache and, on reschedule, concatenates already generated tokens with the original prompt and prefills in one shot. That prefill is much cheaper than the original decode.
+
+### Distributed Execution
+
+Models larger than one GPU use Megatron-style **tensor model parallelism**: Linear layers are column/row-sharded, attention is sharded on heads, and workers all-reduce intermediates. Every shard still sees the *same* token positions, so it needs KV cache for those positions. vLLM therefore keeps **one** KV manager in the scheduler. All workers share the logical-to-physical map; each worker stores only its heads' slice of each physical block.
+
+A step is: the scheduler broadcasts token IDs and block tables; workers run the model, reading cache by those IDs and all-reducing without further scheduler involvement; sampled tokens return to the scheduler. Memory management is synchronized once per iteration, with the step inputs.
+
+---
+
+## Implementation
+
+vLLM is an end-to-end server: a FastAPI frontend that extends the OpenAI API (per-request `max` length, beam width $k$, and other sampling knobs) and a GPU engine of about 8.5K lines of Python plus 2K lines of C++/CUDA. The scheduler and block manager are Python; PagedAttention and related kernels are custom CUDA. GPT, OPT, and LLaMA run on PyTorch; NCCL carries tensor-parallel traffic.
+
+### Kernel-Level Optimization
+
+PagedAttention's access pattern is not what vendor libraries expect, so three fused kernels matter.
+
+1. **Fused reshape and block write.** Each layer splits new KV into blocks, reshapes them for block-friendly reads, and stores them at block-table offsets — one launch instead of several.
+2. **Fused block read and attention.** A FasterTransformer attention kernel is adapted to walk the block table, with one warp per block for coalescing, and with support for mixed sequence lengths in a batch.
+3. **Fused block copy.** Copy-on-write would otherwise issue many tiny `cudaMemcpyAsync`s on discontinuous blocks; one kernel batches them.
+
+### Supporting Various Decoding Algorithms
+
+Three primitives implement the algorithms above: `fork` (new sequence from an existing one), `append` (one new token), and `free` (drop a sequence). Parallel sampling is fork-from-prompt then append/free; beam search and prefix sharing use the same three. The claim is that future decoders can be assembled the same way.
