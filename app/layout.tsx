@@ -5,7 +5,7 @@ import Footer from "../components/Footer";
 
 export const metadata = {
   title: "Jiahe Yan | Personal Site",
-  description: "Software engineer writing about databases, systems, and various things.",
+  description: "Software engineer writing about databases, distributed systems, and agentic systems.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

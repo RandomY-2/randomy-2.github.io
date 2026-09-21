@@ -1,0 +1,135 @@
+---
+slug: sglang-structured-generation
+title: "SGLang: Efficient Execution of Structured Language Model Programs"
+date: "2026-09-20"
+description: "SGLang is a frontend language and co-designed runtime for multi-call LM programs: RadixAttention reuses KV cache across shared prefixes, a compressed FSM decodes structured output in multi-token jumps, and API speculative execution cuts black-box call cost — up to 6.4× higher throughput than vLLM, Guidance, and LMQL."
+tags: [sglang, radixattention, llm-serving, kv-cache, constrained-decoding, fsm, json-decoding, prompting, agents, vllm, multimodal, gpu]
+category: [system-papers, ai]
+---
+
+## Introduction
+
+LLM applications have moved past single-shot chat. Agents, tool use, few-shot prompting, self-consistency, skeleton-of-thought, and tree-of-thought all schedule **multiple, often dependent generation calls**, with control flow and structured inputs and outputs. The paper calls these language model programs (LM programs). They have two recurring properties:
+* LM programs typically contain multiple LLM calls interspersed with control flow. This is needed to complete complex tasks and improve overall quality.
+* LM programs receive structured inputs and produce structured outputs. This is needed to enable the composition of LM programs and to integrate LM programs into existing software systems
+
+Despite their widespread use, current systems for expressing and executing LM programs remain inefficient, for two reasons.
+
+* **Programming is tedious due to the non-deterministic nature of LLMs.** LLMs are non-deterministic, so even a simple program tends to become a tangle of string assembly, prompt tuning, brittle output parsing, multimodal inputs, and ad-hoc parallelism.
+* **Execution is inefficient due to redundant computation and memory usage.** Engines such as vLLM, TGI, and TensorRT-LLM optimize latency and throughput without knowledge of the workload. That generality is robust, but it leaves redundant computation and memory on the table for any given program.
+  * **KV cache reuse.** During typical batch executions of LM programs, numerous opportunities exist to reuse the KV cache across multiple different LLM calls that share a common prefix. Current systems still drop a request's cache when it finishes, so those prefixes are recomputed.
+  * **Constrained decoding.** Structured outputs (JSON mode, a regex grammar) allow multiple tokens to be decoded once following the specific grammatical rule. Existing systems still mask the next-token distribution and decode one token per forward pass.
+
+<div align="center">
+![Figure 1: SGLang frontend, interpreter, and runtime](/figures/sglang-figure1.png)
+</div>
+
+**SGLang** (Structured Generation Language) exploits the multi-call structure in LM programs for efficient execution. SGLang includes a Python-embedded frontend exposes generation and parallelism primitives and a backend runtime accelerates them. The two can be used independently, but they are co-designed (Figure 1).
+
+The frontend is a domain-specific language embedded in Python. It provides generation primitives (`extend`, `gen`, `select`) and parallelism primitives (`fork`, `join`). Because they compose with ordinary Python control flow and libraries, users can write prompting workflows in native Python rather than a custom syntax. An interpreter manages the prompt state as a stream and submits primitive operations to the stream for asynchronous execution while ensuring synchronization and intra-program parallelism. A compiler can also trace a program into a graph and apply further optimizations.
+
+On the runtime, three optimizations accelerate SGLang programs.
+
+* **RadixAttention** enables automatic KV-cache reuse across generation calls. Existing engines discard a request's cache when it finishes, so a later call that shares a prefix must recompute it. SGLang instead keeps an LRU cache of KV tensors in a **radix tree**: matching, insertion, and eviction are tree operations, and a cache-aware scheduler exploits the reuse patterns that tree exposes.
+* A **compressed finite state machine** speeds constrained decoding for structured outputs. Existing systems mask the probabilities of illegal next tokens, so they decode one token per forward pass. SGLang analyzes the constraint, compresses a uniquely determined multi-token path into a single edge, and emits those tokens in one step.
+* **API speculative execution** optimizes multi-call programs for API-only models.
+
+---
+
+## Programming Model
+
+SGLang is a domain-specific language embedded in Python. The programming model is meant to replace the string manipulation, API boilerplate, constraint wiring, and parallelism that multi-call workflows otherwise require by hand.
+
+### A Running Example
+
+<div align="center">
+![Figure 2: Multi-dimensional essay judge in SGLang](/figures/sglang-figure2.png)
+</div>
+
+Figure 2 is a branch-solve-merge judge for an essay about an image. The prompt state `s` is a stream: `+=` appends strings and primitives. `select` decides whether the essay is related to the image; on `"no"` the function returns. Otherwise `fork` makes one copy of the state per evaluation dimension, each calling `gen` in parallel. Judgments are joined, a summary and letter grade are generated, and a regex forces the last `gen` into JSON. An equivalent OpenAI-style program is about $2.1\times$ as many lines, mostly for manual string handling and parallelism.
+
+### Execution Modes
+
+The simplest way to run an SGLang program is an **interpreter**. A prompt is an asynchronous stream. Primitives such as `extend`, `gen`, and `select` are submitted to that stream without waiting: the calls are non-blocking, so Python continues while generation is still in flight — the same pattern as launching CUDA kernels asynchronously. Each prompt has a stream executor on a background thread, which is what enables intra-program parallelism. Fetching a generation result blocks until it is ready to ensure correct synchronization.
+
+Alternatively, a program can be **traced and compiled** into a computational graph and run by a graph executor, which opens further static optimizations. Backends are the native SGLang Runtime (SRT) for open-weight models, and OpenAI / Anthropic APIs.
+
+---
+
+## Efficient KV Cache Reuse with RadixAttention
+
+SGLang programs chain generation calls and `fork` parallel copies of prompt state. Distinct program instances also share common prefixes (system prompts, few-shot examples). Those two facts create many **shared prompt prefixes** at runtime, and therefore many chances to reuse the KV cache.
+
+The KV cache stores intermediate tensors from the forward pass and is reused when decoding later tokens; the name comes from the key and value tensors in self-attention. Its contents depend only on the prefix. Requests that share a prefix can therefore share those tensors, saving both compute and memory. Typical patterns are few-shot example blocks, a shared question with several self-consistency samples, multi-turn chat history, and tree-of-thought search history (Figure 9).
+
+<div align="center">
+![Figure 9: KV cache sharing patterns](/figures/sglang-figure9.png)
+</div>
+
+The challenge is to reuse that cache across calls and across instances. **RadixAttention** does this reuse automatically at runtime. Instead of discarding the cache when a request finishes, the system retains KV tensors for both prompts and generated tokens in a radix tree, and uses that tree for prefix search, reuse, insertion, and eviction. An LRU eviction policy and a cache-aware scheduler raise the hit rate. The design is compatible with continuous batching, PagedAttention, and tensor parallelism, and adds only negligible memory and time overhead when there is no hit.
+
+### RadixAttention
+
+A radix tree is a space-efficient trie. Unlike a classical prefix tree, its edges may be labeled with **sequences of tokens of varying length**, not only single tokens. The tree maps each token sequence to the corresponding KV tensors. Those tensors live in a non-contiguous, paged pool whose page size is one token.
+
+GPU memory fills quickly, so eviction is a simple **LRU, leaves first**: the least recently used leaf is dropped. Ancestors remain reusable until they themselves become leaves and are evicted. Under continuous batching, a node in the current batch cannot be dropped. Each node therefore carries a **reference count** of running requests; it is evictable only when that count is zero.
+
+There is no pre-allocated, fixed-size cache pool. Cached tokens and currently running requests share one memory pool, allocated dynamically. When enough requests are waiting, the system evicts cached tokens in favor of a larger batch.
+
+Figure 3 walks through nine snapshots of the tree. Green nodes are newly inserted, blue are hits, red are evicted.
+
+<div align="center">
+![Figure 3: RadixAttention operations with an LRU eviction policy across nine time points](/figures/sglang-figure3.png)
+</div>
+
+1. The tree is empty.
+2. A first chat turn (`You are a helpful assistant` / `Hello` / `Hi`) is inserted as one edge.
+3. The next turn hits that prefix; only the new tokens are inserted.
+4. A second session shares the system prompt, so node `b` splits.
+5. Memory pressure evicts the first session's latest leaf; the second session continues.
+6. A few-shot query shares nothing with the chats, so the root splits.
+7. Further few-shot queries share the examples; node `e` splits.
+8. The first chat resumes; the second session (`g`, `h`) is LRU-evicted.
+9. Self-consistency samples more answers for the few-shot questions; unrelated leaves go.
+
+The frontend interpreter sends full prompts; the runtime matches prefixes and reuses what it finds. The tree itself lives on the CPU with negligible maintenance overhead. On `fork`, the frontend sends the prefix first as a hint, then the remainder of the prompt, so the prefix is inserted into the tree and matched correctly. That hint is an instance of frontend–runtime co-design: it simplifies scheduling and matching at the runtime.
+
+### Cache-Aware Scheduling
+
+Cache hit rate is $\frac{\text{cached prompt tokens}}{\text{prompt tokens}}$. When the waiting queue is long, order determines that rate. Switching among unrelated requests thrashes the tree. In the batch setting, SGLang therefore sorts the queue by matched prefix length and runs **longest-shared-prefix-first** rather than first-come, first-served. In more latency-sensitive settings, limited reordering can still be tolerated to improve reuse.
+
+**Theorem 3.1.** For a batch of requests, we can achieve an optimal cache hit rate by visiting the radix tree of the requests in the depth-first search order, with a cache size $\geq$ the maximum request length. The longest-shared-prefix-first order is equivalent to a depth-first search order.
+
+In the online case, arrivals disrupt DFS, but the same schedule still approximates DFS on the newly added part of the tree. Unknown output lengths can still force recomputation that the theorem treats as cached.
+
+### Distributed Cases
+
+RadixAttention extends to multiple GPUs. Under **tensor parallelism**, each GPU holds a sharded KV cache. Tree operations are identical on every shard, so no extra synchronization is required. Under **data parallelism**, each worker keeps its own subtree and a router maintains a meta-tree of which device holds which prefix; dispatch prefers affinity so that shared prefixes land on the same worker.
+
+---
+
+## Efficient Constrained Decoding with Compressed Finite State Machine
+
+In LM programs, users often want to constrain the model's output to follow specific formats, such as JSON schemas. This can improve controllability and robustness, and make the output easier to parse. SGLang offers a `regex` argument to enforce such constraints using regular expressions, which are expressive enough for many practical scenarios.
+
+Existing systems support this by converting a regular expression into a finite state machine (FSM). During decoding, they maintain the current FSM state, retrieve allowed tokens from the next states, and set the probability of invalid tokens to zero, decoding token by token. This token-by-token approach is inefficient when there are opportunities to decode multiple tokens at once. For example, the constant sequence {'{"summary": "'} in Figure 2 spans multiple tokens in the normal decoding process (Figure 4c), requiring multiple decoding stages even though there is only one valid next token when decoding it. The whole sequence can therefore be decoded in a single step (one forward pass). Existing systems cannot, because the FSM and the model runner are not integrated for multi-token processing.
+
+<div align="center">
+![Figure 4: Normal versus compressed FSM decoding](/figures/sglang-figure4.png)
+</div>
+
+SGLang overcomes this limitation with a fast constrained-decoding runtime built on a **compressed FSM**. The runtime analyzes the FSM and compresses adjacent singular-transition edges into single edges (Figure 4b), so it can recognize when multiple tokens can be decoded together. In Figure 4d, multiple tokens on a compressed transition edge are decoded in one forward pass. The construction is general and applies to all regular expressions.
+
+---
+
+## Efficient Endpoint Calling with API Speculative Execution
+
+The previous sections introduced optimizations for open-weight models, which require modifications to the model inference process. SGLang also works with API-access-only models, such as OpenAI's GPT-4. For these models, the system can only call a black-box API endpoint.
+
+This section introduces an optimization for black-box API models that accelerates execution and reduces the API cost of multi-call SGLang programs using **speculative execution**. For example, a program may ask the model to generate a description of a character with a multi-call pattern:
+
+```text
+s += context + "name:" + gen("name", stop="\n") + "job:" + gen("job", stop="\n")
+```
+
+Naively, the two `gen` primitives correspond to two API calls, so the user pays the input-token fee on `context` twice. SGLang can enable **speculative execution** on the first call and let it continue generating a few more tokens by ignoring the stop condition. The interpreter keeps the additional outputs and matches and reuses them with later primitives. In certain cases, with careful prompt engineering, the model can correctly match the template with high accuracy, saving the latency and input cost of one API call.
