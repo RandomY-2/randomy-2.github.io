@@ -173,12 +173,13 @@ export default function HomePage() {
             .
           </p>
           <p>
-            I build databases, distributed systems, and agentic systems. I am
-            particularly interested in making AI agents more capable and
-            trustworthy through semantic context, well-scoped capabilities,
-            least-privilege access, auditability, and runtime guardrails. I
-            also work on secure and robust systems, including adversarial AI,
-            data governance, and infrastructure for privacy-preserving computation.
+            I build data systems, distributed systems, and AI infrastructure
+            for capable and trustworthy agents over data. I&apos;m particularly
+            interested in how agents can reason and act over real-world systems
+            while preserving security, privacy, reliability, and
+            accountability—from semantic context and least-privilege
+            capabilities to runtime guardrails, auditability, and
+            privacy-preserving execution.
           </p>
           <Link href="/blog" className="text-primary underline">
             Read the blog →
