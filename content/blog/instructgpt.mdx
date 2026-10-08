@@ -1,0 +1,345 @@
+---
+slug: instructgpt
+title: "InstructGPT: Training Language Models to Follow Instructions with Human Feedback"
+date: "2026-09-01"
+description: "Fine-tuning GPT-3 with human demonstrations and preference rankings — supervised fine-tuning, then a reward model, then PPO — produces InstructGPT. A 1.3B InstructGPT is preferred to 175B GPT-3 on the API prompt distribution, with gains in truthfulness, lower toxicity when asked to be respectful, and only modest regressions on public NLP benchmarks when pretraining updates are mixed into RL."
+tags: [instructgpt, rlhf, alignment, ppo, reward-model, gpt-3, openai, human-feedback, instruction-following, sft]
+category: ai
+---
+
+## Introduction
+
+Making language models bigger does not inherently make them better at following a user's intent. Large LMs generate outputs that are untruthful, toxic, or simply not helpful. In other words, these models are not aligned with their users. The language modeling objective used for GPT-3 and similar models — predicting the next token on a webpage from the internet — is different from the objective "follow the user's instructions helpfully and safely." Averting these unintended behaviors is especially important for language models that are deployed and used in hundreds of applications.
+
+Alignment here means acting in accordance with the user's intention (Leike et al., 2018). That encompasses explicit intentions such as following instructions, and implicit intentions such as staying truthful and not being biased, toxic, or otherwise harmful. Using the language of Askell et al. (2021), language models should be **helpful** (they should help the user solve their task), **honest** (they shouldn't fabricate information or mislead the user), and **harmless** (they should not cause physical, psychological, or social harm). Honesty is not directly measurable in a black-box generative model, so truthfulness — whether the model's statements about the world are true — is used as a proxy.
+
+The approach is to fine-tune GPT-3 with reinforcement learning from human feedback (RLHF; Christiano et al., 2017; Stiennon et al., 2020) to follow a broad class of written instructions. Starting from a set of labeler-written prompts and prompts submitted through the OpenAI API, labeler demonstrations of the desired behavior are collected and used to fine-tune GPT-3 with supervised learning. Rankings of model outputs are then collected and used to further fine-tune this supervised model with PPO. The resulting models are **InstructGPT**, trained at 1.3B, 6B, and 175B parameters. Unless otherwise specified, InstructGPT refers to the PPO-ptx models, which mix pretraining gradients into the RL update.
+
+Main findings:
+
+* **Labelers significantly prefer InstructGPT outputs over outputs from GPT-3.** On the API prompt test set, outputs from the 1.3B InstructGPT are preferred to outputs from the 175B GPT-3, despite having over 100× fewer parameters. These models have the same architecture and differ only by the fact that InstructGPT is fine-tuned on human data. 175B InstructGPT outputs are preferred to 175B GPT-3 outputs $85 \pm 3\%$ of the time, and preferred $71 \pm 4\%$ of the time to few-shot 175B GPT-3.
+* **InstructGPT models show improvements in truthfulness over GPT-3.** On TruthfulQA, InstructGPT generates truthful and informative answers about twice as often as GPT-3. On closed-domain API tasks, where the output should not contain information absent from the input, InstructGPT makes up information about half as often as GPT-3 (a 21% vs. 41% hallucination rate).
+* **InstructGPT shows small improvements in toxicity over GPT-3, but not bias.** InstructGPT generates about 25% fewer toxic outputs than GPT-3 when prompted to be respectful. It does not significantly improve over GPT-3 on Winogender or CrowS-Pairs.
+* **Performance regressions on public NLP datasets can be minimized by modifying the RLHF procedure.** PPO fine-tuning regresses on SQuAD, DROP, HellaSwag, and WMT 2015 Fr→En — an **alignment tax**. Mixing PPO updates with updates that increase the log likelihood of the pretraining distribution (PPO-ptx) greatly reduces these regressions without compromising labeler preference scores.
+* **The models generalize to the preferences of held-out labelers** that did not produce any training data, at about the same preference rate as the training labelers.
+* **Public NLP datasets are not reflective of how these language models are used.** GPT-3 fine-tuned on FLAN or T0 performs slightly worse than the SFT baseline on the API prompt distribution, and labelers significantly prefer InstructGPT to both.
+* **InstructGPT shows promising generalization to instructions outside of the RLHF fine-tuning distribution**, including non-English instructions and code, despite these being very rare in the fine-tuning data.
+* **InstructGPT still makes simple mistakes**: failing to follow instructions, making up facts, giving long hedging answers to simple questions, or failing to detect instructions with false premises.
+
+Overall, fine-tuning large language models using human preferences significantly improves their behavior on a wide range of tasks, though much work remains to improve their safety and reliability.
+
+<div align="center">
+![Figure 1: Human preference win rates against the 175B SFT model on the API prompt distribution](/figures/instructgpt-pref.png)
+</div>
+
+---
+
+## Related Work
+
+### Alignment and Learning from Human Feedback
+
+This work builds on techniques for aligning models with human intentions, particularly RLHF. Originally developed for training simple robots in simulated environments and Atari games (Christiano et al., 2017; Ibarz et al., 2018), RLHF has been applied to fine-tuning language models to summarize text (Ziegler et al., 2019; Stiennon et al., 2020; Wu et al., 2021). Similar uses of human feedback as a reward appear in dialogue, translation, semantic parsing, story generation, review generation, and evidence extraction. InstructGPT is a direct application of RLHF to aligning language models on a broad distribution of language tasks.
+
+What it means for language models to be aligned has also received recent attention (Gabriel, 2020). Kenton et al. (2021) catalog behavioral issues that result from misalignment, including producing harmful content and gaming misspecified objectives. Concurrent work by Askell et al. (2021) proposes language assistants as a testbed for alignment research and studies simple baselines and their scaling properties.
+
+### Training Language Models to Follow Instructions
+
+A related line of work studies cross-task generalization: language models are fine-tuned on a broad range of public NLP datasets, usually prefixed with an instruction, and evaluated on a different set of NLP tasks (Mishra et al., 2021; Wei et al., 2021; Sanh et al., 2021). A consistent finding is that fine-tuning on a range of NLP tasks, with instructions, improves downstream performance on held-out tasks in both the zero-shot and few-shot settings. These datasets differ from the API prompt distribution in both task mix and input diversity.
+
+### Evaluating and Mitigating Harms
+
+A goal of modifying language model behavior is to mitigate harms when models are deployed. These risks have been extensively documented: language models can produce biased outputs, leak private data, generate misinformation, and be used maliciously. A growing set of benchmarks evaluates toxicity (RealToxicityPrompts), stereotypes, and social bias (CrowS-Pairs, Winogender). Making significant progress is hard, since well-intentioned interventions can have side effects — for instance, reducing toxicity can reduce the ability to model text from under-represented groups, due to prejudicial correlations in the training data.
+
+Existing methods for changing generation behavior include value-targeted fine-tuning, filtering the pretraining dataset, blocking words or n-grams at generation time, safety-specific control tokens, word-embedding regularization, data augmentation, null-space projection, and steering generation with a second (usually smaller) language model.
+
+---
+
+## Methods and Experimental Details
+
+### High-level Methodology
+
+The methodology follows Ziegler et al. (2019) and Stiennon et al. (2020), who applied it in the stylistic continuation and summarization domains. The starting point is a pretrained language model, a distribution of prompts on which aligned outputs are desired, and a team of trained human labelers. Training then proceeds in three steps:
+
+<div align="center">
+![Figure 2: The three-step InstructGPT method — SFT, reward modeling, and PPO](/figures/instructgpt-method.png)
+</div>
+
+**Step 1: Collect demonstration data, and train a supervised policy.** Labelers provide demonstrations of the desired behavior on the input prompt distribution. A pretrained GPT-3 is then fine-tuned on this data using supervised learning.
+
+**Step 2: Collect comparison data, and train a reward model.** Labelers indicate which output they prefer for a given input, among several model completions. A reward model is trained to predict the human-preferred output.
+
+**Step 3: Optimize a policy against the reward model using PPO.** The RM output is used as a scalar reward. The supervised policy is fine-tuned to optimize this reward using PPO (Schulman et al., 2017).
+
+Steps 2 and 3 can be iterated continuously: more comparison data is collected on the current best policy, which is used to train a new RM and then a new policy. In practice, most comparison data comes from supervised policies, with some coming from PPO policies.
+
+### Dataset
+
+The prompt dataset consists primarily of text prompts submitted to the OpenAI API — specifically those using an earlier SFT-only version of InstructGPT on the Playground interface. Production API traffic is not used. Prompts that share a long common prefix are heuristically deduplicated, and the number of prompts is limited to 200 per user ID. Train, validation, and test splits are created by user ID, so the validation and test sets contain no data from users whose data is in the training set. Training prompts are filtered for personally identifiable information.
+
+To train the first InstructGPT models, labelers wrote prompts themselves. Instruction-like prompts were rare among those submitted to regular GPT-3 models on the API. Labelers wrote three kinds of prompts:
+
+* **Plain.** An arbitrary task, with sufficient diversity.
+* **Few-shot.** An instruction plus multiple query/response pairs for that instruction.
+* **User-based.** Prompts corresponding to use cases stated in waitlist applications to the OpenAI API.
+
+From these prompts, three datasets are produced:
+
+| Dataset | Training prompts | Sources |
+| --- | --- | --- |
+| SFT | ~13k | 11,295 labeler-written, 1,430 customer |
+| RM | ~33k | 6,623 labeler-written, 26,584 customer |
+| PPO | ~31k | customer only |
+
+SFT contains many more labeler-written than customer prompts because an early interface asked for a template instruction plus few-shot exemplars, which were then unpacked into multiple supervised examples. For the RM, each prompt has $K \in [4, 9]$ ranked completions, and the model is trained on all $\binom{K}{2}$ pairs, so the number of ranked pairs is an order of magnitude larger than the number of prompts.
+
+Most API use-cases are generative rather than classification or QA. The category breakdown on the RM set:
+
+| Use-case | Share |
+| --- | --- |
+| Generation | 45.6% |
+| Open QA | 12.4% |
+| Brainstorming | 11.2% |
+| Chat | 8.4% |
+| Rewrite | 6.6% |
+| Summarization | 4.2% |
+| Classification | 3.5% |
+| Other | 3.5% |
+| Closed QA | 2.6% |
+| Extract | 1.9% |
+
+The dataset is over 96% English. Classification and QA together are about 18% of traffic; open-ended generation and brainstorming are about 57%.
+
+### Tasks
+
+Training tasks come from labeler-written prompts and prompts submitted to early InstructGPT models on the API. They include generation, question answering, dialog, summarization, extraction, and other natural language tasks.
+
+For each prompt, the task is most often specified directly through a natural language instruction (e.g. "Write a story about a wise frog"), but can also be specified indirectly through few-shot examples or implicit continuation. Labelers infer the intent of the user who wrote the prompt, and skip inputs where the task is very unclear. They also take into account implicit intentions such as truthfulness and potentially harmful outputs, guided by written instructions and their judgment.
+
+### Human Data Collection
+
+Demonstration data, comparison data, and the main evaluations are produced by a team of about 40 contractors hired on Upwork and through ScaleAI. Compared to earlier preference collection on summarization, the inputs span a much broader range of tasks and can occasionally include controversial and sensitive topics. Labelers were selected for sensitivity to the preferences of different demographic groups and for identifying outputs that were potentially harmful, using a screening test. A separate set of labelers, sourced from the same vendors but without a screening test, produces no training data and is used to test generalization.
+
+Alignment criteria can conflict — for example, when a user requests a potentially harmful response. During training, helpfulness to the user is prioritized. In final evaluations, labelers prioritize truthfulness and harmlessness.
+
+Despite the complexity of the task, inter-annotator agreement is high: training labelers agree $72.6 \pm 1.5\%$ of the time, and held-out labelers agree $77.3 \pm 1.3\%$ of the time. For comparison, researcher–researcher agreement in Stiennon et al. (2020) was $73 \pm 4\%$.
+
+### Models
+
+Training starts from the GPT-3 pretrained language models (Brown et al., 2020). These models are trained on a broad distribution of Internet data and are adaptable to a wide range of downstream tasks, but have poorly characterized behavior. All models use the GPT-3 architecture, a 2k-token context, the GPT-3 BPE vocabulary, fp16 weights and activations with fp32 master copies, and Adam ($\beta_1 = 0.9$, $\beta_2 = 0.95$). Prompts longer than 1k tokens are filtered; responses are limited to 1k tokens.
+
+**Supervised fine-tuning (SFT).** GPT-3 is fine-tuned on labeler demonstrations for 16 epochs, with a cosine learning rate decay to 10% of the peak and residual dropout of 0.2. Learning rates are $9.65 \times 10^{-6}$ (1.3B and 6B; batch 32) and $5.03 \times 10^{-6}$ (175B; batch 8). Final SFT model selection is based on RM score on the validation set. SFT models overfit on validation loss after 1 epoch; training for more epochs nonetheless helps both RM score and human preference ratings.
+
+**Reward modeling (RM).** Starting from a model with the final unembedding layer removed, the RM takes a prompt and response and outputs a scalar reward. Only 6B RMs are used: this saves compute, and 175B RM training can be unstable, making those models less suitable as value functions during RL. The RM used for all PPO runs was initialized from a 6B GPT-3 fine-tuned on public NLP datasets; initializing from GPT-3 or from SFT gives similar results.
+
+In Stiennon et al. (2020), the RM is trained on comparisons between two outputs on the same input, with a cross-entropy loss: the difference in rewards represents the log odds that one response will be preferred to the other. To speed up comparison collection, labelers rank $K = 4$ to $K = 9$ responses. This produces $\binom{K}{2}$ comparisons per prompt. Because comparisons within a labeling task are highly correlated, shuffling them into one dataset and making a single pass causes the RM to overfit — each completion is reused for $K-1$ gradient updates. Instead, all $\binom{K}{2}$ comparisons from each prompt are trained as a single batch element. This requires only one forward pass per completion rather than $\binom{K}{2}$, no longer overfits, and improves validation accuracy and log loss.
+
+The loss is:
+
+$$
+\mathcal{L}(\theta) = -\frac{1}{\binom{K}{2}} \mathbb{E}_{(x, y_w, y_l) \sim D} \Big[ \log \sigma \big( r_\theta(x, y_w) - r_\theta(x, y_l) \big) \Big]
+$$
+
+where $r_\theta(x, y)$ is the scalar output of the reward model for prompt $x$ and completion $y$, $y_w$ is the preferred completion out of the pair $(y_w, y_l)$, and $D$ is the dataset of human comparisons. Because the RM loss is invariant to shifts in reward, the reward model is normalized with a bias so that labeler demonstrations achieve a mean score of 0 before RL. The final 6B RM is trained for a single epoch at learning rate $9 \times 10^{-6}$ and batch size 64 prompts; a second epoch overfits.
+
+**Reinforcement learning (RL).** Following Stiennon et al. (2020), the SFT model is fine-tuned with PPO. The environment is a bandit: it presents a random customer prompt, expects a response, produces a reward determined by the reward model, and ends the episode. A per-token KL penalty from the SFT model is added at each token to mitigate over-optimization of the reward model. The value function is initialized from the RM. These models are called **PPO**.
+
+Mixing pretraining gradients into the PPO gradients fixes performance regressions on public NLP datasets. These models are called **PPO-ptx**. The combined objective is:
+
+$$
+\begin{aligned}
+\operatorname{objective}(\phi)
+&= \mathbb{E}_{(x,y) \sim D_{\pi_\phi^{\mathrm{RL}}}}
+\Big[ r_\theta(x,y) - \beta \log \frac{\pi_\phi^{\mathrm{RL}}(y \mid x)}{\pi^{\mathrm{SFT}}(y \mid x)} \Big] \\
+&\quad + \gamma \, \mathbb{E}_{x \sim D_{\mathrm{pretrain}}} \big[ \log \pi_\phi^{\mathrm{RL}}(x) \big]
+\end{aligned}
+$$
+
+where $\pi_\phi^{\mathrm{RL}}$ is the learned RL policy, $\pi^{\mathrm{SFT}}$ is the supervised trained model, and $D_{\mathrm{pretrain}}$ is the pretraining distribution. The KL reward coefficient $\beta$ and the pretraining loss coefficient $\gamma$ control the strength of the KL penalty and pretraining gradients. For PPO models, $\gamma = 0$. The runs use $\beta = 0.02$ and, for PPO-ptx, $\gamma = 27.8$ with eight times as many pretraining tokens as RL episodes. Policies train for 256k episodes (~31k unique prompts), batch size 512, minibatch 64, one inner PPO epoch, clip ratio 0.2, and sampling temperature 1. A single 6B RM and 6B value function are shared across all policy sizes.
+
+**Baselines.** PPO models are compared to SFT models and GPT-3, and to GPT-3 provided with a few-shot prefix that prompts it into an instruction-following mode (GPT-3-prompted). This prefix is prepended to the user-specified instruction and was selected as the prefix that attained the highest RM score on the prompt validation set.
+
+InstructGPT is also compared to 175B GPT-3 fine-tuned on FLAN and on T0++ (subsampled to 1 million examples so that the two datasets are comparable). Checkpoints are chosen by 6B RM score on the validation set.
+
+### Evaluation
+
+To evaluate how aligned the models are, alignment needs a working definition. Following Leike et al. (2018), the aim is to train models that act in accordance with user intentions. More practically, the framework is similar to Askell et al. (2021): models are aligned if they are helpful, honest, and harmless.
+
+To be helpful, the model should follow instructions, but also infer intention from a few-shot prompt or another interpretable pattern such as a question–answer template. Since a given prompt's intention can be unclear, judgment from labelers is used, and the main metric is labeler preference ratings. Labelers are not the users who generated the prompts, so there can be a divergence between what a user intended and what the labeler inferred from the prompt alone.
+
+It is unclear how to measure honesty in purely generative models: that would require comparing the model's output to its "belief" about the correct output. Instead, truthfulness is measured in two ways: (1) the tendency to make up information on closed-domain tasks ("hallucinations"), and (2) the TruthfulQA dataset. This captures only a small part of what is meant by truthfulness.
+
+Measuring harm is similarly difficult. In most cases, harms depend on how outputs are used. A model generating toxic outputs could be harmful as a deployed chatbot, but helpful if used for data augmentation to train a toxicity detector. An earlier "potentially harmful" label was discontinued because it required too much speculation about downstream use.
+
+A suite of more specific proxy criteria is used instead: whether an output is inappropriate in the context of a customer assistant, denigrates a protected class, or contains sexual or violent content. Models are also benchmarked on RealToxicityPrompts and CrowS-Pairs.
+
+Evaluations divide into two parts.
+
+**Evaluations on the API distribution.** The main metric is human preference ratings on a held-out set of prompts from the same source as the training distribution, using only customers not included in training. Because the training prompts are designed to be used with InstructGPT models, they likely disadvantage the GPT-3 baselines. The same comparison is therefore also run on prompts submitted to GPT-3 models on the API. For each model, the frequency with which its outputs are preferred to a baseline policy is computed; the 175B SFT model is the baseline, since its performance is near the middle of the pack. Labelers also judge overall quality on a 1–7 Likert scale and collect metadata for each output.
+
+**Evaluations on public NLP datasets.** These include datasets that capture an aspect of language model safety — truthfulness, toxicity, and bias — and datasets that capture zero-shot performance on traditional NLP tasks such as question answering, reading comprehension, and summarization. Toxicity on RealToxicityPrompts is also evaluated by humans.
+
+---
+
+## Results
+
+### Results on the API Distribution
+
+**Labelers significantly prefer InstructGPT outputs over outputs from GPT-3.**
+
+On the test set of prompts, labelers significantly prefer InstructGPT outputs across model sizes (Figure 1). GPT-3 outputs perform the worst. Significant step-size improvements come from using a well-crafted few-shot prompt (GPT-3 prompted), then from training on demonstrations using supervised learning (SFT), and finally from training on comparison data using PPO. Adding updates on the pretraining mix during PPO does not lead to large changes in labeler preference. When compared directly, 175B InstructGPT outputs are preferred to GPT-3 outputs $85 \pm 3\%$ of the time, and preferred $71 \pm 4\%$ of the time to few-shot GPT-3.
+
+Results do not change significantly when evaluated on prompts submitted to GPT-3 models on the API (Figure 3), though PPO-ptx models perform slightly worse at larger model sizes.
+
+<div align="center">
+![Figure 3: Preference win rates on GPT-3 vs. InstructGPT prompt distributions, for training and held-out labelers](/figures/instructgpt-pref-facetted.png)
+</div>
+
+Labelers also rate InstructGPT outputs favorably along several more concrete axes (Figure 4). Compared to GPT-3, InstructGPT outputs are more appropriate in the context of a customer assistant, more often follow explicit constraints in the instruction (e.g. "Write your answer in 2 paragraphs or less."), are less likely to fail to follow the correct instruction entirely, and make up facts less often on closed-domain tasks. This suggests that InstructGPT models are more reliable and easier to control than GPT-3. Other metadata categories occur too infrequently in the API data to obtain statistically significant differences.
+
+<div align="center">
+![Figure 4: Labeler metadata on the API distribution, collapsed across model sizes](/figures/instructgpt-metadata.png)
+</div>
+
+**The models generalize to the preferences of held-out labelers that did not produce any training data.**
+
+Held-out labelers have similar ranking preferences to workers who produced the training data (Figure 3). In particular, all InstructGPT models still greatly outperform the GPT-3 baselines according to held-out workers. InstructGPT is not simply overfitting to the preferences of the training labelers.
+
+Further evidence comes from the reward models. Splitting labelers into 5 groups and training 5 RMs with 5-fold cross-validation yields $69.6 \pm 0.9\%$ accuracy on the held-out group, a small decrease from $72.4 \pm 0.4\%$ accuracy on the training set.
+
+**Public NLP datasets are not reflective of how these language models are used.**
+
+InstructGPT is also compared to 175B GPT-3 fine-tuned on FLAN and T0 (Figure 5). These models perform better than GPT-3, on par with GPT-3 with a well-chosen prompt, and worse than the SFT baseline. In a head-to-head comparison, 175B InstructGPT outputs were preferred over the FLAN model $78 \pm 4\%$ of the time and over the T0 model $79 \pm 4\%$ of the time.
+
+<div align="center">
+![Figure 5: Likert scores on the InstructGPT prompt distribution, including FLAN and T0 baselines](/figures/instructgpt-flan-t0.png)
+</div>
+
+InstructGPT outperforms FLAN and T0 for two reasons. First, public NLP datasets are designed to capture tasks that are easy to evaluate with automatic metrics — classification, question answering, and to a certain extent summarization and translation. Classification and QA are only a small part (about 18%) of what API customers use language models for, whereas open-ended generation and brainstorming consist of about 57% of the prompt dataset. Second, it is difficult for public NLP datasets to obtain a very high diversity of inputs of the kind real-world users actually submit. Tasks found in NLP datasets do represent a kind of instruction that language models should solve, so the broadest instruction-following model would combine both types of datasets.
+
+### Results on Public NLP Datasets
+
+**InstructGPT models show improvements in truthfulness over GPT-3.**
+
+As measured by human evaluations on TruthfulQA, PPO models show small but significant improvements in generating truthful and informative outputs compared to GPT-3 (Figure 6). This behavior is the default: the models do not have to be specifically instructed to tell the truth. The exception is the 1.3B PPO-ptx model, which performs slightly worse than a GPT-3 model of the same size. When evaluated only on prompts that were not adversarially selected against GPT-3, PPO models are still significantly more truthful and informative, though the absolute improvement decreases by a couple of percentage points.
+
+<div align="center">
+![Figure 6: TruthfulQA — gray bars are truthfulness, colored bars are truthful and informative](/figures/instructgpt-truthfulqa.png)
+</div>
+
+Following Lin et al. (2021), a helpful "Instruction+QA" prompt instructs the model to respond with "I have no comment" when it is not certain of the correct answer. In this case, PPO models err on the side of being truthful and uninformative rather than confidently saying a falsehood; the GPT-3 baselines are not as good at this.
+
+Improvements in truthfulness are also evidenced by the fact that PPO models hallucinate less often on closed-domain tasks from the API distribution (Figure 4).
+
+**InstructGPT shows small improvements in toxicity over GPT-3, but not bias.**
+
+On RealToxicityPrompts, model samples are scored automatically with the Perspective API and also sent to labelers for ratings on absolute toxicity, toxicity relative to the prompt, continuity, and overall preference. Prompts are sampled uniformly according to prompt toxicity to better assess performance with high input toxicity; this differs from the standard sampling, so absolute toxicity numbers are inflated.
+
+When instructed to produce a safe and respectful output, InstructGPT models generate less toxic outputs than GPT-3 according to the Perspective API (Figure 7). This advantage disappears when the respectful prompt is removed. When explicitly prompted to produce a toxic output, InstructGPT outputs are much more toxic than those from GPT-3.
+
+<div align="center">
+![Figure 7: Human and Perspective API toxicity on RealToxicityPrompts, with and without a respectful prompt](/figures/instructgpt-toxicity.png)
+</div>
+
+Human evaluations confirm the same pattern: InstructGPT is less toxic than GPT-3 in the "respectful prompt" setting, but performs similarly in the "no prompt" setting. All models are rated as less toxic than expected given the prompt. The SFT baseline is the least toxic, but also has the lowest continuity and is the least preferred, which could indicate that it generates very short or degenerate responses.
+
+To evaluate the propensity to generate biased speech, InstructGPT is evaluated on modified versions of Winogender and CrowS-Pairs. These datasets consist of pairs of sentences that can highlight potential bias. Relative probabilities of producing the sentences in each pair are computed, along with the entropy of the associated binary distributions. Perfectly unbiased models have no preference between the sentences in each pair and therefore have maximum entropy. By this metric, the models are not less biased than GPT-3. PPO-ptx shows similar bias to GPT-3, but when instructed to act respectfully it exhibits lower entropy and thus higher bias. The instructed models are more certain of their outputs regardless of whether those outputs exhibit stereotypical behavior.
+
+**Performance regressions on public NLP datasets can be minimized by modifying the RLHF fine-tuning procedure.**
+
+By default, a PPO model trained on the API distribution suffers an alignment tax: performance on several public NLP datasets decreases. An alignment procedure that avoids an alignment tax is desirable, because a tax incentivizes the use of models that are unaligned but more capable on these tasks.
+
+Adding pretraining updates to PPO fine-tuning (PPO-ptx) mitigates these regressions on all datasets, and even surpasses GPT-3 on HellaSwag. Performance still lags GPT-3 on DROP, SQuADv2, and translation.
+
+Mixing in pretraining updates performs better than the simpler solution of increasing the KL coefficient. There is a value of the pretraining mix coefficient that both reverses the regressions on SQuADv2 and DROP and has minimal reductions in validation reward. Increasing the KL coefficient leads to significant decreases in validation reward and never fully recovers on DROP and SQuAD. Changing the KL model from the PPO initialization to GPT-3 gives similar results.
+
+### Qualitative Results
+
+**InstructGPT models show promising generalization to instructions outside of the RLHF fine-tuning distribution.**
+
+InstructGPT can follow instructions in non-English languages and can perform summarization and question-answering for code. Non-English languages and code form a tiny minority of the fine-tuning data. This suggests that, in some cases, alignment methods can generalize to producing the desired behavior on inputs that humans did not directly supervise.
+
+These behaviors are not tracked quantitatively. Qualitatively, the 175B PPO-ptx model reliably answers questions about code and can follow instructions in other languages, though it often produces an output in English even when the instruction is in another language. GPT-3 can perform these tasks but requires more careful prompting, and rarely follows instructions in these domains.
+
+**InstructGPT still makes simple mistakes.**
+
+The 175B PPO-ptx model can still:
+
+1. **Accept a false premise.** Given an instruction that assumes something false, the model sometimes incorrectly assumes the premise is true and goes along with it.
+2. **Over-hedge.** Given a simple question, the model can say that there is no one answer and give multiple possible answers, even when there is one fairly clear answer from the context. This likely emerges in part because labelers were instructed to reward epistemic humility, so they may tend to reward outputs that hedge, and this is picked up by the reward model.
+3. **Degrade under multiple or LM-hard constraints.** Performance drops when instructions contain multiple explicit constraints (e.g. "list 10 movies made in the 1930s set in France") or constraints that are challenging for language models (e.g. writing a summary in a specified number of sentences).
+
+False-premise failures likely occur because few training prompts assume false premises, and the models do not generalize well to these examples. Both (1) and (2) could be reduced with adversarial data collection.
+
+---
+
+## Discussion
+
+### Implications for Alignment Research
+
+This work is part of a broader research program to align AI systems with human intentions. Even though it focuses on current language model systems, the aim is general and scalable methods that work for future AI systems. The systems here are still fairly limited, but they are among the largest language models and are applied on a wide range of language tasks, including classification, summarization, question answering, creative writing, and dialogue.
+
+The approach is iterative: improving the alignment of current AI systems rather than focusing abstractly on aligning systems that do not yet exist. A disadvantage is that this does not directly confront alignment problems that occur only when aligning superhuman systems. The advantage is a clear empirical feedback loop of what works and what does not. This feedback loop is essential to refine alignment techniques, and it forces the work to keep pace with progress in machine learning. RLHF is also an important building block in several proposals to align superhuman systems. For example, RLHF was a central method in recent work on summarizing books, a task that exhibits some of the difficulties of aligning superhuman AI systems because it is difficult for humans to evaluate directly.
+
+Lessons for alignment research more generally:
+
+1. **The cost of increasing model alignment is modest relative to pretraining.** The cost of collecting the data and the compute for training runs, including experimental runs, is a fraction of what was spent to train GPT-3: training the 175B SFT model requires 4.9 petaflops/s-days and training the 175B PPO-ptx model requires 60 petaflops/s-days, compared to 3,640 petaflops/s-days for GPT-3. At the same time, RLHF is very effective at making language models more helpful to users, more so than a 100× model size increase. Increasing investments in alignment of existing language models is more cost-effective than training larger models — at least for this natural language task distribution.
+
+2. **InstructGPT generalizes "following instructions" to settings it is not supervised in**, for example non-English language tasks and code-related tasks. This is an important property because it is prohibitively expensive to have humans supervise models on every task they perform. More research is needed to study how well this generalization scales with increased capabilities.
+
+3. **Most of the performance degradations introduced by fine-tuning can be mitigated.** If this were not the case, these degradations would constitute an alignment tax — an additional cost for aligning the model. Any technique with a high tax might not see adoption. To avoid incentives for future highly capable AI systems to remain unaligned, alignment techniques need a low alignment tax. These results are good news for RLHF as a low-tax alignment technique.
+
+4. **Alignment techniques from research can be validated in the real world.** Alignment research has historically been rather abstract, focusing on theoretical results, small synthetic domains, or training models on public NLP datasets. Applying the same methods to AI systems that are being used in production with customers enables an important feedback loop on the techniques' effectiveness and limitations.
+
+### Who Are We Aligning To?
+
+When aligning language models with human intentions, end behavior is a function of the underlying model (and its training data), the fine-tuning data, and the alignment method. The literature often frames alignment using terms such as "human preferences" or "human values." The models here are aligned to a set of labelers' preferences that were influenced by the instructions they were given, the context in which they received them (as a paid job), and who they received them from. Several caveats apply.
+
+First, the models are aligned to demonstrations and preferences provided by the training labelers, who directly produce the data used to fine-tune. They are mostly English-speaking people living in the United States or Southeast Asia, hired via Upwork or Scale AI. They disagree with each other on many examples; inter-labeler agreement is about 73%.
+
+Second, the models are aligned to the preferences of the researchers designing the study (and thus by proxy to the broader research organization): the labeling instructions that labelers use as a guide when writing demonstrations and choosing their preferred output, and the answers to their questions about edge cases. More study is needed on the exact effect of different instruction sets and interface designs on the data collected and its ultimate effect on model behavior.
+
+Third, the training data is determined by prompts sent by OpenAI customers to models on the API Playground, so the models are implicitly aligned to what customers think is valuable and, in some cases, what their end users think is valuable. Customers and their end users may disagree, or customers may not be optimizing for end users' well-being — for example, a customer may want a model that maximizes the amount of time a user spends on their platform. Labelers do not have visibility into the contexts in which a given prompt or completion will be seen.
+
+Fourth, OpenAI's customers are not representative of all potential or current users of language models — let alone of all individuals and groups impacted by language model use. For most of the duration of this project, users of the OpenAI API were selected off of a waitlist whose initial seeds were OpenAI employees, biasing the ultimate group toward those networks.
+
+There are many difficulties in designing an alignment process that is fair, transparent, and has suitable accountability mechanisms. The goal is to demonstrate that this alignment technique can align to a specific human reference group for a specific application. This is not a claim that researchers, the hired labelers, or API customers are the right source of preferences. There are many stakeholders to consider — the organization training the model, the customers using the model to develop products, the end users of these products, and the broader population who may be directly or indirectly affected. It is not only a matter of making the alignment process more participatory; it is impossible to train a system that is aligned to everyone's preferences at once, or where everyone would endorse the tradeoffs.
+
+One path forward is to train models that can be conditioned on the preferences of certain groups, or that can be easily fine-tuned or prompted to represent different groups. Different models can then be deployed and used by groups who endorse different values. These models might still end up affecting broader society, and there are difficult decisions relating to whose preferences to condition on, and how to ensure that all groups can be represented and can opt out of processes that may be harmful.
+
+### Limitations
+
+**Methodology.** The behavior of InstructGPT is determined in part by the human feedback obtained from contractors. Some of the labeling tasks rely on value judgments that may be impacted by the identity of the contractors, their beliefs, cultural backgrounds, and personal history. About 40 contractors were hired, guided by performance on a screening test meant to judge how well they could identify and respond to sensitive prompts, and by their agreement rate with researchers on a labeling task with detailed instructions. The contractor team was kept small because this facilitates high-bandwidth communication with people who are doing the task full-time. This group is clearly not representative of the full spectrum of people who will use and be affected by deployed models. As a simple example, the labelers are primarily English-speaking and the data consists almost entirely of English instructions.
+
+There are also many ways the data collection set-up could be improved. Most comparisons are labeled by only 1 contractor for cost reasons. Having examples labeled multiple times could help identify areas where contractors disagree, and thus where a single model is unlikely to align to all of them. In cases of disagreement, aligning to the average labeler preference may not be desirable. For example, when generating text that disproportionately affects a minority group, the preferences of labelers belonging to that group may need to be weighted more heavily.
+
+**Models.** The models are neither fully aligned nor fully safe; they still generate toxic or biased outputs, make up facts, and generate sexual and violent content without explicit prompting. They can also fail to generate reasonable outputs on some inputs.
+
+Perhaps the greatest limitation is that, in most cases, they follow the user's instruction, even if that could lead to harm in the real world. When given a prompt instructing the models to be maximally biased, InstructGPT generates more toxic outputs than equivalently sized GPT-3 models.
+
+### Open Questions
+
+This is a first step toward using alignment techniques to fine-tune language models to follow a wide range of instructions. There are many open questions in further aligning language model behavior with what people actually want them to do.
+
+Many methods could further decrease the models' propensity to generate toxic, biased, or otherwise harmful outputs. One is an adversarial set-up where labelers find the worst-case behaviors of the model, which are then labeled and added to the dataset. Another is combining this method with ways of filtering the pretraining data, either for the initial pretrained models or for the data used in the pretraining mix. Similarly, the approach could be combined with methods that improve truthfulness, such as WebGPT.
+
+If the user requests a potentially harmful or dishonest response, the model is allowed to generate these outputs. Training the model to be harmless despite user instructions is important, but is also difficult because whether an output is harmful depends on the context in which it is deployed; for example, it may be beneficial to use language models to generate toxic outputs as part of a data augmentation pipeline. The same techniques can be applied to making models refuse certain user instructions.
+
+Getting models to do what is wanted is directly related to the steerability and controllability literature. A promising path is combining RLHF with other methods of steerability — for example control codes, or modifying the sampling procedure at inference time using a smaller model.
+
+While the focus is mainly on RLHF, many other algorithms could train policies on the demonstration and comparison data. Expert iteration, simpler behavior cloning methods that use a subset of the comparison data, or constrained optimization approaches that maximize the reward model score conditioned on generating a small number of harmful behaviors are all candidates.
+
+Comparisons are also not necessarily the most efficient way of providing an alignment signal. Labelers could edit model responses to make them better, or generate critiques of model responses in natural language. There is a vast space of options for designing interfaces for labelers to provide feedback to language models.
+
+The proposal for mitigating the alignment tax, by incorporating pretraining data into RLHF fine-tuning, does not completely mitigate performance regressions, and may make certain undesirable behaviors more likely for some tasks if those behaviors are present in the pretraining data. Another modification that would likely improve the method is to filter the pretraining mix data for toxic content, or augment this data with synthetic instructions.
+
+There are subtle differences between aligning to instructions, intentions, revealed preferences, ideal preferences, interests, and values. Gabriel (2020) advocates for a principle-based approach: identifying fair principles for alignment that receive reflective endorsement despite widespread variation in people's moral beliefs. This work aligns to the inferred user intention for simplicity. One of the biggest open questions is how to design an alignment process that is transparent, that meaningfully represents the people impacted by the technology, and that synthesizes people's values in a way that achieves broad consensus amongst many groups.
+
+### Broader Impacts
+
+This work is motivated by the aim to increase the positive impact of large language models by training them to do what a given set of humans want them to do. By default, language models optimize the next-word prediction objective, which is only a proxy for what these models should do. The results indicate that these techniques hold promise for making language models more helpful, truthful, and harmless. In the longer term, alignment failures could lead to more severe consequences, particularly if these models are deployed in safety-critical situations. As model scaling continues, greater care has to be taken to ensure that they are aligned with human intentions.
+
+However, making language models better at following user intentions also makes them easier to misuse. It may be easier to use these models to generate convincing misinformation, or hateful or abusive content.
+
+Alignment techniques are not a panacea for resolving safety issues associated with large language models; they should be used as one tool in a broader safety ecosystem. Aside from intentional misuse, there are many domains where large language models should be deployed only with great care, or not at all. Examples include high-stakes domains such as medical diagnoses, classifying people based on protected characteristics, determining eligibility for credit, employment, or housing, generating political advertisements, and law enforcement. If these models are open-sourced, it becomes challenging to limit harmful applications in these and other domains without proper regulation. On the other hand, if large language model access is restricted to a few organizations with the resources required to train them, this excludes most people from access to cutting-edge ML technology. Another option is for an organization to own the end-to-end infrastructure of model deployment and make it accessible via an API. This allows for safety protocols like use-case restriction, monitoring for misuse and revoking access, and rate limiting to prevent the generation of large-scale misinformation. This can come at the cost of reduced transparency and increased centralization of power, because it requires the API provider to make decisions on where to draw the line on each of these questions.
+
+Finally, the question of who these models are aligned to is extremely important, and will significantly affect whether the net impact of these models is positive or negative.

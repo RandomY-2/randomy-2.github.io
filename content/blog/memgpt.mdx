@@ -1,0 +1,85 @@
+---
+slug: memgpt
+title: "MemGPT: Towards LLMs as Operating Systems"
+date: "2026-10-08"
+description: "MemGPT treats the LLM context window as RAM and pages data to external archival and recall storage, giving a virtual-memory illusion of unbounded context. Function calls and heartbeats let the model manage its own memory and control flow. The design outperforms fixed-context baselines on multi-session chat consistency and on document analysis that exceeds the underlying window — including nested multi-hop key-value lookup."
+tags: [memgpt, memory, context-window, virtual-memory, llm-agents, function-calling, multi-session-chat, document-analysis, hierarchical-memory]
+category: ai
+---
+
+## Introduction
+
+Large language models and their transformer architecture have become the cornerstone of conversational AI. The limited fixed-length context window still significantly hinders long conversations and reasoning about long documents. The most widely used open-source LLMs can support only a few dozen back-and-forth messages or reason about a short document before exceeding maximum input length.
+
+Directly extending transformer context incurs a quadratic increase in compute and memory from self-attention, so long-context architectures remain an active research challenge. Even if the computational obstacles of context scaling were solved, long-context models struggle to utilize additional context effectively. Given the cost of training state-of-the-art LLMs and the diminishing returns of context scaling, alternative techniques for supporting long context are needed.
+
+The approach here is to provide the *illusion* of infinite context while continuing to use fixed-context models. Traditional operating systems developed virtual memory paging so that applications can work on datasets that far exceed physical RAM, paging data between main memory and disk. Recent function-calling abilities of LLM agents make a similar design possible: agents can read and write external data, modify their own context, and choose when to return control to the user.
+
+These capabilities let an LLM "page" information between its context window (analogous to main memory) and external storage, similar to hierarchical memory in a traditional OS. Function calls also manage control flow among context management, response generation, and user interaction. The agent can iteratively modify what sits in context for a single task, using the limited window more effectively.
+
+MemGPT treats the context window as a constrained memory resource and designs a memory hierarchy analogous to the tiers in traditional OSes. Applications interact with virtual memory, which provides the illusion of more memory than is physically available by paging overflow to disk and retrieving it on a page fault. To provide a similar illusion of longer context, the LLM manages what is placed in its own context via an "LLM OS" — MemGPT. Relevant historical data missing from the window can be retrieved; less relevant data can be evicted into external storage.
+
+<div align="center">
+![Figure 3: MemGPT augments a fixed-context LLM with hierarchical memory and self-managed paging functions](/figures/memgpt-architecture.png)
+</div>
+
+The combination of a memory hierarchy, OS functions, and event-based control flow lets MemGPT handle unbounded context with finite-window LLMs. Two domains where finite context severely limits existing models are used for evaluation: document analysis, where standard files quickly exceed input capacity, and conversational agents, where limited conversation windows lack context awareness, persona consistency, and long-term memory. In both settings MemGPT outperforms existing LLM-based approaches.
+
+Code and data: [https://research.memgpt.ai](https://research.memgpt.ai).
+
+---
+
+## MemGPT (MemoryGPT)
+
+The architecture delineates two primary memory types. **Main context** is analogous to RAM: the LLM prompt tokens. Anything in main context is in-context and accessible to the processor during inference. **External context** is analogous to disk: any information held outside the fixed window. Out-of-context data must be explicitly moved into main context before it can be passed to the processor. Function calls let the processor manage this memory without user intervention.
+
+### Main context (prompt tokens)
+
+Prompt tokens are split into three contiguous sections.
+
+**System instructions** are read-only and static. They describe MemGPT control flow, the intended use of each memory level, and how to use the functions (including how to retrieve out-of-context data).
+
+**Working context** is a fixed-size read/write block of unstructured text, writable only via function calls. In conversation it stores key facts, preferences, and other important information about the user and the agent's persona, so the agent can converse fluently.
+
+**The FIFO queue** stores a rolling history of messages: agent–user dialogue, system messages (e.g. memory warnings), and function-call inputs and outputs. The first slot holds a system message containing a recursive summary of messages that have already been evicted.
+
+### Queue Manager
+
+The queue manager owns messages in recall storage and in the FIFO queue. When a new message arrives, it is appended to the queue; prompt tokens are concatenated; LLM inference produces completion tokens. Both the incoming message and the generated output are written to recall storage (the message database). When recall storage is searched via a function call, retrieved messages are appended to the back of the queue so they re-enter the context window.
+
+The queue manager also implements overflow via an eviction policy. When prompt tokens exceed a **warning token count** (e.g. 70% of the window), a system message warns of impending eviction — a memory-pressure alert — so the LLM can copy important FIFO contents into working context or archival storage (a read/write database of arbitrary-length text). When tokens exceed a **flush token count** (e.g. 100% of the window), the queue is flushed: a configured number of messages (e.g. 50% of the window) are evicted, and a new recursive summary is generated from the existing summary plus the evicted messages. Evicted messages are no longer immediately visible, but they remain indefinitely in recall storage and can be read via function calls.
+
+<div align="center">
+![Figure 1: After a memory-pressure alert, MemGPT writes important facts into persistent working context](/figures/memgpt-write-memory.png)
+</div>
+
+### Function executor (handling of completion tokens)
+
+Data movement between main and external context is entirely self-directed. The LLM decides when to move items (for example when conversation history is becoming too long) and how to update main context as its understanding of objectives evolves. Self-directed editing and retrieval are implemented by explicit system instructions with two parts: (1) a description of the memory hierarchy and the utility of each tier, and (2) a function schema, with natural-language descriptions, for accessing or modifying memory.
+
+Each inference cycle takes main context (concatenated into one string) as input and produces an output string. A parser validates the function arguments; if they are valid the function runs. Results — including runtime errors such as trying to add to a full working context — are fed back to the processor. That feedback loop lets the system adjust its behavior. Awareness of context limits is essential: the processor is prompted with token-limitation warnings, and retrieval is paginated so that a single search cannot overflow the window.
+
+Context lengths of commonly used models (data as of January 2024; approximate message counts assume a 1k-token preprompt and ~50-token messages):
+
+| Model / API | Open? | Tokens | ~Messages |
+| --- | --- | --- | --- |
+| Llama 1 | yes | 2k | 20 |
+| Llama 2 | yes | 4k | 60 |
+| GPT-3.5 Turbo (release) | no | 4k | 60 |
+| Mistral 7B | yes | 8k | 140 |
+| GPT-4 (release) | no | 8k | 140 |
+| GPT-3.5 Turbo | no | 16k | 300 |
+| GPT-4 | no | 32k | ~600 |
+| Claude 2 | no | 100k | ~2000 |
+| GPT-4 Turbo | no | 128k | ~2600 |
+| Yi-34B-200k | yes | 200k | ~4000 |
+
+### Control flow and function chaining
+
+Events trigger inference. An event is a generalized input: a user message, a system message (capacity warning), a user interaction (login, finished upload), or a timed event on a regular schedule (so MemGPT can run unprompted). Events are parsed into plain-text messages, appended to main context, and fed to the processor.
+
+Many practical tasks require calling several functions in sequence — paging through results, or collating data from different documents. **Function chaining** lets MemGPT execute multiple calls before returning control to the user. A special flag (`request_heartbeat=true`) requests that control return immediately to the processor after the function completes. If the flag is present, function output is added to main context and inference continues. If it is absent (a **yield**), the processor waits for the next external event.
+
+<div align="center">
+![Figure 2: MemGPT searches recall storage and pages matching messages back into the FIFO queue](/figures/memgpt-search-recall.png)
+</div>
