@@ -1,0 +1,75 @@
+---
+slug: mem0
+title: "Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory"
+date: "2026-10-09"
+description: "Mem0 extracts, consolidates, and retrieves salient facts from ongoing conversations so agents stay consistent across sessions without stuffing the full history into context. A graph variant, Mem0^g, stores entities and relations for temporal and relational queries. On LOCOMO, Mem0 improves LLM-as-a-Judge by 26% relative to OpenAI memory, and cuts p95 latency by 91% and token cost by more than 90% versus reading the entire conversation."
+tags: [mem0, long-term-memory, agents, locomo, graph-memory, rag, latency, conversational-ai]
+category: ai
+---
+
+## Introduction
+
+Human memory shapes identity, guides decisions, and makes communication possible: past interactions are recalled, preferences inferred, and evolving models of other people maintained over days, weeks, or months. LLM-powered agents generate fluent, contextually appropriate responses, but they are limited by fixed context windows. They lack a persistent memory that survives session boundaries and context overflow. Once information falls outside the window, the model effectively resets.
+
+Without persistent memory, agents forget preferences, repeat questions, and contradict facts already established. A user who says they are vegetarian and avoid dairy can, in a later session, be recommended chicken. A system that keeps that constraint across sessions recommends a vegetarian, dairy-free option instead. The same gap shows up beyond chat: memory of past experience improves anticipation, learning from mistakes, and generalization. Hierarchical and agentic memory systems further show that long-term reasoning across dialogue sessions depends on something other than a longer prompt.
+
+<div align="center">
+![Figure 1: Without persistent memory, dietary constraints are forgotten between sessions; with memory, later recommendations stay consistent](/figures/mem0-memory-importance.png)
+</div>
+
+Longer windows — GPT-4 at 128K tokens, o1 at 200K, Claude 3.7 Sonnet at 200K, Gemini at least 10M — delay the problem rather than solve it. Conversation over weeks or months still exceeds those limits. Real conversations also lack thematic continuity: dietary preferences can be buried under hours of unrelated discussion, and attention degrades over distant tokens. In healthcare, education, and enterprise support, that loss of continuity undermines trust.
+
+A robust memory selectively stores important information, consolidates related concepts, and retrieves relevant details when needed. **Mem0** (pronounced mem-zero) dynamically captures, organizes, and retrieves salient information from ongoing conversations. **$\mathrm{Mem0}^{g}$** adds graph-based memory so that relationships among conversational elements can be modeled explicitly.
+
+---
+
+## Proposed Methods
+
+Two architectures. Mem0 extracts, evaluates, and manages salient information through dedicated extraction and update modules, processing a pair of messages between two users or between a user and an assistant. $\mathrm{Mem0}^{g}$ stores memories as a directed labeled graph — entities as nodes, relationships as edges — so queries can follow relational paths across memories.
+
+### Mem0
+
+Processing is incremental and runs inside an ongoing conversation. The pipeline has two phases: extraction and update.
+
+<div align="center">
+![Figure 2: Mem0 extraction uses a summary and recent messages; the update phase applies ADD, UPDATE, DELETE, or NOOP against similar memories](/figures/mem0-pipeline.png)
+</div>
+
+**Extraction.** A new message pair $(m_{t-1}, m_t)$ is ingested — typically a user message and an assistant response. Context comes from two sources: a conversation summary $S$ that encapsulates the full history, and a window of recent messages $\{m_{t-m}, \ldots, m_{t-2}\}$, where $m$ is a recency hyperparameter. An asynchronous summary generator refreshes $S$ independently of the main pipeline, so extraction sees an up-to-date global summary without adding latency to the hot path. The summary supplies thematic context; the recent window supplies details not yet consolidated into it. Together with the new pair they form the prompt
+
+$$
+P = (S, \{m_{t-m}, \ldots, m_{t-2}\}, m_{t-1}, m_t)
+$$
+
+An LLM extraction function $\phi(P)$ returns a set of candidate memories $\Omega = \{\omega_1, \ldots, \omega_n\}$ drawn from the new exchange while remaining aware of the broader conversation.
+
+**Update.** Each candidate $\omega_i$ is compared with existing memories so the store stays consistent and non-redundant. The top $s$ semantically similar memories are retrieved by dense vector search. Those memories and the candidate are passed to the LLM through a function-calling interface (a tool call). The LLM chooses one of four operations — there is no separate classifier:
+
+* **ADD** — create a new memory when nothing semantically equivalent exists.
+* **UPDATE** — augment an existing memory with complementary information when the new fact is richer.
+* **DELETE** — remove a memory contradicted by the new information.
+* **NOOP** — leave the store unchanged when the fact is already present or irrelevant.
+
+The chosen operation is then executed. In the reported configuration, $m = 10$ previous messages and $s = 10$ similar memories. All LLM calls use GPT-4o-mini. The vector database stores dense embeddings for the similarity search.
+
+### $\mathrm{Mem0}^{g}$
+
+$\mathrm{Mem0}^{g}$ represents memory as a directed labeled graph $G = (V, E, L)$:
+
+* Nodes $V$ are entities (for example, ALICE, SAN_FRANCISCO).
+* Edges $E$ are relationships (for example, LIVES_IN).
+* Labels $L$ assign semantic types (Person, City).
+
+Each node carries an entity type, an embedding $e_v$, and a creation timestamp $t_v$. A relationship is a triplet $(v_s, r, v_d)$: source, labeled edge, destination.
+
+<div align="center">
+![Figure 3: Mem0^g extracts entities and relation triplets, then resolves conflicts before writing the graph](/figures/mem0-graph.png)
+</div>
+
+Extraction is two-stage. An entity extractor identifies people, locations, objects, concepts, events, and attributes that are semantically important, distinctive, and likely to persist. A relationship generator then derives triplets, using linguistic patterns, context, and domain knowledge to label connections such as `lives_in`, `prefers`, `owns`, or `happened_on`, including relations that are only implicit in the dialogue.
+
+On write, embeddings of the source and destination entities are compared with existing nodes. Nodes whose similarity exceeds a threshold $t$ are reused; otherwise new nodes are created, and the edge is stored with metadata. A conflict detector finds existing relationships that the new triple may invalidate. An LLM update resolver marks those relationships obsolete rather than deleting them, so later queries can still reason about time.
+
+Retrieval is dual. The **entity-centric** path identifies key entities in the query, locates similar nodes, and expands incoming and outgoing edges into a subgraph. The **semantic triplet** path embeds the whole query and ranks triplet encodings by similarity, returning those above a relevance threshold. The first path fits entity-focused questions; the second fits broader conceptual queries.
+
+The graph store is Neo4j. Extractors and the update module use GPT-4o-mini with function calling.

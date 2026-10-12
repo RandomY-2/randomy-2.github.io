@@ -1,0 +1,87 @@
+---
+slug: autogen
+title: "AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation"
+date: "2026-10-10"
+description: "AutoGen builds LLM applications as conversations among customizable agents backed by models, tools, humans, or a mix of them. Conversation programming unifies computation and control as message passing, with auto-reply and a fusion of natural language and code. On MATH, ALFWorld, retrieval-augmented QA, and OptiGuide, the same abstraction matches or beats specialized systems while cutting application code and manual steps."
+tags: [autogen, multi-agent, conversation, llm-agents, tool-use, human-in-the-loop, math, rag, alfworld, optiguide]
+category: ai
+---
+
+## Introduction
+
+Large language models (LLMs) are becoming a crucial building block for powerful agents that use LLMs for reasoning, tool usage, and adapting to new observations in many real-world tasks. Given the expanding tasks that could benefit from LLMs and the growing task complexity, an intuitive approach to scale up the power of agents is to use multiple agents that cooperate. Prior work suggests that multiple agents can encourage divergent thinking, improve factuality and reasoning, and provide validation. That intuition and early evidence raise the question of how to facilitate LLM applications that span a broad spectrum of domains and complexities based on the multi-agent approach.
+
+The insight is to use multi-agent conversations. Recent advances in LLMs confirm the feasibility and utility of that approach for at least three reasons.
+* Chat-optimized LLMs (for example, GPT-4) can incorporate feedback, so LLM agents can cooperate through conversations with each other or with humans: a dialogue in which agents provide and seek reasoning, observations, critiques, and validation.
+* A single LLM can exhibit a broad range of capabilities, especially when configured with the correct prompt and inference settings. Conversations between differently configured agents combine these capabilities in a modular and complementary manner.
+* LLMs have demonstrated the ability to solve complex tasks when the tasks are broken into simpler subtasks. Multi-agent conversations can enable this partitioning and integration in an intuitive manner.
+
+The requirement is a multi-agent conversation framework with a generic abstraction and an effective implementation, flexible enough to satisfy different application needs. Achieving this requires addressing two critical questions:
+* How can individual agents be designed so that they are capable, reusable, customizable, and effective in multi-agent collaboration?
+* How can a straightforward, unified interface accommodate a wide range of agent conversation patterns?
+
+In practice, applications of varying complexities may need distinct sets of agents with specific capabilities, and may require different conversation patterns, such as single- or multi-turn dialogs, different human involvement modes, and static versus dynamic conversation. Moreover, developers may prefer the flexibility to program agent interactions in natural language or code. Failing to adequately address these two questions would limit the framework's scope of applicability and generality.
+
+**AutoGen** is a generalized multi-agent conversation framework built on two concepts.
+
+**Customizable and conversable agents.** AutoGen uses a generic agent design that can leverage LLMs, human inputs, tools, or a combination of them. Developers can create agents with different roles — writing code, executing code, wiring in human feedback, validating outputs — by selecting and configuring a subset of built-in capabilities. The agent's backend can also be extended for custom behavior. Every agent is conversable: it can receive, react, and respond to messages. Configured properly, an agent holds multiple turns with other agents autonomously, or solicits human input at selected rounds, so human agency and automation sit in the same conversation. The design uses the ability of advanced LLMs to take feedback and make progress through chat, and it combines LLM capabilities in a modular fashion.
+
+**Conversation programming.** Complex LLM application workflows are simplified and unified as multi-agent conversations. Conversation programming is the paradigm centered on those inter-agent conversations. It streamlines intricate applications in two steps: (1) define a set of conversable agents with specific capabilities and roles; (2) program the interaction behavior between agents through conversation-centric computation and control. Both steps fuse natural language and programming language, which supports a wide range of conversation patterns and agent behaviors. Ready-to-use implementations cover both steps, and both can be extended and experimented with.
+
+<div align="center">
+![Figure 1: Agents can be backed by LLMs, tools, or humans, then composed into joint or hierarchical chats. A stock-chart example shows the assistant and user proxy repairing a missing package and a plot request](/figures/autogen-overview.png)
+</div>
+
+---
+
+## The AutoGen Framework
+
+<div align="center">
+![Figure 2: Built-in agents share send, receive, and generate_reply. A custom reply on the user proxy prefers human input and otherwise executes code. Once initiate_chat starts, auto-reply carries the stock-chart dialogue](/figures/autogen-programming.png)
+</div>
+
+### Conversable Agents
+
+A conversable agent is an entity with a specific role that can pass messages to send and receive information to and from other conversable agents, for example to start or continue a conversation. It maintains its internal context based on sent and received messages and can be configured with a set of capabilities, enabled by LLMs, tools, or human input. Agents then act according to programmed behavior patterns.
+
+**Agent capabilities powered by LLMs, humans, and tools.** Capabilities directly influence how an agent processes and responds to messages, so agents can be endowed with different composable capabilities.
+
+* **LLMs.** LLM-backed agents exploit role playing, implicit state inference and progress making conditioned on conversation history, providing feedback, adapting from feedback, and coding. These capabilities can be combined through prompting to increase an agent's skill and autonomy. An enhanced LLM inference layer adds result caching, error handling, and message templating.
+* **Humans.** Human involvement is desired or essential in many LLM applications. Human-backed agents let a person participate by soliciting input at certain rounds, depending on the agent configuration. The default user proxy agent allows configurable levels and patterns of involvement: the frequency and conditions for requesting human input, including the option to skip providing input.
+* **Tools.** Tool-backed agents execute tools via code execution or function execution. The default user proxy agent can execute code suggested by LLMs, or make LLM-suggested function calls.
+
+**Agent customization and cooperation.** Based on application-specific needs, each agent can be configured with a mix of these back-end types and so display complex behavior in multi-agent conversations. Specialized capabilities and roles are created by reusing or extending the built-in agents. Figure 2 sketches those agents. `ConversableAgent` is the highest-level abstraction and, by default, can use LLMs, humans, and tools. `AssistantAgent` and `UserProxyAgent` are two preconfigured subclasses, each a common usage mode: acting as an AI assistant backed by LLMs, and acting as a human proxy to solicit human input or execute code and function calls, backed by humans and/or tools.
+
+### Conversation Programming
+
+Conversation programming is the paradigm used to specify and mold multi-agent conversations so that agents make meaningful progress. It considers two concepts. **Computation** is the actions agents take to compute their response in a multi-agent conversation. **Control flow** is the sequence, or the conditions, under which these computations happen. The ability to program both is what implements the flexible conversation patterns in the applications below.
+
+Computations are conversation-centric. An agent takes actions relevant to the conversations it is involved in, and those actions result in message passing for consequent conversations, unless a termination condition is satisfied. Control flow is conversation-driven: decisions about which agents to send messages to, and the procedure of computation, are functions of the inter-agent conversation. A complex workflow can then be reasoned about as agents taking actions and passing messages.
+
+Figure 2 illustrates this. The bottom sub-figure shows individual agents performing role-specific, conversation-centric computations to generate responses, for example via LLM inference calls and code execution. The task progresses through the conversations in the dialog box. The middle sub-figure demonstrates a conversation-based control flow. When the assistant receives a message, the user proxy agent typically sends the human input as a reply. If there is no input, it executes any code in the assistant's message instead.
+
+Two design patterns facilitate conversation programming.
+
+**Unified interfaces and auto-reply mechanisms for automated agent chat.** Agents share a conversation interface for conversation-centric computation: a send/receive function for sending and receiving messages, and a generate-reply function for taking actions and generating a response based on the received message. An agent auto-reply mechanism, adopted by default, realizes conversation-driven control. Once an agent receives a message from another agent, it automatically invokes generate-reply and sends the reply back to the sender unless a termination condition is satisfied. Built-in reply functions are based on LLM inference, code or function execution, or human input. Custom reply functions can be registered to change an agent's behavior pattern, for example chatting with another agent before replying to the sender. Once the reply functions are registered and the conversation is initialized, the conversation flow is naturally induced, and the conversation proceeds without any extra control plane — a special module that controls the flow. The developer code in the blue-shaded area of Figure 2, marked "Developer Code," triggers the conversation, which then proceeds automatically, as shown in the dialog box in the grey shaded area, marked "Program Execution." Auto-reply provides a decentralized, modular, and unified way to define the workflow.
+
+**Control by fusion of programming and natural language.** Programming and natural language are used in three control-flow patterns.
+
+1. *Natural-language control via LLMs.* Conversation flow is controlled by prompting LLM-backed agents with natural language. The default system message of the built-in `AssistantAgent` instructs the agent to fix errors and generate code again if the previous result indicates errors. It also confines the LLM output to certain structures, making it easier for tool-backed agents to consume. For example, the agent is instructed to reply with "TERMINATE" when all tasks are completed, which terminates the program.
+2. *Programming-language control.* Python specifies the termination condition, human input mode, and tool execution logic, including the maximum number of auto replies. Programmed auto-reply functions can also control the conversation flow, as in the code block marked "Conversation-Driven Control Flow" in Figure 2.
+3. *Control transition between natural and programming language.* Transition from code to natural-language control is achieved by invoking an LLM inference that contains control logic inside a customized reply function. Transition from natural language to code control is achieved via LLM-proposed function calls.
+
+Beyond static conversation with a predefined flow, dynamic flows with multiple agents are supported in two ways. Within a customized generate-reply function, one agent can hold the current conversation while invoking conversations with other agents, depending on the content of the current message and context. Alternatively, the LLM decides whether to call a particular function depending on the conversation status. By messaging additional agents in the called functions, the LLM drives a dynamic multi-agent conversation. More complex dynamic group chat uses the built-in `GroupChatManager`, which dynamically selects the next speaker and then broadcasts that response to the other agents.
+
+---
+
+## Applications of AutoGen
+
+Six applications use the same agent and conversation abstractions. They were chosen for real-world relevance (math, retrieval, OptiGuide, group chat, chess), for difficulty that the framework actually changes (math, retrieval, ALFWorld, OptiGuide), and for patterns that are awkward to hard-code (dynamic group chat, conversational chess).
+
+<div align="center">
+![Figure 3: Conversation patterns for math tutoring with an on-call expert, retrieval-augmented chat, ALFWorld with a grounding agent, OptiGuide coding, dynamic group chat, and conversational chess](/figures/autogen-applications.png)
+</div>
+
+<div align="center">
+![Figure 4: AutoGen on MATH, Natural Questions, ALFWorld, and OptiGuide. Interactive retrieval, a grounding agent, and a separate safeguard each move the corresponding metric](/figures/autogen-results.png)
+</div>
