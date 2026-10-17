@@ -1,0 +1,133 @@
+---
+slug: gepa
+title: "GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning"
+date: "2026-10-12"
+description: "GEPA is a prompt optimizer that reflects on rollout traces in natural language, proposes prompt updates, and combines complementary lessons from the Pareto frontier of its own attempts. Across six tasks it outperforms GRPO by 6% on average and by up to 20%, while using up to 35× fewer rollouts, and it outperforms MIPROv2 by over 10%."
+tags: [gepa, prompt-optimization, reflection, pareto, grpo, miprov2, compound-ai, sample-efficiency]
+category: ai
+---
+
+## Introduction
+
+Large language models have enabled agents and systems that combine fuzzy natural-language specifications with tools such as retrieval and code execution. This raises the question of how LLMs should be optimized for downstream performance. One popular approach is Reinforcement Learning with Verifiable Rewards, for example Group Relative Policy Optimization (GRPO), which treats success metrics as end-of-rollout scalar rewards used to estimate policy gradients. These RL approaches are effective, but they typically require tens of thousands of rollouts to fit new tasks, and recent GRPO work often uses up to hundreds of thousands. That sample inefficiency becomes a bottleneck when downstream applications invoke expensive tool calls, have a limited inference budget for sampling from the LLM, or cannot finetune the weights of the largest or best-performing models.
+
+Rollouts sampled from even highly sophisticated LLM systems can be serialized into traces of natural language. They contain the instructions of each LLM module, the resulting reasoning chains, tool calls, and potentially the internal workings of the reward function — compiler error messages, for example — before those signals are collapsed into scalar rewards. Because such serialized trajectories are readily understood by modern LLMs, algorithms that learn deliberately in natural language, by reflecting on these trajectories, can make more effective use of the strong language priors that LLMs have, compared with standard RL.
+
+**GEPA** (Genetic-Pareto) is a reflective prompt optimizer for compound AI systems that merges textual reflection with multi-objective evolutionary search. It iteratively mutates prompts using natural language feedback drawn from new rollouts. In each mutation, the candidate prompt is derived from an ancestor, accumulating high-level lessons from observations and LLM feedback. To avoid the local optima that afflict greedy prompt optimization, GEPA maintains a Pareto front: instead of evolving only the global best prompt, it stochastically explores the top-performing prompts for each problem instance. This diversification enables robust generalization and mitigates getting stuck in local minima.
+
+GEPA is evaluated on multi-hop reasoning (HotpotQA), math (AIME and LiveBench-Math), instruction following (IFBench), privacy-aware delegation (PUPA), and retrieval-augmented verification (HoVer), using both an open model (Qwen3 8B) and a proprietary model (GPT-4.1 Mini). It generalizes well and is highly sample-efficient. On Qwen3 8B, it outperforms GRPO (24,000 rollouts) by up to 20% while using up to $35\times$ fewer rollouts, with an average gain of $+6\%$ across six tasks. It also surpasses the prior state-of-the-art prompt optimizer, MIPROv2, on all benchmarks and models, achieving $+13\%$ aggregate gains, over double MIPROv2's $+5.6\%$.
+
+<div align="center">
+![Figure 1: On HotpotQA and IFBench with Qwen3 8B, GEPA and MIPROv2 improve much faster than GRPO. Stars mark held-out test performance](/figures/gepa-learning.png)
+</div>
+
+Qualitatively, GEPA-learned prompts are quite rich. Figure 2 shows excerpts from a prompt crafted for the query-creation module of a multi-hop question answering system used in HotpotQA, and Figure 5 shows that even a single reflective update often yields large gains. These results highlight that reflective prompt evolution with language feedback enables improved sample efficiency and robust generalization, offering a practical approach to optimizing complex AI workflows in data- or budget-constrained environments. GEPA is also demonstrated as an inference-time search strategy for code optimization, and for adversarial prompt search.
+
+<div align="center">
+![Figure 2: A GEPA prompt for second-hop document retrieval in a multi-hop question-answering system, shown with the seed prompt it started from](/figures/gepa-prompt.png)
+</div>
+
+<div align="center">
+![Figure 5: Reflective updates on the privacy-preserving delegation task. The path from the base prompt (candidate 0, score 82.26) to the best prompt (candidate 11, score 97.6) accumulates targeted lessons at each step](/figures/gepa-trajectory.png)
+</div>
+
+---
+
+## Problem Statement
+
+A compound AI system is any modular system composed of one or more language-model invocations, potentially interleaved with external tool calls, orchestrated through arbitrary control flow. This subsumes agents, multi-agent systems, and scaffolding techniques such as ReAct. Such a system is formalized as
+
+$$
+\Phi = (M, C, \mathcal{X}, \mathcal{Y}),
+$$
+
+where $M = \langle M_1, \ldots, M_{|M|} \rangle$ denotes the language modules, $C$ specifies the control-flow logic, and $\mathcal{X}, \mathcal{Y}$ are the global input and output schemas. Each module $M_i = (\pi_i, \theta_i, \mathcal{X}_i, \mathcal{Y}_i)$ is an LLM subcomponent: $\pi_i$ is its system prompt, including instructions and few-shot demonstrations; $\theta_i$ the underlying model weights; and $\mathcal{X}_i, \mathcal{Y}_i$ the module input and output schemas. At runtime, $C$ orchestrates sequencing and invocation — passing outputs from one module to another, invoking modules conditionally, or calling tool APIs — and can invoke different modules in any order, multiple times.
+
+Let $\Pi_{\Phi} = \langle \pi_1, \ldots, \pi_{|M|} \rangle$ be the collection of all module prompts and $\Theta_{\Phi} = \langle \theta_1, \ldots, \theta_{|M|} \rangle$ the module weights. The learnable parameters are $\langle \Pi, \Theta \rangle_{\Phi}$. For a task instance $(x, m)$ — where $x$ maps to the input schema and $m$ contains evaluator metadata such as gold answers, rubrics, or unit tests — the system induces an output $y = \Phi(x; \langle \Pi, \Theta \rangle_{\Phi})$. A metric $\mu$ maps an output and metadata to a score in $[0, 1]$, for example by exact match, F1, or pass rate. The optimization problem, over a task distribution $\mathcal{T}$, is
+
+$$
+\langle \Pi^{*}, \Theta^{*} \rangle_{\Phi} = \arg\max_{\langle \Pi, \Theta \rangle_{\Phi}} \mathbb{E}_{(x, m) \sim \mathcal{T}} \left[ \mu\left(\Phi(x; \langle \Pi, \Theta \rangle_{\Phi}), m\right) \right].
+$$
+
+This formulation allows updates to both prompts and weights, so that optimizers operating in different parameter spaces — prompt evolution and GRPO — can be compared.
+
+**Sample-efficient optimization.** In many real settings, a rollout — an invocation of $\Phi$ plus evaluation by $\mu$ — is computationally, monetarily, or timewise expensive. The optimizer is limited to at most $B$ rollouts on a training set $\mathcal{D}_{\mathrm{train}}$, with full access to $\mu$. The goal is to identify parameters that maximize held-out performance without exceeding that budget:
+
+$$
+\langle \Pi^{*}, \Theta^{*} \rangle_{\Phi} = \arg\max_{\langle \Pi, \Theta \rangle_{\Phi}} \mathbb{E}_{(x, m) \sim \mathcal{T}} \left[ \mu\left(\Phi(x; \langle \Pi, \Theta \rangle_{\Phi}), m\right) \right], \quad \text{subject to } \#\text{rollouts} \le B.
+$$
+
+The core challenge is how to extract maximal learning signal from every expensive rollout, so that complex, modular AI systems can be adapted in low-data or budget-constrained settings.
+
+---
+
+## GEPA: Reflective Prompt Evolution
+
+GEPA is a sample-efficient optimizer for compound AI systems, motivated by three principles: genetic prompt evolution, reflection using natural language feedback, and Pareto-based candidate selection. It receives a system $\Phi$ instantiated with simple prompts, a training set $D_{\mathrm{train}}$ of instances $(x, m)$, the evaluation metric $\mu$, a feedback function $\mu_f$, and a rollout budget $B$. GEPA evolves only the prompts $\Pi_{\Phi}$. The underlying LLM weights $\Theta_{\Phi}$ stay fixed.
+
+<div align="center">
+![Figure 3: Each iteration proposes a candidate by reflective prompt mutation or system-aware merge, accepts it only if a minibatch improves, and samples the next parent from the Pareto frontier rather than always from the global best](/figures/gepa-overview.png)
+</div>
+
+<div align="center">
+![Figure 4: Left, the reflective prompt-evolution loop: select a candidate, update one module from minibatch traces, and keep the new system only if the minibatch score improves, then score it on the Pareto set. Right, SelectCandidate keeps non-dominated prompts and samples one in proportion to how often it leads on a task](/figures/gepa-algorithm.png)
+</div>
+
+**Genetic optimization loop.** The goal is to identify prompts $\Pi_{\Phi}$ that maximize task performance. GEPA begins with a candidate pool $\mathcal{P}$ containing only the base system. Each candidate is a concrete instantiation of the prompts with frozen weights. It then proposes new candidates until the evaluation budget is exhausted. Candidates are derived from existing ones by reflective mutation or crossover, guided by feedback from rollouts. Each candidate inherits learning signals from its parents and from its own rollout, so knowledge accumulates along the genetic tree. In each iteration GEPA selects promising candidates, proposes and evaluates a variant on a minibatch, and, if the variant outperforms its parents, adds it to the pool with ancestry records and evaluates it on $D_{\mathrm{pareto}}$, the validation set used for selection. After the budget is exhausted, GEPA returns the candidate with the best aggregate performance on $D_{\mathrm{pareto}}$.
+
+**Reflective prompt mutation.** Natural-language traces generated during execution offer visibility into the behavior and responsibilities of each module: they capture intermediate inferences and reasoning steps. Paired with the final outcome, they have diagnostic value, so errors or successes can be traced back to decisions at the module level. An LLM can use these traces, via reflection, to perform implicit credit assignment, attributing the final outcome to the relevant modules, and then to make targeted updates to individual modules.
+
+Given a candidate selected stochastically from the Pareto frontier, GEPA executes it on a minibatch of training queries and traces the program. From the traces it extracts each module's inputs, outputs, and reasoning, and calls the feedback function $\mu_f$, which returns a numeric score and text feedback — compiler errors, failed rubrics, and similar details. The module to update is chosen by a round-robin policy. A reflection LM is shown the current prompt, the trajectory, the score, and the feedback, and is asked to attribute successes or failures to elements of the prompt and to propose revised instructions. The updated module, with the rest of the program, is evaluated again on the minibatch. If the score improves, the new program is added to the candidate pool.
+
+**Evaluation traces as diagnostic signals.** The text that LLMs produce is the execution trace of the AI system. The text that the environment produces while computing the reward — compiler error messages, before a reward of 0 is returned — is the evaluation trace. Many metrics apply rich procedures, such as compilation, execution, and profiling, and produce natural-language traces before collapsing them to a scalar. GEPA extends the reward $\mu$ into a feedback function $\mu_f$ that extracts those textual traces and returns them with the final score as feedback text. When available, the feedback can be module-specific: in a multi-hop system, the evaluator may comment after each hop. Where human graders rate responses and justify the rating, those explanations can be attached to $D_{\mathrm{train}}$ and consumed as auxiliary feedback, even when natural-language feedback from the rollout itself is limited.
+
+### Pareto-Based Candidate Selection
+
+GEPA supports several strategies for choosing the next candidate, and that choice governs the exploration–exploitation tradeoff. Always selecting the best-performing candidate often traps the search in a local optimum: once a dominant strategy is found, it becomes difficult to surpass, and the budget is exhausted without learning new strategies. After one successful child, repeated attempts to refine that same candidate fail, and the budget is depleted.
+
+GEPA instead uses a Pareto-based illumination strategy. For each training instance, it records the highest score across all candidates, forming a Pareto frontier. Candidates that achieve the best score on at least one task are retained. Strictly dominated candidates are pruned. From the pruned set, a candidate is sampled with probability proportional to the number of tasks on which it is a leader. The search can then escape local optima without inflating the pool, focusing rollouts on candidates that embody winning strategies within the budget.
+
+<div align="center">
+![Figure 6: Always mutating the current best candidate collapses onto one lineage. Pareto sampling keeps several winning strategies and reaches a higher-scoring program in the same budget](/figures/gepa-pareto.png)
+</div>
+
+---
+
+## Evaluation
+
+### Observation 1: Reflective Prompt Evolution Is Highly Sample-Efficient
+
+Across these benchmarks, GEPA adapts rapidly and generalizes in compound AI systems, beating GRPO (24,000 rollouts) by up to 19% while using up to $35\times$ fewer rollouts. It reaches optimal test performance with $4$–$35\times$ fewer rollouts and exceeds GRPO on 5 of 6 tasks, by 19.0%, 2.73%, 13.66%, 5.19%, and 0.7%. It matches GRPO's best validation score after only 243, 402, 330, 1,143, 1,179, and 306 rollouts — up to $78\times$ greater sample efficiency. GEPA+Merge widens the gap, outperforming GRPO by 21% at a comparable rollout budget.
+
+Most of GEPA's rollout budget is spent on validation, where scores are used only for candidate selection and not as a learning signal. Restricted to train-set rollouts, GEPA needs only 79 to 737 rollouts to reach optimal performance, and matches GRPO's best validation scores with 102, 32, 6, and 179 train rollouts on four of the tasks. Because validation dominates the budget, sample efficiency can be improved further by evaluating a smaller validation set, or by tracking scores on dynamically selected subsets rather than the full set.
+
+### Observation 2: Instruction Optimization Alone Can Outperform Joint Instruction and Few-Shot Optimization
+
+Compared with MIPROv2, which jointly optimizes instructions and few-shot demonstrations, GEPA outperforms MIPROv2 in every setting, with margins as high as 11.1% for GPT-4.1 Mini and 10.3% for Qwen3 8B. GEPA and GEPA+Merge more than double MIPROv2's aggregate gain over the baseline ($+13.33\%$ and $+12.19\%$ versus $+5.64\%$).
+
+Prior evidence had favored few-shot example optimization over instruction-only optimization. The shift here is attributed to stronger instruction-following and self-reflection in recent LLMs, and to GEPA's use of those abilities. The generalization gap — validation score minus test score — is also smaller for reflectively evolved instructions. Unlike prompts whose gains come mainly from quasi-exemplars, GEPA's prompts frequently contain detailed declarative instructions for completing the task.
+
+### Observation 3: Pareto-Based Sampling Changes the Trajectory
+
+The next-candidate strategy strongly influences both the optimization trajectory and the final score. With the evolution harness held fixed, three selection rules are compared on Qwen3 8B. SelectBestCandidate, as used by TextGrad, evolves only from the top-scoring candidate. Beam search of width 4, as used by APO, keeps a pool of the top candidates and is still prone to local optima. Pareto-based selection yields a $+12.44\%$ aggregate improvement, against $+6.05\%$ for greedy selection and $+5.11\%$ for beam search.
+
+| Qwen3 8B | HotpotQA | IFBench | HoVer | PUPA | Aggregate |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 42.33 | 36.90 | 35.33 | 80.82 | 48.84 |
+| SelectBestCandidate | 58.33 | 30.44 | 45.33 | 85.45 | 54.89 |
+| Beam search | 57.33 | 36.39 | 41.00 | 81.08 | 53.95 |
+| GEPA | 62.33 | 38.61 | 52.33 | 91.85 | 61.28 |
+
+Pareto-based sampling outperforms beam search by up to 11.33% and SelectBestCandidate by up to 8.17%, with aggregate margins of $+7.33\%$ and $+6.4\%$. Always choosing the current best candidate improves immediately and then stalls, spending the remaining rollouts on a single lineage. Pareto selection expands the search over all winning strategies found so far and converges to a higher-performing solution in the same budget.
+
+### Observation 4: Instruction-Optimized Prompts Are Shorter and Generalize Better
+
+Reflectively evolved instructions are often much shorter, and therefore cheaper, than few-shot demonstration prompts. The gap is especially large on complex tasks, where a single demonstration can already be long, and larger still when several demonstrations are optimized jointly, as in MIPROv2. Prompts produced by GEPA and GEPA+Merge are up to $9.2\times$ shorter than MIPROv2 prompts, with higher scores. In aggregate, the optimizers that score higher also produce shorter prompts. Shorter prompts reduce metered input tokens, latency, and the cost of serving.
+
+### Observation 5: System-Aware Crossover Helps, Depending on When It Is Invoked
+
+A system-aware crossover, Merge, identifies distinct optimization lineages that have learned complementary strategies — typically by evolving different modules — and proposes a candidate that takes the best version of each module. GEPA+Merge can outperform GEPA by as much as 5%, an aggregate additional 2% over GEPA alone. It works especially well for GPT-4.1 Mini and can degrade Qwen3 8B, though Qwen3 8B still benefits from Merge on one of four tasks. The discrepancy is attributed to a fixed split of the rollout budget between mutation and crossover, and to when merge is invoked. Crossover helps most once the tree contains independent lineages that already perform well. Adaptive schedules for that choice are left open.
+
+### Observation 6: Optimized Prompts Transfer Across Models
+
+Prompts optimized entirely with Qwen3 8B, then evaluated on GPT-4.1 Mini without modification, transfer across model families. The aggregate gain is $+9.00\%$ across the six benchmarks, and as high as $+27.67\%$ on HotpotQA. That transferred performance exceeds MIPROv2 ($+5.64\%$), TextGrad ($+6.11\%$), and Trace ($+3.27\%$), even though those methods were optimized directly on GPT-4.1 Mini.
